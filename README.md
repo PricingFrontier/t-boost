@@ -87,18 +87,6 @@ score with mathematical exactness within floating-point tolerance (for a multicl
 | `gamma` | positive severities | log |
 | `tweedie` | compound Poisson-gamma | log |
 
-## Status & license
+## License
 
-Pre-1.0; the wire `schema_version` is versioned independently of the package version.
-
-### Serialization compatibility
-
-Serialized models and rating exports embed a wire `schema_version` (supported through `6`; see `SCHEMA_VERSION` in
-[`crates/t-boost-core/src/serialize.rs`](crates/t-boost-core/src/serialize.rs)).
-Rating table export schema versions are content-dependent based on model structure and reference measure (v2 for legacy ≤3-order unlifted models, v3 for depth-lifted trees up to 8, v4 for order-4 or factored box representations, v5 for high-order interactions 5..8, and v6 for exposure-marginal reference measures).
-Known supported artifacts are validated and loaded according to the container's version rules.
-JSON provides registered migration paths; binary compatibility is container- and schema-dependent,
-not a promise that any older blob can load. Pin the producing package version with each artifact
-and verify loading and prediction equivalence before upgrading.
-
-Licensed under **Apache-2.0**.
+Apache-2.0
