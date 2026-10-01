@@ -1284,11 +1284,9 @@ fn contains_token(haystack: &str, tok: &str) -> bool {
     let mut from = 0;
     while let Some(rel) = haystack.get(from..).and_then(|s| s.find(tok)) {
         let at = from + rel;
-        // `map_or(true, ..)` rather than `is_none_or` — the latter is stable only
-        // since Rust 1.82, above this workspace's 1.74 MSRV.
-        let before_ok = at == 0 || bytes.get(at - 1).map_or(true, |b| !is_ident_byte(*b));
+        let before_ok = at == 0 || bytes.get(at - 1).is_none_or(|b| !is_ident_byte(*b));
         let after = at + tok.len();
-        let after_ok = bytes.get(after).map_or(true, |b| !is_ident_byte(*b));
+        let after_ok = bytes.get(after).is_none_or(|b| !is_ident_byte(*b));
         if before_ok && after_ok {
             return true;
         }

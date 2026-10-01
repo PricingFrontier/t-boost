@@ -18,18 +18,19 @@ env:
 
 jobs:
   # Deliberately near-identical to ci.yml's `platform-matrix` job: that job runs
-  # this same {stable,1.74}x{4-OS} matrix automatically (push to main + nightly, via
+  # this same {stable,MSRV}x{4-OS} matrix automatically (push to main + nightly, via
   # pinned "1.96.1" rather than the floating "stable" tag) so a platform regression
   # can't silently accumulate between manual pre-publish runs; this copy stays so
   # the pre-publish checklist remains one self-contained workflow.
   rust-matrix:
     name: rust ${{ matrix.rust }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
-        rust: [stable, "1.74.0"]
+        rust: [stable, "1.85.0"]
     defaults:
       run:
         shell: bash
@@ -44,17 +45,18 @@ jobs:
         if: matrix.rust == 'stable'
         run: cargo fmt --all --check
       - name: Core clippy
+        if: matrix.rust == 'stable' # lints differ between clippy versions; the MSRV leg builds and tests only
         run: cargo clippy -p t-boost-core --all-targets --all-features -- -D warnings
       - name: Core tests (all features)
-        run: cargo test -p t-boost-core --all-features
+        run: cargo test --release -p t-boost-core --all-features
       - name: Core tests (no default features)
-        run: cargo test -p t-boost-core --no-default-features
+        run: cargo test --release -p t-boost-core --no-default-features
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism and invariant gates
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test invariants_gate
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test invariants_gate
       - name: Grep gates
         if: matrix.rust == 'stable'
         run: cargo run -p xtask -- check-all
@@ -92,8 +94,8 @@ jobs:
       - name: Determinism + scoring-determinism suites (portable baseline)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test scoring_determinism
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test scoring_determinism
       - name: bit-repro fixture (portable baseline)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         run: cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-baseline.bin
@@ -102,8 +104,8 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings -C target-cpu=x86-64-v3"
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test scoring_determinism
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test scoring_determinism
       - name: bit-repro fixture (target-cpu=x86-64-v3)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         env:

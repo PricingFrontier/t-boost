@@ -973,8 +973,7 @@ pub fn prune_bank(
     // cost nothing, then the factored effects, each costing its realized region-box count. This is
     // the identical convention `box_costs` uses for the deploy-time budget — one accounting, so a
     // selection-time price and a deploy-time cap can never disagree about what a bank costs.
-    let box_cost: Vec<u32> = std::iter::repeat(0_u32)
-        .take(bank.tables.len())
+    let box_cost: Vec<u32> = std::iter::repeat_n(0_u32, bank.tables.len())
         .chain(
             bank.factored
                 .iter()

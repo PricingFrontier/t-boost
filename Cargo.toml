@@ -12,10 +12,8 @@ resolver     = "2"
 [workspace.package]
 version      = "0.6.0"                 # shared crate semver; the wire schema_version is separate (§02.8)
 edition      = "2021"
-# MSRV. The `[workspace.lints]` table this workspace relies on was stabilised in
-# Rust 1.74, so 1.74 is the minimum floor compatible with inherited lint gates.
-# This still satisfies the wheel portability floor.
-rust-version = "1.74"
+# MSRV: the floor the locked dependencies allow (bincode 2 needs 1.85).
+rust-version = "1.85"
 license      = "Apache-2.0"
 repository   = "https://github.com/PricingFrontier/t-boost"
 

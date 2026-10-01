@@ -14,7 +14,7 @@
 - [ ] **Test** — `cargo test -p t-boost-core --all-features` and `--no-default-features`
 - [ ] **Doctests** — `cargo test -p t-boost-core --doc`
 - [ ] **Deny** — `cargo deny check`
-- [ ] **MSRV** — builds + tests on Rust 1.74
+- [ ] **MSRV** — builds + tests on Rust 1.85
 - [ ] **NoPyo3 / Wasm** — core stays Python-free and wasm32-buildable
 - [ ] **Determinism** — byte-equal across `n_threads ∈ {1,2,8}` (if training paths touched)
 - [ ] **Invariants** — the five I2 checks + I1 budget still pass (if model/tables touched)

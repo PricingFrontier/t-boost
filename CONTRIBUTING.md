@@ -29,7 +29,9 @@ with.
 
 ## Environment
 
-- Rust: stable via `rust-toolchain.toml` (with rustfmt + clippy). CI pins 1.96.1; the MSRV is 1.74.
+- Rust: your default stable toolchain with rustfmt and clippy. CI pins 1.96.1 in each job; the
+  MSRV is 1.85 (`rust-version` in `Cargo.toml`). Do not add a `rust-toolchain.toml`: it
+  overrides the toolchains CI pins.
 - Python: [uv](https://docs.astral.sh/uv/). `uv sync` creates `.venv` with the interpreter from
   `.python-version` (3.11, matching CI), builds the Rust extension into it, and installs the
   `dev` dependency group (pytest, mypy, pandas, pyarrow, scikit-learn — the tests exercise the
@@ -51,7 +53,7 @@ Run the gates for every area you touched:
 | You changed | Run |
 |-------------|-----|
 | Any Rust | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets --all-features -- -D warnings` · `cargo run -p xtask -- check-all` |
-| `t-boost-core` | `cargo test --release -p t-boost-core --all-features` (~15 min) · `cargo test --release -p t-boost-core --no-default-features` · `cargo test -p t-boost-core --doc` · the bit-repro pair below |
+| `t-boost-core` | `cargo test --release -p t-boost-core --all-features` (~15 min; CI also runs in release) · `cargo test --release -p t-boost-core --no-default-features` · `cargo test -p t-boost-core --doc` · the bit-repro pair below |
 | The binding (`t-boost-py`) or the stub | `uv sync --reinstall-package t-boost` · `uv run python -m mypy.stubtest t_boost._t_boost` · the Python row |
 | Python (`python/t_boost`) | `uv run pytest python/tests -q` (~3 min) · `uv run mypy --strict python/t_boost` |
 | `pyproject.toml` / dependencies | `uv lock` (commit `uv.lock`) · `uv sync --locked` · the Python row |
@@ -81,7 +83,7 @@ cmp target/bit-repro-a.bin target/bit-repro-b.bin
 | `python` | runtime-only install check (`uv sync --locked --no-dev`, no scikit-learn), then pytest, `mypy --strict`, stubtest |
 | `test` | core tests (`--all-features`, `--no-default-features`, `--doc`), determinism (`n_threads ∈ {1,2,8}`, byte-compared), invariants, overflow trap, bit-repro |
 | `m6-preflight` | `cargo test -p xtask`, `xtask accuracy` (plain + adversarial), `xtask release-preflight` |
-| `msrv` | build + test on Rust 1.74 |
+| `msrv` | build + test on Rust 1.85 |
 | `features` | the core builds under each feature combination (`arrow`, `nightly`) |
 | `portability` | no `pyo3`/`numpy` in the core's dependency graph; the core builds for `wasm32-unknown-unknown` |
 | `deny` | `cargo deny check` (licenses, advisories, bans, sources) |
@@ -89,7 +91,7 @@ cmp target/bit-repro-a.bin target/bit-repro-b.bin
 
 On push to `main`, nightly and manual dispatch only (not on pull requests):
 `platform-matrix` re-runs the core gates on Linux x86_64/aarch64, macOS arm64 and Windows
-under Rust 1.96.1 and 1.74, and `bit-repro-cpu-baseline` byte-compares a
+under Rust 1.96.1 and 1.85, and `bit-repro-cpu-baseline` byte-compares a
 `target-cpu=x86-64-v3` build against the portable baseline.
 
 ## Code rules

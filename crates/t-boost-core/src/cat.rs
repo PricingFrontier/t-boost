@@ -257,7 +257,7 @@ pub struct CatEncoder {
 }
 
 /// The smallest `f32` strictly greater than `x` (standard IEEE-754 `nextafter`
-/// bit-stepping; MSRV 1.74 predates the stable `f32::next_up`, stabilized in 1.86).
+/// bit-stepping; MSRV 1.85 predates the stable `f32::next_up`, stabilized in 1.86).
 /// `NaN`/`+inf` pass through unchanged; `+0.0`/`-0.0` both step to the smallest
 /// positive subnormal.
 fn next_up_f32(x: f32) -> f32 {
@@ -3097,8 +3097,8 @@ mod tests {
     fn class_freq_pools_rare_levels_identically_to_the_mean_and_count_channels() {
         // "rare" carries 3 rows (below the floor of 10); "common"/"other" clear it.
         let mut levels = vec!["rare".to_string(); 3];
-        levels.extend(std::iter::repeat("common".to_string()).take(20));
-        levels.extend(std::iter::repeat("other".to_string()).take(15));
+        levels.extend(std::iter::repeat_n("common".to_string(), 20));
+        levels.extend(std::iter::repeat_n("other".to_string(), 15));
         let y: Vec<f32> = (0..levels.len()).map(|i| (i % 3) as f32).collect();
 
         let frozen_labels = |cfg: &TsConfig, id: u8| -> Vec<String> {
@@ -3180,10 +3180,10 @@ mod tests {
     fn class_freq_separates_levels_the_ordinal_label_mean_collapses() {
         // "p" is all class 1; "q" is half class 0, half class 2. Both have label mean 1.0.
         let mut levels = vec!["p".to_string(); 20];
-        levels.extend(std::iter::repeat("q".to_string()).take(20));
+        levels.extend(std::iter::repeat_n("q".to_string(), 20));
         let mut y = vec![1.0_f32; 20];
-        y.extend(std::iter::repeat(0.0_f32).take(10));
-        y.extend(std::iter::repeat(2.0_f32).take(10));
+        y.extend(std::iter::repeat_n(0.0_f32, 10));
+        y.extend(std::iter::repeat_n(2.0_f32, 10));
 
         let fit = |cfg: &TsConfig| -> CatEncoder {
             fit_cat_encoder(
@@ -3227,7 +3227,7 @@ mod tests {
         // "rare" collapses into the reserved rare bucket, which must still get a representative
         // share value from its (here, sole) pooled member's aggregate weight.
         let mut levels = vec!["rare".to_string()];
-        levels.extend(std::iter::repeat("common".to_string()).take(20));
+        levels.extend(std::iter::repeat_n("common".to_string(), 20));
         let y = vec![0.0_f32; levels.len()]; // unread
         let cfg = count_cfg(10.0);
         let spec = CatFitSpec {
@@ -3382,7 +3382,7 @@ mod tests {
         // asserting it.
         let mut levels = vec!["rare".to_string()];
         for label in ["a", "b", "c", "d"] {
-            levels.extend(std::iter::repeat(label.to_string()).take(20));
+            levels.extend(std::iter::repeat_n(label.to_string(), 20));
         }
         let weight = vec![1.0_f32; levels.len()];
         let exposure = vec![0.5_f32; levels.len()]; // deliberately != 1 to exercise Mean's e-term
@@ -3433,7 +3433,7 @@ mod tests {
         // No `weight` supplied: every row counts as 1, matching `fit_cat_encoder`'s own
         // `None` -> all-ones default (see its `w` resolution).
         let mut levels = vec!["rare".to_string()];
-        levels.extend(std::iter::repeat("common".to_string()).take(20));
+        levels.extend(std::iter::repeat_n("common".to_string(), 20));
         let got = post_pooling_level_count(&levels, None, None, CatTarget::Mean, 10.0).unwrap();
         assert_eq!(
             got, 2,

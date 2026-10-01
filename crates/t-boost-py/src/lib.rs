@@ -830,7 +830,7 @@ mod cat_count_gate_tests {
     use t_boost_core::cat::{CatTarget, Smooth, TsConfig, TsEncodingId};
 
     fn levels_of(n: usize, label: &str) -> Vec<String> {
-        std::iter::repeat(label.to_string()).take(n).collect()
+        std::iter::repeat_n(label.to_string(), n).collect()
     }
 
     fn ts(min_data_per_group: f32) -> TsConfig {

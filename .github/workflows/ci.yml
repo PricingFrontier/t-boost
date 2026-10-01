@@ -112,22 +112,23 @@ jobs:
   test:
     name: test + doctests + invariants + determinism
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.96.1
       - uses: Swatinem/rust-cache@v2
       - name: Test (all features)
-        run: cargo test -p t-boost-core --all-features
+        run: cargo test --release -p t-boost-core --all-features
       - name: Test (no default features)
-        run: cargo test -p t-boost-core --no-default-features
+        run: cargo test --release -p t-boost-core --no-default-features
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism gate ({1,2,8}-thread byte-equality)
-        run: cargo test -p t-boost-core --test determinism && cargo test -p t-boost-core --test scoring_determinism
+        run: cargo test --release -p t-boost-core --test determinism && cargo test --release -p t-boost-core --test scoring_determinism
       - name: Invariant gate (G0 five checks + feature budget)
-        run: cargo test -p t-boost-core --test invariants_gate
+        run: cargo test --release -p t-boost-core --test invariants_gate
       - name: Overflow-checks liveness
-        run: cargo test -p t-boost-core --test overflow_trap
+        run: cargo test --release -p t-boost-core --test overflow_trap
       # spec §13.4's promised cross-run (two-process) reproducibility gate: the
       # {1,2,8}-thread determinism test above proves fixed-thread-count determinism
       # WITHIN one process, but cannot see ambient nondeterminism a single process
@@ -167,18 +168,18 @@ jobs:
 
   # ---- MSRV: build + test on exactly the pinned floor --------------------
   msrv:
-    name: MSRV (1.74)
+    name: MSRV (1.85)
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      # The `[workspace.lints]` table this workspace relies on was stabilised in
-      # Rust 1.74, so the MSRV job pins that inherited-lint floor exactly.
-      - uses: dtolnay/rust-toolchain@1.74.0
+      # Cargo.toml's `rust-version`: the floor the locked dependencies allow (bincode 2 needs 1.85).
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - name: Build + test on MSRV
         run: |
           cargo build -p t-boost-core --all-features
-          cargo test -p t-boost-core --all-features
+          cargo test --release -p t-boost-core --all-features
 
   # ---- Feature-matrix builds (each flag composes independently) ----------
   features:
@@ -237,6 +238,7 @@ jobs:
   coverage:
     name: coverage (cargo-llvm-cov, informational)
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
@@ -246,15 +248,15 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: Swatinem/rust-cache@v2
       - name: Generate lcov report (all features)
-        run: cargo llvm-cov -p t-boost-core --all-features --lcov --output-path lcov.info
+        run: cargo llvm-cov --release -p t-boost-core --all-features --lcov --output-path lcov.info
       - name: Per-file coverage report (math modules held to a higher bar — spec §13.10)
-        run: cargo llvm-cov report
+        run: cargo llvm-cov report --release
       - uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
           path: lcov.info
 
-  # ---- Platform matrix: spec §13.10's promised {stable,1.74} x {linux-x86_64, --
+  # ---- Platform matrix: spec §13.10's promised {stable,MSRV} x {linux-x86_64, --
   # ---- linux-aarch64, macos-aarch64, windows-x64} gate, promoted from -----------
   # ---- release-gate.yml's manual-only checklist to a blocking one ---------------
   # Previously this matrix existed ONLY in release-gate.yml's `rust-matrix` job,
@@ -271,11 +273,12 @@ jobs:
     name: platform ${{ matrix.rust }} / ${{ matrix.os }}
     if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
-        rust: ["1.96.1", "1.74.0"]
+        rust: ["1.96.1", "1.85.0"]
     defaults:
       run:
         shell: bash
@@ -290,18 +293,19 @@ jobs:
         if: matrix.rust == '1.96.1'
         run: cargo fmt --all --check
       - name: Core clippy
+        if: matrix.rust == '1.96.1' # lints differ between clippy versions; the MSRV leg builds and tests only
         run: cargo clippy -p t-boost-core --all-targets --all-features -- -D warnings
       - name: Core tests (all features)
-        run: cargo test -p t-boost-core --all-features
+        run: cargo test --release -p t-boost-core --all-features
       - name: Core tests (no default features)
-        run: cargo test -p t-boost-core --no-default-features
+        run: cargo test --release -p t-boost-core --no-default-features
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism and invariant gates
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test scoring_determinism
-          cargo test -p t-boost-core --test invariants_gate
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test scoring_determinism
+          cargo test --release -p t-boost-core --test invariants_gate
       - name: Grep gates
         if: matrix.rust == '1.96.1'
         run: cargo run -p xtask -- check-all
@@ -338,8 +342,8 @@ jobs:
       - name: Determinism + scoring-determinism suites (portable baseline)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test scoring_determinism
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test scoring_determinism
       - name: bit-repro fixture (portable baseline)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         run: cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-baseline.bin
@@ -348,8 +352,8 @@ jobs:
         env:
           RUSTFLAGS: "-D warnings -C target-cpu=x86-64-v3"
         run: |
-          cargo test -p t-boost-core --test determinism
-          cargo test -p t-boost-core --test scoring_determinism
+          cargo test --release -p t-boost-core --test determinism
+          cargo test --release -p t-boost-core --test scoring_determinism
       - name: bit-repro fixture (target-cpu=x86-64-v3)
         if: steps.cpu-check.outputs.has_avx2 == 'true'
         env:
