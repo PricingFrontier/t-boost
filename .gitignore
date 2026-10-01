@@ -1,0 +1,35 @@
+# Rust
+/target
+**/target
+**/*.rs.bk
+*.profraw
+/fuzz/artifacts
+/fuzz/coverage
+/fuzz/target
+
+# Python
+__pycache__/
+*.py[cod]
+.venv*/
+/dist
+/wheels
+*.so
+*.pyd
+.pytest_cache/
+*.egg-info/
+
+# OS / editor
+.DS_Store
+
+speed_accuracy_work.md
+*.orig
+
+# example-notebook output artifact (regenerated on each run)
+examples/frequency_model.bin
+
+# Local av40 verification build (separate CARGO_TARGET_DIR so the release wheel build does
+# not contend with the debug test run for the target lock). Never committed.
+/target-rel
+
+# local secrets (API tokens)
+.env

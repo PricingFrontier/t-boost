@@ -1,0 +1,28 @@
+[package]
+name = "t-boost-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+t-boost-core = { path = "../crates/t-boost-core" }
+
+[[bin]]
+name = "fuzz_deserialize"
+path = "fuzz_targets/fuzz_deserialize.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_binning"
+path = "fuzz_targets/fuzz_binning.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,60 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "t-boost"
+description = "An oblivious gradient-boosting machine that is exactly decomposable into fANOVA rating tables."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+keywords = ["gradient-boosting", "gbm", "explainable", "interpretable", "fanova", "glassbox", "insurance", "actuarial"]
+dependencies = [
+  "numpy>=1.23",
+  "polars>=1.0",
+  # caps BLAS to one thread during table graduation: deterministic, and avoids thread thrash
+  "threadpoolctl>=3.0",
+]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Financial and Insurance Industry",
+]
+dynamic = ["version"] # from the Cargo workspace; bump with scripts/release_version.py
+
+[project.urls]
+Repository = "https://github.com/PricingFrontier/t-boost"
+Documentation = "https://github.com/PricingFrontier/t-boost#readme"
+
+[dependency-groups]
+# pandas, pyarrow and scikit-learn are optional interop paths the test suite exercises
+dev = [
+  "pytest>=8",
+  "mypy>=1.10",
+  "pandas>=2.0",
+  "pyarrow>=14",
+  "scikit-learn>=1.2",
+]
+
+[tool.maturin]
+python-source = "python"
+module-name = "t_boost._t_boost"
+manifest-path = "crates/t-boost-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+
+# no type information shipped (no py.typed / bundled stubs)
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "pandas.*", "scipy.*", "threadpoolctl.*"]
+ignore_missing_imports = true

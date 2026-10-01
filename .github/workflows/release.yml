@@ -1,0 +1,340 @@
+name: Release
+
+# Publishes the version the Cargo workspace declares on main to PyPI, then tags it.
+#
+# Releasing: bump the version in a pull request (`python scripts/release_version.py bump
+# patch`, or minor / major / X.Y.Z — it rewrites Cargo.toml's [workspace.package] version,
+# the two internal t-boost-core requirements and Cargo.lock together; pyproject.toml's
+# version is dynamic and follows). Merge it, wait for main's CI to pass, then run this
+# workflow from the Actions tab (Release -> Run workflow, on main). It never edits or
+# commits to the repository, and it refuses a version PyPI already has or one not newer
+# than PyPI's latest, so an unbumped main cannot be released twice. Tick "dry run" to build
+# and smoke-check without publishing. If a run fails after publishing started, use "Re-run
+# failed jobs": the upload skips files PyPI already has, and the tag is created only once
+# PyPI serves exactly this run's files.
+#
+# Builds: one abi3 wheel per platform (cp310-abi3, CPython 3.10+) for Linux x86_64/aarch64
+# (manylinux), Windows x64 and macOS x86_64/arm64, plus an sdist.
+#
+# Build baseline: no RUSTFLAGS/target-cpu is set below, so every wheel builds at the default
+# portable CPU baseline, deliberately — decided policy, 2026-07-11: spec §13.4 puts
+# bit-reproducibility ahead of serve speed, and a `-C target-cpu=x86-64-v3` baseline (+
+# multiversion runtime AVX-512 dispatch) is only safe under the determinism gate once specific
+# (integer-only — scatter/accumulate, table-lookup gather; float reductions are excluded)
+# kernels are proven order-exact across vector widths, which hasn't happened yet (see spec
+# §13.4/§11.1). ci.yml's and release-gate.yml's `bit-repro-cpu-baseline` jobs are the standing
+# canaries that keep this honest.
+#
+# One-time setup, before adding the publisher:
+# 1. GitHub: Settings -> Environments -> `pypi` -> Deployment branches and tags
+#    -> Selected branches and tags -> add the branch rule `main`. PyPI's
+#    trusted publisher cannot restrict the branch, so this rule is what stops a
+#    copy of this workflow on another branch from publishing.
+# 2. PyPI: add a GitHub trusted publisher for the t-boost project (owner PricingFrontier,
+#    repository t-boost, workflow release.yml, environment pypi). Before the first release
+#    the project does not exist yet, so add it as a "pending publisher".
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build and smoke-check only, publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: Check the version and main's CI
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Release from main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Run Release on main; this run is on ${GITHUB_REF}."
+          exit 1
+
+      - name: Require main's CI to have passed on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --branch main \
+            --event push --commit "$GITHUB_SHA" --limit 1 --json status,conclusion,url \
+            --jq '.[0] | select(. != null) | "\(.status)|\(.conclusion)|\(.url)"')
+          if [ -z "$run" ]; then
+            echo "::error::No CI run on main for ${GITHUB_SHA}; release a commit main's CI has checked."
+            exit 1
+          fi
+          # A running job has an empty conclusion, so split on a separator that
+          # keeps empty fields rather than on whitespace.
+          IFS='|' read -r status conclusion url <<< "$run"
+          if [ "$status" != "completed" ]; then
+            echo "::error::main's CI is still running for this commit ($url); run Release when it finishes."
+            exit 1
+          fi
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::main's CI finished '$conclusion' for this commit ($url); fix main before releasing."
+            exit 1
+          fi
+          echo "main's CI passed for ${GITHUB_SHA}: $url"
+
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - name: Refuse a version PyPI already has
+        id: version
+        run: |
+          status=$(curl -sS -o pypi.json -w '%{http_code}' https://pypi.org/pypi/t-boost/json)
+          case "$status" in
+            200) pypi=(--pypi-json pypi.json) ;;
+            404) pypi=() ;;
+            *)
+              echo "::error::PyPI answered HTTP $status for t-boost; run Release again later."
+              exit 1
+              ;;
+          esac
+          uv run --no-project python scripts/release_version.py check "${pypi[@]}" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Refuse a version that is already tagged
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # --exit-code exits 2 only when no tag matches; any other failure of the
+          # lookup must not read as "untagged".
+          lookup=0
+          git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null || lookup=$?
+          case "$lookup" in
+            2) echo "v$VERSION is not tagged yet." ;;
+            0)
+              echo "::error::Tag v$VERSION already exists. Bump the version in a pull request (scripts/release_version.py bump)."
+              exit 1
+              ;;
+            *)
+              echo "::error::Could not look up tag v$VERSION (git ls-remote exited $lookup); run Release again."
+              exit 1
+              ;;
+          esac
+
+  # ── Wheels: one abi3 wheel per platform ──────────────────────────────────
+  wheels:
+    name: Wheel (${{ matrix.name }})
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-latest, target: x86_64 }
+          - { name: linux-aarch64, os: ubuntu-latest, target: aarch64 }
+          - { name: windows-x64, os: windows-latest, target: x86_64 }
+          - { name: macos-x86_64, os: macos-latest, target: x86_64 }
+          - { name: macos-arm64, os: macos-latest, target: aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build abi3 wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist
+          sccache: "true"
+          manylinux: auto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.name }}
+          path: dist
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+          if-no-files-found: error
+
+  dist:
+    name: Collect and check the files
+    needs: [check, wheels, sdist]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+
+      - name: Check the files carry the version
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          ls -l dist
+          test -f "dist/t_boost-${VERSION}.tar.gz"
+          for platform in 'manylinux*_x86_64' 'manylinux*_aarch64' 'win_amd64' 'macosx*_x86_64' 'macosx*_arm64'; do
+            # shellcheck disable=SC2086 # the glob must expand
+            matches=$(ls dist/t_boost-${VERSION}-cp310-abi3-${platform}.whl 2>/dev/null | wc -l)
+            if [ "$matches" -ne 1 ]; then
+              echo "::error::Expected one ${platform} wheel for ${VERSION}, found ${matches}."
+              exit 1
+            fi
+          done
+          test "$(ls dist | wc -l)" -eq 6
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  smoke:
+    name: Install smoke (${{ matrix.name }})
+    needs: [check, dist]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux wheel, os: ubuntu-latest, only: ":all:" }
+          - { name: windows wheel, os: windows-latest, only: ":all:" }
+          - { name: macos-arm64 wheel, os: macos-latest, only: ":all:" }
+          - { name: sdist, os: ubuntu-latest, only: ":none:" }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Install the built t-boost into a fresh environment
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+          ONLY: ${{ matrix.only }}
+        run: |
+          # t-boost comes from dist/ only (a wheel, or the sdist built from source); its
+          # dependencies come from PyPI.
+          if [ "$ONLY" = ":all:" ]; then mode=(--only-binary t-boost); else mode=(--no-binary t-boost); fi
+          uv venv "$RUNNER_TEMP/pkg" --python 3.12
+          uv pip install --python "$RUNNER_TEMP/pkg" --find-links dist "${mode[@]}" "t-boost==${VERSION}"
+
+      - name: Smoke-check the installed package
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then py="$RUNNER_TEMP/pkg/Scripts/python.exe"; else py="$RUNNER_TEMP/pkg/bin/python"; fi
+          cd "$RUNNER_TEMP"  # away from the source tree, so only the installed package can import
+          "$py" "$GITHUB_WORKSPACE/scripts/package_smoke_check.py" --version "$VERSION"
+
+  publish:
+    name: Publish to PyPI
+    if: ${{ !inputs.dry_run }}
+    needs: [check, dist, smoke]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/t-boost/${{ needs.check.outputs.version }}/
+    permissions:
+      id-token: write # required for PyPI trusted publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      # A re-run after a partial upload completes it rather than failing on the
+      # file that already made it; `verify` then checks the files are this run's.
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+
+  verify:
+    name: Verify PyPI serves this run's files
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Wait for PyPI to list exactly the built files
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # PyPI's JSON API can lag an upload by a few minutes.
+          for attempt in $(seq 1 20); do
+            if curl -sSf -o release.json "https://pypi.org/pypi/t-boost/$VERSION/json" \
+              && uv run --no-project python scripts/verify_pypi_release.py \
+                --dist dist --pypi-json release.json; then
+              exit 0
+            fi
+            echo "Attempt $attempt: PyPI does not list exactly the built files yet."
+            sleep 30
+          done
+          echo "::error::PyPI does not serve exactly this run's files for t-boost $VERSION; re-run the failed jobs."
+          exit 1
+
+  github-release:
+    name: Tag and create the GitHub release
+    needs: [check, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Tag the released commit and create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "v$VERSION" --generate-notes

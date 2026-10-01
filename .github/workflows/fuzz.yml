@@ -1,0 +1,32 @@
+name: Fuzz
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: cargo-fuzz nightly smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --version 0.13.1 --locked
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      - name: fuzz_deserialize smoke
+        # -dict seeds the 3 magic-prefix tokens (TBMC/TBTM/TBMT) that gate the newer
+        # multiclass/tables/multiclass-tables decoders, so the mutator can reach past
+        # each decoder's own prefix check instead of guessing 4 bytes blindly.
+        run: cargo +nightly fuzz run fuzz_deserialize -- -max_total_time=300 -dict=fuzz_targets/fuzz_deserialize.dict
+      - name: fuzz_binning smoke
+        run: cargo +nightly fuzz run fuzz_binning -- -max_total_time=300

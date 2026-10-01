@@ -1,0 +1,38 @@
+# cargo-deny config (spec §02.7 / F3). A build [GATE] in Correctness CI:
+# license allow-list, RUSTSEC advisories denied, crates.io-only sources, no
+# wildcard deps, duplicate-major versions denied, openssl banned.
+[advisories]
+version       = 2
+yanked        = "deny"
+# Surgical, documented exceptions — vulnerabilities and every OTHER unmaintained
+# advisory stay denied. RUSTSEC-2025-0141: bincode 2.x is "unmaintained" (the team
+# ceased development after a harassment incident), NOT vulnerable; v2.0.1 is
+# feature-complete and is the spec-mandated wire format (§10, frozen
+# `config::standard()`). Revisit if a security advisory ever lands on bincode.
+ignore        = ["RUSTSEC-2025-0141"]
+
+[licenses]
+version              = 2
+confidence-threshold = 0.9
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Unicode-DFS-2016",
+]
+
+[bans]
+multiple-versions = "deny"   # no duplicate-major (F3); tune to "warn" only with justification
+wildcards         = "deny"
+deny = [
+  { name = "openssl" },      # F3: no openssl in the tree
+  { name = "openssl-sys" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git      = "deny"
+allow-registry   = ["https://github.com/rust-lang/crates.io-index"]

@@ -1,0 +1,360 @@
+name: Correctness CI
+
+# The build-blocking gate set (spec §02.7 / §13, plan F3). Every gate runs on every
+# PR and on pushes to main, over the PURE core (no Python toolchain in the loop). The
+# first line of feature code physically cannot merge if it panics, is unformatted,
+# leaks a non-typed error, breaks reproducibility, or violates an invariant.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Nightly cron. Every job below still runs on the triggers above too — this only
+  # ADDS a trigger, it doesn't gate the existing ones. In practice it's a harmless
+  # nightly reconfirmation of the fast gates, and it's what drives `platform-matrix`
+  # (that job itself opts out of `pull_request` via its own `if:` — "per-merge +
+  # nightly, not per-PR").
+  schedule:
+    - cron: "17 3 * * *" # nightly, off-peak UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---- Format + lint + the no-panic deny set + grep-gates ----------------
+  lint:
+    name: fmt + clippy + grep-gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to a specific stable release, not the floating `stable` tag, so a new
+      # Rust release can't turn CI red without a code change (fmt/clippy drift across
+      # releases). Bump this deliberately, not automatically.
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fmt
+        run: cargo fmt --all --check
+      # Bare `cargo clippy` targets default-members (core + xtask) — deliberately
+      # Python-free (the py crate is linted by the `py-lint` job, with a Python set up).
+      - name: Clippy (no-panic deny set, all targets, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Grep-gates (no-box-dyn / justified / wire-width / no-hashmap)
+        run: cargo run -p xtask -- check-all
+
+  # ---- The PyO3 binding under the SAME no-panic/missing-docs lint wall ----
+  # t-boost-py inherits `[lints] workspace = true`, but it is excluded from
+  # default-members, so the core `lint` job never sees it. This dedicated job
+  # enforces the inherited wall on the binding (needs a Python for pyo3 build config).
+  py-lint:
+    name: t-boost-py lint wall
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy on the PyO3 binding
+        run: cargo clippy -p t-boost-py --all-targets --all-features -- -D warnings
+
+  # ---- Python API: pytest + mypy --strict + stubtest (spec §12.8) --------
+  # Builds the PyO3 extension into the project's uv environment, then runs the Python
+  # test suite and the typed-package stub/lint gate. This is the only job with a Python
+  # runtime; the core gates above stay Python-free.
+  python:
+    name: python (pytest + mypy + stubtest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6 # interpreter from .python-version
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the extension into the runtime-only environment (no dev group)
+        run: uv sync --locked --no-dev
+      - name: Core + estimators work with only the runtime dependencies (the _compat shim path)
+        run: |
+          uv run --no-sync python -c "import t_boost; t_boost._Booster; t_boost._Model; print('runtime-only core OK')"
+          uv run --no-sync python - <<'EOF'
+          import numpy as np
+          from t_boost import TBoostRegressor
+          from t_boost._compat import SKLEARN_AVAILABLE
+          assert not SKLEARN_AVAILABLE, "an optional interop dependency leaked into the runtime-only stage"
+          x = np.asfortranarray(np.random.default_rng(0).uniform(size=(80, 2)), dtype=np.float32)
+          y = (2.0 * x[:, 0] - x[:, 1]).astype(np.float32)
+          m = TBoostRegressor(n_trees=8, n_bags=1, validation_fraction=None, prune=False, seed=0).fit(x, y)
+          assert np.isfinite(m.predict(x)).all()
+          print("runtime-only estimators OK")
+          EOF
+      - name: Add the dev dependency group (test + lint tooling)
+        run: uv sync --locked
+      - name: Pytest
+        run: uv run --no-sync pytest python/tests -q
+      - name: mypy --strict over the typed package
+        run: uv run --no-sync mypy --strict python/t_boost
+      - name: stubtest against the compiled module
+        run: uv run --no-sync python -m mypy.stubtest t_boost._t_boost
+
+  # ---- Tests + doctests + the invariant & determinism harnesses ----------
+  test:
+    name: test + doctests + invariants + determinism
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (all features)
+        run: cargo test -p t-boost-core --all-features
+      - name: Test (no default features)
+        run: cargo test -p t-boost-core --no-default-features
+      - name: Doctests
+        run: cargo test -p t-boost-core --doc
+      - name: Determinism gate ({1,2,8}-thread byte-equality)
+        run: cargo test -p t-boost-core --test determinism && cargo test -p t-boost-core --test scoring_determinism
+      - name: Invariant gate (G0 five checks + feature budget)
+        run: cargo test -p t-boost-core --test invariants_gate
+      - name: Overflow-checks liveness
+        run: cargo test -p t-boost-core --test overflow_trap
+      # spec §13.4's promised cross-run (two-process) reproducibility gate: the
+      # {1,2,8}-thread determinism test above proves fixed-thread-count determinism
+      # WITHIN one process, but cannot see ambient nondeterminism a single process
+      # can't observe (hash-seed/ASLR effects, env-sensitive branches). Fitting the
+      # same fixture twice, as two separate `cargo run` process invocations, and
+      # diffing the encoded bytes closes that gap.
+      - name: Cross-run bit-reproducibility gate (two independent process invocations)
+        run: |
+          cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-a.bin
+          cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-b.bin
+          cmp target/bit-repro-a.bin target/bit-repro-b.bin
+
+  # ---- Dev-only harness: exactness-gated accuracy + budget preflight -------
+  m6-preflight:
+    name: M6 internal preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: xtask harness unit tests
+        run: cargo test -p xtask
+      - name: Accuracy smoke artifact
+        run: cargo run -p xtask -- accuracy --seed 7 --output target/accuracy-smoke.json
+      - name: Adversarial table-budget artifact
+        run: cargo run -p xtask -- accuracy --seed 7 --adversarial --output target/adversarial-budget.json
+      - name: Release preflight checkpoint
+        run: cargo run -p xtask -- release-preflight --seed 7 --output target/release-preflight.json
+      - name: Upload preflight artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: m6-internal-preflight
+          path: |
+            target/accuracy-smoke.json
+            target/adversarial-budget.json
+            target/release-preflight.json
+
+  # ---- MSRV: build + test on exactly the pinned floor --------------------
+  msrv:
+    name: MSRV (1.74)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The `[workspace.lints]` table this workspace relies on was stabilised in
+      # Rust 1.74, so the MSRV job pins that inherited-lint floor exactly.
+      - uses: dtolnay/rust-toolchain@1.74.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + test on MSRV
+        run: |
+          cargo build -p t-boost-core --all-features
+          cargo test -p t-boost-core --all-features
+
+  # ---- Feature-matrix builds (each flag composes independently) ----------
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build each feature combination
+        run: |
+          cargo build -p t-boost-core --no-default-features
+          cargo build -p t-boost-core --no-default-features --features arrow
+          cargo build -p t-boost-core --no-default-features --features nightly
+          cargo build -p t-boost-core --all-features
+
+  # ---- No-pyo3-in-core + wasm32 smoke build (the no-Python guarantee) ----
+  portability:
+    name: NoPyo3 + wasm32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: NoPyo3 (pyo3/numpy must be absent from the core dep graph)
+        run: |
+          if cargo tree -p t-boost-core --all-features -e normal | grep -E 'pyo3|numpy'; then
+            echo "::error::pyo3/numpy leaked into t-boost-core"; exit 1
+          fi
+      - name: Wasm32 smoke build (fixed-width index fields, no usize on the wire)
+        run: cargo build -p t-boost-core --target wasm32-unknown-unknown
+
+  # ---- Supply chain: licenses, advisories, bans, sources -----------------
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  # ---- Coverage: cargo-llvm-cov over the core crate (spec §13.10) --------------
+  # spec §13.10 promises: "Coverage [CHECK]: cargo
+  # llvm-cov over the core crate, target >= 90% line coverage, with the math modules
+  # ... held to >= 95% ... A drop below threshold on changed files is [GATE]; absolute
+  # coverage is [CHECK]." No coverage tooling existed anywhere in CI before this job.
+  # This is a first cut: it reports
+  # (per-file percentages + an lcov artifact) but does not yet gate on a threshold.
+  # `continue-on-error: true` is deliberate, not an oversight — there is no established
+  # baseline yet, so failing merges against an unmeasured number would be arbitrary.
+  # TODO(spec §13.10): once a baseline exists, add the changed-file coverage-drop
+  # check and flip this to a real [GATE] (drop `continue-on-error`, add a threshold).
+  coverage:
+    name: coverage (cargo-llvm-cov, informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate lcov report (all features)
+        run: cargo llvm-cov -p t-boost-core --all-features --lcov --output-path lcov.info
+      - name: Per-file coverage report (math modules held to a higher bar — spec §13.10)
+        run: cargo llvm-cov report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+
+  # ---- Platform matrix: spec §13.10's promised {stable,1.74} x {linux-x86_64, --
+  # ---- linux-aarch64, macos-aarch64, windows-x64} gate, promoted from -----------
+  # ---- release-gate.yml's manual-only checklist to a blocking one ---------------
+  # Previously this matrix existed ONLY in release-gate.yml's `rust-matrix` job,
+  # which is `on: workflow_dispatch` only (its own header: "it never publishes by
+  # itself") — a platform-specific regression could accumulate through an arbitrary
+  # number of merged PRs before anyone manually dispatched that workflow. Runs on
+  # push to main + nightly, NOT on `pull_request` (the full 4-OS x 2-toolchain
+  # matrix is too slow/costly for the fast per-PR loop the jobs above already cover
+  # on ubuntu-only) — "per-merge + nightly at minimum". `cargo deny` is
+  # intentionally not duplicated here — OS/toolchain-independent, already covered
+  # by the `deny` job above on every PR/push. release-gate.yml keeps its own copy
+  # of this same matrix so the manual pre-publish checklist stays self-contained.
+  platform-matrix:
+    name: platform ${{ matrix.rust }} / ${{ matrix.os }}
+    if: github.event_name != 'pull_request'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-14, windows-latest]
+        rust: ["1.96.1", "1.74.0"]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fmt
+        if: matrix.rust == '1.96.1'
+        run: cargo fmt --all --check
+      - name: Core clippy
+        run: cargo clippy -p t-boost-core --all-targets --all-features -- -D warnings
+      - name: Core tests (all features)
+        run: cargo test -p t-boost-core --all-features
+      - name: Core tests (no default features)
+        run: cargo test -p t-boost-core --no-default-features
+      - name: Doctests
+        run: cargo test -p t-boost-core --doc
+      - name: Determinism and invariant gates
+        run: |
+          cargo test -p t-boost-core --test determinism
+          cargo test -p t-boost-core --test scoring_determinism
+          cargo test -p t-boost-core --test invariants_gate
+      - name: Grep gates
+        if: matrix.rust == '1.96.1'
+        run: cargo run -p xtask -- check-all
+
+  # ---- Bit-repro-first dispatch policy canary (spec §13.4/§11.1, plan C4) -------
+  # multiversion/target-cpu=x86-64-v3 runtime dispatch is a decided-deferred policy
+  # (2026-07-11): bit-reproducibility outranks serve speed, so dispatch ships only
+  # once specific (integer-only) kernels are proven order-exact across vector
+  # widths — not yet audited. This job is the standing regression canary: it proves
+  # an x86-64-v3 build is ALREADY byte-identical to the shipped portable baseline on
+  # today's scalar kernels, so adopting the faster baseline later is a verified
+  # green flip, not a gamble. Same cadence as platform-matrix (push to main +
+  # nightly, not per-PR — this rebuilds the crate twice under different RUSTFLAGS,
+  # too slow for the fast per-PR loop above) and a near-identical sibling of
+  # release-gate.yml's copy of this job, kept for the same reason platform-matrix
+  # and rust-matrix both exist.
+  bit-repro-cpu-baseline:
+    name: target-cpu=x86-64-v3 vs portable baseline (byte-identical canary)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Check host CPU supports AVX2 (the x86-64-v3 floor)
+        id: cpu-check
+        run: |
+          if grep -qE '(^|[[:space:]])avx2([[:space:]]|$)' /proc/cpuinfo 2>/dev/null; then
+            echo "has_avx2=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_avx2=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Runner CPU lacks AVX2 - skipping the target-cpu=x86-64-v3 canary (skip-with-notice, not a false pass). Re-run on an AVX2 runner to actually exercise this guard."
+          fi
+      - name: Determinism + scoring-determinism suites (portable baseline)
+        if: steps.cpu-check.outputs.has_avx2 == 'true'
+        run: |
+          cargo test -p t-boost-core --test determinism
+          cargo test -p t-boost-core --test scoring_determinism
+      - name: bit-repro fixture (portable baseline)
+        if: steps.cpu-check.outputs.has_avx2 == 'true'
+        run: cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-baseline.bin
+      - name: Determinism + scoring-determinism suites (target-cpu=x86-64-v3)
+        if: steps.cpu-check.outputs.has_avx2 == 'true'
+        env:
+          RUSTFLAGS: "-D warnings -C target-cpu=x86-64-v3"
+        run: |
+          cargo test -p t-boost-core --test determinism
+          cargo test -p t-boost-core --test scoring_determinism
+      - name: bit-repro fixture (target-cpu=x86-64-v3)
+        if: steps.cpu-check.outputs.has_avx2 == 'true'
+        env:
+          RUSTFLAGS: "-D warnings -C target-cpu=x86-64-v3"
+        run: cargo run -p xtask -- bit-repro --seed 7 --output target/bit-repro-v3.bin
+      - name: Byte-compare the two builds' fixture output
+        if: steps.cpu-check.outputs.has_avx2 == 'true'
+        run: cmp target/bit-repro-baseline.bin target/bit-repro-v3.bin

@@ -1,0 +1,10 @@
+# libFuzzer dictionary for fuzz_deserialize (AFL/libFuzzer -dict= format).
+#
+# The three newer wire envelopes (crates/t-boost-core/src/serialize.rs) are gated
+# behind a 4-byte magic prefix that a decoder rejects immediately if absent. Without a
+# hint, the mutator would need to blindly guess one of these exact 4-byte sequences
+# (1 in ~4 billion per attempt) before ever reaching the real decode logic beneath the
+# prefix check. Seeding them here lets libFuzzer insert/splice the tokens directly.
+"TBMC"
+"TBTM"
+"TBMT"

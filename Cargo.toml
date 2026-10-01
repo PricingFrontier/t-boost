@@ -1,0 +1,83 @@
+# t-boost workspace — the maturin "separated" layout (spec §02.2):
+# pure-Rust `t-boost-core` + thin `t-boost-py` (cdylib) + dev-only `xtask`.
+#
+# default-members EXCLUDES `t-boost-py`: the core's Correctness gates
+# (fmt/clippy/test) run with no Python toolchain in the loop (spec §02.7 /
+# §02.6 rule 4). The py crate builds only via maturin / Release CI.
+[workspace]
+members      = ["crates/t-boost-core", "crates/t-boost-py", "xtask"]
+default-members = ["crates/t-boost-core", "xtask"]
+resolver     = "2"
+
+[workspace.package]
+version      = "0.6.0"                 # shared crate semver; the wire schema_version is separate (§02.8)
+edition      = "2021"
+# MSRV. The `[workspace.lints]` table this workspace relies on was stabilised in
+# Rust 1.74, so 1.74 is the minimum floor compatible with inherited lint gates.
+# This still satisfies the wheel portability floor.
+rust-version = "1.74"
+license      = "Apache-2.0"
+repository   = "https://github.com/PricingFrontier/t-boost"
+
+[workspace.dependencies]
+# Pinned ONCE here at the root; each crate opts into the subset it uses.
+rayon        = "1"
+ndarray      = "0.16"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = { version = "1", features = ["float_roundtrip"] }   # correctly-rounded f64 parse so TableModel/bank JSON round-trips bit-exactly
+bincode      = { version = "2", features = ["serde"] }   # 2.x; serde path, FROZEN config::standard() (§10)
+# default-features = false drops `getrandom`/OS entropy: the reproducible path seeds
+# ONLY via `Pcg64::seed_from_u64(pb_seed(..))` (§02.3b), never the OS RNG. This is
+# also what lets the core smoke-build on wasm32-unknown-unknown (the §02.6 gate) —
+# getrandom has no wasm32-unknown-unknown backend without an explicit opt-in.
+rand         = { version = "0.8", default-features = false }
+rand_pcg     = "0.3"                   # Pcg64 — the named, versioned PRNG (§1); deterministic re-seeding, NOT "split"
+thiserror    = "1"
+num-traits   = "0.2"
+smallvec     = { version = "1", features = ["serde"] }   # FeatureSet backing (§2.7)
+itertools    = "0.13"                  # izip! for the no-indexing loss/engine hot loops (§05/§06)
+multiversion = "0.7"                   # runtime-dispatched SIMD; safe (§11)
+pulp         = "0.18"                  # safe SIMD abstraction; safe (§11)
+# pyo3/numpy 0.29 clears RUSTSEC-2026-0177 (a missing `Sync` bound on
+# `PyCFunction::new_closure`) while preserving the abi3-py310 binding shape.
+pyo3         = { version = "0.29", default-features = false }
+numpy        = "0.29"
+proptest     = "1"                     # dev-only: property tests (§13.3)
+
+# The shared lint table — the §1 panic GATE expressed as config, inherited by the
+# core via `[lints] workspace = true`. NOTE: `unsafe_code = "forbid"` is deliberately
+# NOT here — `forbid` cannot be locally relaxed, which would make the pyo3 py-crate
+# (needs `unsafe` for macro expansion) uncompilable. `forbid(unsafe_code)` is instead
+# a CORE crate attribute (crates/t-boost-core/src/lib.rs).
+# `arithmetic_side_effects` is NOT here either: it is SCOPED per-module (§02.3a),
+# backed by `overflow-checks = true` in all profiles.
+[workspace.lints.clippy]
+unwrap_used      = "deny"
+expect_used      = "deny"
+panic            = "deny"
+unreachable      = "deny"
+indexing_slicing = "deny"
+
+[workspace.lints.rust]
+missing_docs = "deny"
+
+# Overflow checks ON in EVERY profile (spec §02.3a). This is the runtime half of
+# the integer-safety contract: `arithmetic_side_effects` is scoped per-module
+# rather than denied workspace-wide, so a wrapping/overflowing add in a hot loop
+# must trap at runtime in release too — never silently wrap. Profiles are only
+# honoured in the WORKSPACE ROOT manifest (cargo ignores `[profile.*]` in member
+# crates), which is why they live here.
+[profile.dev]
+overflow-checks = true
+
+[profile.release]
+overflow-checks = true
+# Perf: whole-crate codegen + cross-crate thin LTO. Pure scheduling/inlining — no
+# fast-math, no FP contraction — so outputs stay bit-identical (verified by fixture
+# bit-compare). ~free speedup on the hist/refine hot loops. (Measured 2026-07-05:
+# overflow-checks=false gives NO additional gain on this workload — keep the §02.3a gate.)
+lto = "thin"
+codegen-units = 1
+
+[profile.test]
+overflow-checks = true

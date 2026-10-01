@@ -1,0 +1,7 @@
+# Develop on stable (with the gate components). The MSRV (1.74, see workspace
+# Cargo.toml) is enforced by a dedicated CI matrix job that pins 1.74 explicitly,
+# NOT by forcing every contributor onto the MSRV toolchain here — that is better
+# practice than pinning the repo to its floor (spec §02.7's MSRV job overrides this).
+[toolchain]
+channel    = "stable"
+components = ["rustfmt", "clippy"]

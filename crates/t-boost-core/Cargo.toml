@@ -1,0 +1,37 @@
+[package]
+name = "t-boost-core"
+description = "t-boost core: a depth-3 oblivious gradient boosting machine, exactly decomposable into ≤3rd-order fANOVA tables. Pure Rust, no Python."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true                 # inherits the §1 panic-gate clippy set + missing_docs
+
+[dependencies]
+# Phase-0 subset of the pinned workspace set. (ndarray/multiversion/pulp/num-traits
+# are added by §03/§11 when first used — no unused deps in the core.)
+thiserror.workspace  = true
+serde.workspace      = true
+serde_json.workspace = true
+bincode.workspace    = true
+smallvec.workspace   = true
+itertools.workspace  = true
+rayon.workspace      = true
+rand.workspace       = true
+rand_pcg.workspace   = true
+
+[features]
+default = []
+arrow   = []                     # §03 zero-copy Arrow ingest (stub flag in Phase 0)
+nightly = []                     # §11 portable_simd path (stub flag in Phase 0)
+# NOTE: no pyo3, no numpy — verified by the NoPyo3 CI gate (§02.6).
+
+[dev-dependencies]
+# rayon is also a normal dep, but integration tests link only against the crate +
+# its dev-deps, so it must be listed here too to drive the {1,2,8}-thread
+# determinism harness.
+rayon.workspace     = true
+proptest.workspace  = true

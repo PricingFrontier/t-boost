@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+description = "t-boost dev tasks: grep-gates and the accuracy harness. Dev-only, never published, ships no library code."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# Deliberately does NOT inherit `[lints] workspace = true`: `xtask` is in the
+# unwrap-allowed set {tests, benches, xtask} (spec §1 / plan F4), so the no-panic
+# deny set does not apply to dev tooling.
+
+[dependencies]
+rayon.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+t-boost-core = { path = "../crates/t-boost-core", version = "0.6.0" }
