@@ -25,7 +25,7 @@ with.
 | `xtask/` | Dev-only Rust tasks: the grep-gates (`check-all`), `bit-repro`, `accuracy`, `release-preflight`. |
 | `fuzz/` | cargo-fuzz targets (a separate workspace with its own lock file). |
 | `scripts/` | Release tooling: `release_version.py`, `verify_pypi_release.py`, `package_smoke_check.py`. |
-| `.github/workflows/` | `ci.yml` (the gates), `release.yml` (PyPI), `release-gate.yml` (manual pre-publish checklist), `fuzz.yml`. |
+| `.github/workflows/` | `ci.yml` (the gates), `release.yml` (PyPI), `release-gate.yml` (manual pre-publish checklist), `coverage.yml`, `fuzz.yml`. |
 
 ## Environment
 
@@ -87,12 +87,15 @@ cmp target/bit-repro-a.bin target/bit-repro-b.bin
 | `features` | the core builds under each feature combination (`arrow`, `nightly`) |
 | `portability` | no `pyo3`/`numpy` in the core's dependency graph; the core builds for `wasm32-unknown-unknown` |
 | `deny` | `cargo deny check` (licenses, advisories, bans, sources) |
-| `coverage` | `cargo llvm-cov` — informational, `continue-on-error` until a baseline exists |
 
 On push to `main`, nightly and manual dispatch only (not on pull requests):
 `platform-matrix` re-runs the core gates on Linux x86_64/aarch64, macOS arm64 and Windows
 under Rust 1.96.1 and 1.85, and `bit-repro-cpu-baseline` byte-compares a
 `target-cpu=x86-64-v3` build against the portable baseline.
+
+`coverage.yml` runs `cargo llvm-cov` over the core nightly and on demand. It is informational
+(it gates nothing yet) and lives outside `ci.yml` because the instrumented suite runs for over
+two hours.
 
 ## Code rules
 
