@@ -15,6 +15,7 @@ import pytest
 from sklearn.base import clone
 
 from t_boost import TBoostClassifier, TBoostRegressor
+from _artifact import ensemble_fit
 
 
 @pytest.fixture(scope="module")
@@ -181,9 +182,17 @@ def test_deployed_table_count_comes_from_the_artifact_not_the_prune_report(data)
     assert artifact >= len(m.pruning_report_.get("deployed") or [])
 
 
-def test_deployed_table_count_is_None_when_there_is_no_table_bank(data):
+def test_deployed_table_count_counts_the_full_bank_when_unpruned(data):
     X, y = data
-    assert _mk(prune=False).fit(X, y)._deployed_table_count() is None
+    unpruned = _mk(prune=False).fit(X, y)._deployed_table_count()
+    assert unpruned is not None
+    assert unpruned >= _mk(prune=True).fit(X, y)._deployed_table_count()
+
+
+def test_deployed_table_count_is_None_when_there_is_no_table_bank(data):
+    # Only a tree ensemble (a model saved by an older t-boost) has no deployed bank.
+    X, y = data
+    assert ensemble_fit(_mk(prune=False), X, y)._deployed_table_count() is None
 
 
 # ------------------------------------------------- proactive warning: knobs that do nothing ----

@@ -103,9 +103,8 @@ _ES_ADAPTIVE_DEFAULT = 1.5
 # insur-arena cell — default and tuned variants — deployed the CV-pruned tables-only model
 # (the adapter forced prune=True on all val-is-None fits), so the constructors now default to
 # the same artifact. The selection is held-out-guarded (neutral-or-better by construction) and
-# costs a handful of extra single-bag fold fits on top of the deploy fit. Pass prune=False for
-# the cheaper full-ensemble artifact (and for explain-time table re-weighting, which pruned
-# models freeze at fit).
+# costs a handful of extra single-bag fold fits on top of the deploy fit. prune=False deploys the
+# full, unpruned table bank instead: every fit's artifact is rating tables.
 _PRUNE_DEFAULT = True
 
 
@@ -1497,6 +1496,89 @@ def _inverse_link(eta: "np.ndarray", link: str) -> "np.ndarray":
     if link == "logit":
         return np.asarray(1.0 / (1.0 + np.exp(-eta)))
     return eta
+
+
+def _label_value(label: Any) -> Any:
+    """A class label as a plain Python scalar (numpy scalars do not survive ``json.dumps``)."""
+    return label.item() if isinstance(label, np.generic) else label
+
+
+def _contribution_terms(
+    values: "np.ndarray",
+    feature_sets: list[list[int]],
+    names: list[str],
+    to_input: list[int],
+    columns: list[list[Any]],
+    split_interactions: bool,
+    n_rows: int,
+) -> tuple["np.ndarray", list[tuple[str, str, list[Any]]]]:
+    """One bank's ``(n_rows, n_terms)`` contribution matrix and its terms, each
+    ``(name, term_type, per-row feature values)``: one term per effect, or with
+    ``split_interactions`` one per input feature (each effect shared equally among its
+    features)."""
+    terms: list[tuple[str, str, list[Any]]] = []
+    if split_interactions:
+        matrix = np.zeros((n_rows, len(names)), dtype=np.float64)
+        for k, raws in enumerate(feature_sets):
+            for raw in raws:
+                matrix[:, to_input[raw]] += values[:, k] / len(raws)
+        for j, name in enumerate(names):
+            terms.append((name, "feature", columns[j]))
+        return matrix, terms
+    for raws in feature_sets:
+        cols = [to_input[raw] for raw in raws]
+        if len(cols) == 1:
+            terms.append((names[cols[0]], "main", columns[cols[0]]))
+        else:
+            joint = [{names[j]: columns[j][i] for j in cols} for i in range(n_rows)]
+            terms.append((":".join(names[j] for j in cols), "interaction", joint))
+    return np.asarray(values, dtype=np.float64), terms
+
+
+def _ladder_parts(
+    f0: float,
+    matrix: "np.ndarray",
+    terms: list[tuple[str, str, list[Any]]],
+    eta: "np.ndarray",
+    mu: "np.ndarray",
+    n_rows: int,
+) -> dict[str, Any]:
+    """Everything a records or dataframe row needs for one bank's ladder."""
+    if matrix.shape[1]:
+        order = np.argsort(-np.abs(matrix), axis=1, kind="stable")
+        ranks = np.empty_like(order)
+        np.put_along_axis(ranks, order, np.arange(1, matrix.shape[1] + 1)[None, :], axis=1)
+    else:
+        ranks = np.zeros((n_rows, 0), dtype=np.int64)
+    return {
+        "base": np.full(n_rows, f0),
+        "matrix": matrix,
+        "terms": terms,
+        "ranks": ranks,
+        "sums": matrix.sum(axis=1),
+        "eta": eta,
+        "mu": mu,
+    }
+
+
+def _ladder_record(part: dict[str, Any], i: int) -> dict[str, Any]:
+    return {
+        "base_value": float(part["base"][i]),
+        "sum_contributions": float(part["sums"][i]),
+        "prediction_from_contributions": float(part["eta"][i]),
+        "prediction_value": float(part["mu"][i]),
+        "contributions": [
+            {
+                "term": term,
+                "term_type": term_type,
+                "feature": term,
+                "feature_value": fv[i],
+                "contribution": float(part["matrix"][i, k]),
+                "rank": int(part["ranks"][i, k]),
+            }
+            for k, (term, term_type, fv) in enumerate(part["terms"])
+        ],
+    }
 
 
 # Below this many rows the per-value loop beats factorize's fixed cost; both give the same list.
@@ -2907,6 +2989,28 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             X = X.drop(list(dict.fromkeys(consumed)))
         return X, resolved
 
+    def _explain_mass(
+        self, sample_weight: Any, exposure: Any, model: Any
+    ) -> "tuple[np.ndarray | None, np.ndarray | None]":
+        """The per-row mass ``tables()`` hands the native export. Explicit values win, each
+        defaulting independently to its fit-time stash (multiclass fits never stash
+        exposure). A tables-only model keeps the ledger it stored at fit unless the caller
+        passes a mass, so only then do the fit-time defaults apply."""
+        tables_only = isinstance(model, (_TableModel, _MultiClassTableModel))
+        if tables_only and sample_weight is None and exposure is None:
+            return None, None
+        weight32 = (
+            _as_float32_1d(sample_weight, "sample_weight")
+            if sample_weight is not None
+            else getattr(self, "_fit_sample_weight_", None)
+        )
+        exposure32 = (
+            _as_float32_1d(exposure, "exposure")
+            if exposure is not None
+            else getattr(self, "_fit_exposure_", None)
+        )
+        return weight32, exposure32
+
     def _resolve_explain_inputs(
         self, X: Any, sample_weight: Any, exposure: Any
     ) -> tuple[Any, Any, Any]:
@@ -3126,9 +3230,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     ) -> dict[str, Any]:
         """Resolve ``tables()``'s measure arguments against the fit-time measure.
 
-        ``ref_measure=None`` means "the ledger this estimator fitted under": for a pruned fit
-        the frozen deployed bank as is, for an unpruned fit a fresh purification under the
-        fit-time measure. Any explicit name re-expresses the same function under that
+        ``ref_measure=None`` means "the ledger this estimator fitted under": the deployed bank
+        as stored (or, given a call-time mass, re-centred on those rows under the fit-time
+        measure). Any explicit name re-expresses the same function under that
         measure (predictions never change). ``measure_floor=None`` inherits the fit-time
         floor.
         """
@@ -3445,12 +3549,37 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         if not self.prune and isinstance(model, _Model):
             self.delta_step_gate_ = model.delta_step_gate
+            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
+            model = self._full_tables(model, x32, y32, weight32, exposure32, cat_x)
         self._model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features
         if feature_names is not None:
             self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         return model
+
+    def _full_tables(
+        self, model: _Model, x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None,
+    ) -> _TableModel:
+        """The unpruned deploy: every table of ``model``, purified on the training rows under
+        the fit's measure, with no re-anchor or rebalance, so it predicts as the ensemble does
+        (to float32 rounding) while its tables are fixed at fit like a pruned model's."""
+        w = weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
+        w = np.ascontiguousarray(w)
+        kw = self._measure_kwargs()
+        supports = sorted(
+            tuple(sorted(int(i) for i in u))
+            for u, _ in model.table_variances(
+                x32, w, cat_x=cat_x, exposure=exposure32, n_jobs=self._resolve_n_jobs(), **kw
+            )
+        )
+        return model.apply_keepset(
+            x32, np.ascontiguousarray(y32), w, [list(u) for u in supports],
+            reanchor=False, rebalance=False, n_jobs=self._resolve_n_jobs(),
+            exposure=exposure32, cat_x=cat_x, **kw,
+        )
 
     def _fit_and_prune(
         self, booster: _Booster, x32: np.ndarray, y32: np.ndarray,
@@ -5134,16 +5263,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
     # --- Contributions and importances (rustystats `predict_contributions` contract) ---------
 
-    def _deployed_tables(self) -> _TableModel:
-        """The deployed rating-table model, which both contributions and importances read."""
+    def _deployed_tables(self) -> "_TableModel | _MultiClassTableModel":
+        """The deployed rating tables, which both contributions and importances read. Every
+        fit deploys tables (an unpruned fit keeps all of them); only a model saved by an older
+        t-boost as a tree ensemble has none."""
         check_is_fitted(self)
-        if getattr(self, "_multi_model", None) is not None:
-            raise ValueError("contributions and importances are not supported for multiclass models")
-        model = self._model
-        if not isinstance(model, _TableModel):
+        multi = getattr(self, "_multi_model", None)
+        model = multi if multi is not None else self._model
+        if not isinstance(model, (_TableModel, _MultiClassTableModel)):
             raise ValueError(
-                "contributions and importances read the deployed rating tables, which a model "
-                "fitted with prune=False does not have; refit with prune=True (the default)"
+                "this model was saved by an older t-boost as a tree ensemble, without its "
+                "rating tables; refit it to get contributions and importances"
             )
         return model
 
@@ -5163,8 +5293,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
     @property
     def link(self) -> str:
-        """The link between the raw score and the prediction: ``identity``, ``log`` or
-        ``logit``."""
+        """The link between the raw score and the prediction: ``identity``, ``log``,
+        ``logit`` or (a multiclass fit) ``softmax``."""
+        if getattr(self, "_multi_model", None) is not None:
+            return "softmax"
         if self.objective == "logistic":
             return "logit"
         return "identity" if self.objective == "squared_error" else "log"
@@ -5175,18 +5307,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         Each deployed effect's Sobol share (its variance over the model's, under the reference
         measure the tables were purified against) is split equally among the features it
-        involves, as in the Shapley split of ``predict_contributions``. Read from the model;
-        needs no data.
+        involves, as in the Shapley split of ``predict_contributions``. A multiclass model
+        averages this over its class logits. Read from the model; needs no data.
         """
         try:
             model = self._deployed_tables()
         except ValueError as exc:  # hasattr() must see an unsupported model as lacking it
             raise AttributeError(str(exc)) from exc
+        banks = model.sobol() if isinstance(model, _MultiClassTableModel) else [model.sobol()]
         to_input = self._raw_to_input_column()
         out = np.zeros(int(self.n_features_in_), dtype=np.float64)
-        for raws, share in model.sobol():
-            for raw in raws:
-                out[to_input[raw]] += share / len(raws)
+        for shares in banks:
+            per_bank = np.zeros_like(out)
+            for raws, share in shares:
+                for raw in raws:
+                    per_bank[to_input[raw]] += share / len(raws)
+            total = per_bank.sum()
+            if total > 0:
+                out += per_bank / total
         total = out.sum()
         return out / total if total > 0 else out
 
@@ -5210,7 +5348,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         exactly, because the deployed model IS its rating tables: ``base_value`` is the tables'
         intercept and each contribution is one table's value for the row. Same record shape as
-        rustystats' ``GLMModel.predict_contributions``.
+        rustystats' ``GLMModel.predict_contributions``. A multiclass model decomposes every
+        class logit the same way (see Returns).
 
         Parameters
         ----------
@@ -5228,10 +5367,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             its features. These are exact interventional Shapley values.
         return_format : {"records", "dataframe"}, default "records"
             ``"records"``: one dict per row with a nested ``contributions`` list.
-            ``"dataframe"``: a long polars DataFrame, one row per ``(row_index, term)``.
+            ``"dataframe"``: a long polars DataFrame, one row per ``(row_index, term)`` (per
+            ``(row_index, class, term)`` for a multiclass model).
         validate : bool, default True
             Check both identities above against the model's own raw score and prediction (the
-            positive-class probability for a classifier), raising ``ValueError`` on a breach.
+            class probabilities for a classifier), raising ``ValueError`` on a breach.
         atol, rtol : float
             Tolerance ``|delta| <= atol + rtol * |actual|``. Predictions are float32, so the
             defaults are looser than rustystats'.
@@ -5243,12 +5383,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             ``base_value``, ``sum_contributions``, ``prediction_from_contributions``,
             ``prediction_value`` and ``contributions`` (each with ``term``, ``term_type``,
             ``feature``, ``feature_value``, ``contribution`` and ``rank`` by absolute size).
+            For a multiclass model each row instead holds ``family="multinomial"``,
+            ``link="softmax"``, ``prediction_space="probability"`` and a ``classes`` list with
+            one entry per class (``class`` plus the per-row keys above): ``base_value`` and the
+            contributions add up to that class's logit, and ``prediction_value`` is its
+            softmax probability.
 
         Raises
         ------
         ValueError
-            For a multiclass model, a model fitted with ``prune=False`` (no deployed tables),
-            exposure on a non-log-link model, or non-positive exposure.
+            For exposure on a non-log-link model, non-positive exposure, or a model saved by
+            an older t-boost without its rating tables.
         """
         if return_format not in ("records", "dataframe"):
             raise ValueError(f"return_format must be 'records' or 'dataframe', got {return_format!r}")
@@ -5261,133 +5406,150 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             X = collect_frame(X, needed)
         frame = X if is_polars_eager(X) else None
         exposure = resolve_vector(frame, exposure, "exposure")
+        link = self.link
+        if exposure is not None and link != "log":
+            raise ValueError("exposure= is only meaningful for log-link models")
         x32, cat_kw = self._serve_kwargs(X, model)
-        f0, values, feature_sets = model.effect_contributions(
-            x32, **cat_kw, n_jobs=self._resolve_n_jobs()
-        )
-        n_rows = values.shape[0]
-        # Summed left to right from f0, exactly as the native scorer sums, so the raw score is
-        # reproduced to the last float64 bit before its float32 rounding.
-        eta = np.cumsum(np.column_stack([np.full(n_rows, f0), values]), axis=1)[:, -1]
-
+        n_jobs = self._resolve_n_jobs()
+        banks: list[tuple[float, np.ndarray, list[list[int]]]]
+        if isinstance(model, _MultiClassTableModel):
+            banks = model.effect_contributions(x32, **cat_kw, n_jobs=n_jobs)
+        else:
+            banks = [model.effect_contributions(x32, **cat_kw, n_jobs=n_jobs)]
+        multiclass = isinstance(model, _MultiClassTableModel)
+        n_rows = int(x32.shape[0])
         names = self._input_feature_names()
         to_input = self._raw_to_input_column()
         columns = [_input_column_values(X, j, names[j]) for j in range(len(names))]
-        terms: list[tuple[str, str, list[Any]]] = []  # (term, term_type, per-row feature values)
-        if split_interactions:
-            matrix = np.zeros((n_rows, len(names)), dtype=np.float64)
-            for k, raws in enumerate(feature_sets):
-                for raw in raws:
-                    matrix[:, to_input[raw]] += values[:, k] / len(raws)
-            for j, name in enumerate(names):
-                terms.append((name, "feature", columns[j]))
-        else:
-            matrix = values
-            for raws in feature_sets:
-                cols = [to_input[raw] for raw in raws]
-                if len(cols) == 1:
-                    terms.append((names[cols[0]], "main", columns[cols[0]]))
-                else:
-                    joint = [{names[j]: columns[j][i] for j in cols} for i in range(n_rows)]
-                    terms.append((":".join(names[j] for j in cols), "interaction", joint))
 
-        link = self.link
+        log_exposure = None
+        exp_list: list[Any] = []
         if exposure is not None:
-            if link != "log":
-                raise ValueError("exposure= is only meaningful for log-link models")
             exp_arr = np.asarray(exposure, dtype=np.float64).reshape(-1)
             if exp_arr.shape[0] != n_rows:
                 raise ValueError(f"exposure has {exp_arr.shape[0]} rows, X has {n_rows}")
             if not np.all(np.isfinite(exp_arr) & (exp_arr > 0)):
                 raise ValueError("exposure must be finite and strictly positive")
             log_exposure = np.log(exp_arr)
-            matrix = np.column_stack([matrix, log_exposure])
-            eta = eta + log_exposure
-            terms.append(("exposure", "exposure", exp_arr.tolist()))
+            exp_list = exp_arr.tolist()
 
-        mu = _inverse_link(eta, link)
+        # One ladder per bank: a single-output model has one, a multiclass model one per class.
+        ladders = []
+        for f0, values, feature_sets in banks:
+            matrix, terms = _contribution_terms(
+                values, feature_sets, names, to_input, columns, split_interactions, n_rows
+            )
+            # Summed left to right from f0, exactly as the native scorer sums, so the raw score
+            # is reproduced to the last float64 bit before its float32 rounding.
+            eta = np.cumsum(np.column_stack([np.full(n_rows, f0), values]), axis=1)[:, -1]
+            if log_exposure is not None:
+                matrix = np.column_stack([matrix, log_exposure])
+                eta = eta + log_exposure
+                terms.append(("exposure", "exposure", exp_list))
+            ladders.append((float(f0), matrix, terms, eta))
+
+        etas = np.column_stack([lad[3] for lad in ladders])
+        if multiclass:
+            shifted = np.exp(etas - etas.max(axis=1, keepdims=True))
+            mus = shifted / shifted.sum(axis=1, keepdims=True)
+        else:
+            mus = _inverse_link(etas, link)
         if validate:
-            self._validate_contributions(X, eta, mu, exposure, atol, rtol)
+            self._validate_contributions(X, etas, mus, log_exposure, atol, rtol)
 
-        base = np.full(n_rows, float(f0))
-        sums = matrix.sum(axis=1) if matrix.size else np.zeros(n_rows)
-        order = np.argsort(-np.abs(matrix), axis=1, kind="stable")
-        ranks = np.empty_like(order)
-        np.put_along_axis(ranks, order, np.arange(1, matrix.shape[1] + 1)[None, :], axis=1)
+        family = "multinomial" if multiclass else str(self.objective)
         output_space = "response" if link == "identity" else "linear_predictor"
-        family = self.objective
+        prediction_space = "probability" if multiclass else "response"
+        labels = [_label_value(c) for c in self.classes_] if multiclass else [None]
+        parts = [
+            _ladder_parts(f0, matrix, terms, etas[:, k], mus[:, k], n_rows)
+            for k, (f0, matrix, terms, _) in enumerate(ladders)
+        ]
         if return_format == "dataframe":
             import polars as pl
 
-            n_terms = len(terms)
-            return pl.DataFrame(
-                {
-                    "row_index": np.repeat(np.arange(n_rows, dtype=np.int64), n_terms),
-                    "term": [t for _ in range(n_rows) for t, _, _ in terms],
-                    "term_type": [tt for _ in range(n_rows) for _, tt, _ in terms],
-                    "feature": [t for _ in range(n_rows) for t, _, _ in terms],
-                    "feature_value": [str(fv[i]) for i in range(n_rows) for _, _, fv in terms],
-                    "contribution": matrix.reshape(-1),
-                    "rank": ranks.reshape(-1),
-                    "base_value": np.repeat(base, n_terms),
-                    "sum_contributions": np.repeat(sums, n_terms),
-                    "prediction_from_contributions": np.repeat(eta, n_terms),
-                    "prediction_value": np.repeat(mu, n_terms),
-                    "output_space": [output_space] * (n_rows * n_terms),
-                    "prediction_space": ["response"] * (n_rows * n_terms),
-                    "family": [family] * (n_rows * n_terms),
-                    "link": [link] * (n_rows * n_terms),
-                }
-            )
-        return [
-            {
+            frames = []
+            for label, part in zip(labels, parts):
+                n_terms = len(part["terms"])
+                cols: dict[str, Any] = {"row_index": np.repeat(np.arange(n_rows), n_terms)}
+                if multiclass:
+                    cols["class"] = [str(label)] * (n_rows * n_terms)
+                cols.update(
+                    {
+                        "term": [t for _ in range(n_rows) for t, _, _ in part["terms"]],
+                        "term_type": [tt for _ in range(n_rows) for _, tt, _ in part["terms"]],
+                        "feature": [t for _ in range(n_rows) for t, _, _ in part["terms"]],
+                        "feature_value": [
+                            str(fv[i]) for i in range(n_rows) for _, _, fv in part["terms"]
+                        ],
+                        "contribution": part["matrix"].reshape(-1),
+                        "rank": part["ranks"].reshape(-1),
+                        "base_value": np.repeat(part["base"], n_terms),
+                        "sum_contributions": np.repeat(part["sums"], n_terms),
+                        "prediction_from_contributions": np.repeat(part["eta"], n_terms),
+                        "prediction_value": np.repeat(part["mu"], n_terms),
+                        "output_space": [output_space] * (n_rows * n_terms),
+                        "prediction_space": [prediction_space] * (n_rows * n_terms),
+                        "family": [family] * (n_rows * n_terms),
+                        "link": [link] * (n_rows * n_terms),
+                    }
+                )
+                frames.append(pl.DataFrame(cols).with_columns(pl.col("row_index").cast(pl.Int64)))
+            out = pl.concat(frames)
+            return out.sort(["row_index"], maintain_order=True) if multiclass else out
+        records = []
+        for i in range(n_rows):
+            per_class = [_ladder_record(part, i) for part in parts]
+            head: dict[str, Any] = {
                 "family": family,
                 "link": link,
                 "output_space": output_space,
-                "prediction_space": "response",
-                "base_value": float(base[i]),
-                "sum_contributions": float(sums[i]),
-                "prediction_from_contributions": float(eta[i]),
-                "prediction_value": float(mu[i]),
-                "contributions": [
-                    {
-                        "term": term,
-                        "term_type": term_type,
-                        "feature": term,
-                        "feature_value": fv[i],
-                        "contribution": float(matrix[i, k]),
-                        "rank": int(ranks[i, k]),
-                    }
-                    for k, (term, term_type, fv) in enumerate(terms)
-                ],
+                "prediction_space": prediction_space,
             }
-            for i in range(n_rows)
-        ]
+            if multiclass:
+                head["classes"] = [
+                    {"class": label, **rec} for label, rec in zip(labels, per_class)
+                ]
+                records.append(head)
+            else:
+                records.append({**head, **per_class[0]})
+        return records
 
     def _validate_contributions(
-        self, X: Any, eta: np.ndarray, mu: np.ndarray, exposure: Any, atol: float, rtol: float
+        self,
+        X: Any,
+        etas: np.ndarray,
+        mus: np.ndarray,
+        log_exposure: "np.ndarray | None",
+        atol: float,
+        rtol: float,
     ) -> None:
-        x32, cat_kw = self._serve_kwargs(X, self._model)
-        raw = np.asarray(
-            self._model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
-        )
-        if self.objective == "logistic":
-            pred = np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1]
+        multi = getattr(self, "_multi_model", None)
+        model = multi if multi is not None else self._model
+        x32, cat_kw = self._serve_kwargs(X, model)
+        if multi is not None:
+            raw = np.asarray(model.predict_raw(x32, **cat_kw), dtype=np.float64)
+            pred = np.asarray(self.predict_proba(X), dtype=np.float64)
         else:
-            pred = np.asarray(self.predict(X), dtype=np.float64)
-        if exposure is not None:
-            log_exposure = np.log(np.asarray(exposure, dtype=np.float64).reshape(-1))
-            raw = raw + log_exposure
-            pred = pred * np.exp(log_exposure)
-        for what, got, want in (("raw score", eta, raw), ("prediction", mu, pred)):
+            raw = np.asarray(
+                model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
+            )[:, None]
+            if self.objective == "logistic":
+                pred = np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1:]
+            else:
+                pred = np.asarray(self.predict(X), dtype=np.float64)[:, None]
+        if log_exposure is not None:
+            raw = raw + log_exposure[:, None]
+            pred = pred * np.exp(log_exposure)[:, None]
+        for what, got, want in (("raw score", etas, raw), ("prediction", mus, pred)):
             bad = np.abs(got - want) > atol + rtol * np.abs(want)
             if bad.any():
-                worst = int(np.argmax(np.abs(got - want)))
+                row, col = np.unravel_index(int(np.argmax(np.abs(got - want))), got.shape)
                 raise ValueError(
                     f"predict_contributions failed its additivity check on the {what} at "
-                    f"{int(bad.sum())} of {len(want)} row(s); worst row {worst}: "
-                    f"{got[worst]!r} from contributions vs {want[worst]!r}. This is a t-boost "
-                    "bug; please report it with the model and input."
+                    f"{int(bad.any(axis=1).sum())} of {got.shape[0]} row(s); worst row {row}: "
+                    f"{got[row, col]!r} from contributions vs {want[row, col]!r}. This is a "
+                    "t-boost bug; please report it with the model and input."
                 )
 
     def __getstate__(self) -> dict[str, Any]:
@@ -5869,8 +6031,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         tables-only model (see ``pruning_report_``). ON by default — every insur-arena
         benchmark cell deployed the pruned artifact, and the selection is held-out-guarded
         (neutral-or-better by construction) — at the cost of a handful of extra single-bag
-        fold fits. Pass ``False`` for the cheaper full-ensemble artifact; note a pruned
-        model's ``tables()`` are frozen at fit (no explain-time re-weighting).
+        fold fits. ``False`` deploys the full, unpruned table bank instead (fitted faster, but
+        a much larger artifact than the pruned bank or the trees it is built from). Either
+        way the model is stored as rating tables.
     prune_validation_fraction : float, default=0.15
         Train/select split fraction of the LEGACY multiclass (K>=3) prune
         (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
@@ -6437,11 +6600,11 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ref_measure : {"exposure", "product_marginals", "uniform", "joint"} or None, default=None
             Reference measure the tables are purified against. ``None`` means the ledger
             this estimator fitted under (the constructor's ``ref_measure``, ``"exposure"``
-            by default): for a pruned fit the deployed bank exactly as stored, for an
-            unpruned fit a fresh purification under that measure. An explicit name
-            re-expresses the SAME function under that measure — the table sum on every cell,
-            and so every prediction, is unchanged; only which table owns shared mass moves.
-            On a pruned fit this runs on the bank's own stored support, so no rows are read.
+            by default): the deployed bank exactly as stored. An explicit name re-expresses
+            the SAME function under that measure — the table sum on every cell, and so every
+            prediction, is unchanged; only which table owns shared mass moves. Without a
+            call-time ``sample_weight``/``exposure`` this runs on the bank's own stored
+            support, so no rows are read.
             ``"exposure"`` weights each axis by its exposure-weighted empirical marginal plus
             the ``measure_floor`` positivity floor; ``"product_marginals"`` is the legacy
             half-uniform row-count blend (``laplace``); ``"uniform"`` weights every cell
@@ -6485,8 +6648,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             force the unweighted export) whenever ``X`` is different rows, since a different
             ``X`` with a coincidentally matching row count would silently misapply the
             fit-time mass. Cleared by ``set_params`` and refits, never leaks across fits.
-            No effect if ``self`` is a pruned (``prune=True``) model: its tables are already
-            frozen from fit time.
+            The deployed tables are stored, purified on the training rows at fit: passing
+            neither ``sample_weight`` nor ``exposure`` exports them as stored (which is the
+            fit-time-mass ledger), and passing either re-centres them on ``X``'s rows under
+            that mass. Predictions never change either way.
         exposure : array-like of shape (n_samples,) or str, optional
             Per-row exposure for ``X``, aligned to ``X``'s rows; a ``str`` names a column of
             the polars ``X``. See ``sample_weight`` — the
@@ -6508,18 +6673,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         check_is_fitted(self, "_model")
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
         x32, cat_x = self._serve_design(X)
-        # Explicit call-time mass wins; otherwise default to the fit-time stash (each of the
-        # two components independently). See the docstring caveat about non-fit-time X.
-        weight32 = (
-            _as_float32_1d(sample_weight, "sample_weight")
-            if sample_weight is not None
-            else getattr(self, "_fit_sample_weight_", None)
-        )
-        exposure32 = (
-            _as_float32_1d(exposure, "exposure")
-            if exposure is not None
-            else getattr(self, "_fit_exposure_", None)
-        )
+        weight32, exposure32 = self._explain_mass(sample_weight, exposure, self._model)
         payload = self._model.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),
@@ -7014,8 +7168,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         cross-validated held-out deviance, and deploy the smaller, more explainable
         tables-only model (see ``pruning_report_``). ON by default — every insur-arena
         benchmark cell deployed the pruned artifact, and the selection is held-out-guarded
-        (neutral-or-better by construction). Pass ``False`` for the cheaper full-ensemble
-        artifact. Available on both the binary and multiclass (K>=3) paths.
+        (neutral-or-better by construction). ``False`` deploys the full, unpruned table bank
+        instead (fitted faster, but a much larger artifact). Either way the model is stored
+        as rating tables. Available on both the binary and multiclass (K>=3) paths.
     prune_validation_fraction : float, default=0.15
         Train/select split fraction of the LEGACY multiclass (K>=3) prune
         (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
@@ -8000,6 +8155,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 bag_groups=bag_codes,
             )
             self.cell_refit_report_ = model.cell_refit_report
+            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
+            w_full = weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
+            model = model.to_tables(
+                x32, np.ascontiguousarray(w_full), cat_x=cat_x, **self._measure_kwargs()
+            )
         self._multi_model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features
@@ -8156,11 +8316,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         ref_measure : {"exposure", "product_marginals", "uniform", "joint"} or None, default=None
             Reference measure the tables are purified against. ``None`` means the ledger
             this estimator fitted under (the constructor's ``ref_measure``, ``"exposure"``
-            by default): for a pruned fit the deployed bank exactly as stored, for an
-            unpruned fit a fresh purification under that measure. An explicit name
-            re-expresses the SAME function under that measure — the table sum on every cell,
-            and so every prediction, is unchanged; only which table owns shared mass moves.
-            On a pruned fit this runs on the bank's own stored support, so no rows are read.
+            by default): the deployed bank exactly as stored. An explicit name re-expresses
+            the SAME function under that measure — the table sum on every cell, and so every
+            prediction, is unchanged; only which table owns shared mass moves. Without a
+            call-time ``sample_weight``/``exposure`` this runs on the bank's own stored
+            support, so no rows are read.
             ``"exposure"`` weights each axis by its exposure-weighted empirical marginal plus
             the ``measure_floor`` positivity floor; ``"product_marginals"`` is the legacy
             half-uniform row-count blend (``laplace``); ``"uniform"`` weights every cell
@@ -8205,8 +8365,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             ``numpy.ones``, to force the unweighted export) whenever ``X`` is different rows,
             since a different ``X`` with a coincidentally matching row count would silently
             misapply the fit-time mass. Cleared by ``set_params`` and refits, never leaks
-            across fits. No effect if ``self`` is a pruned (``prune=True``) model: its tables
-            are already frozen from fit time.
+            across fits. The deployed tables are stored, purified on the training rows at fit:
+            passing neither ``sample_weight`` nor ``exposure`` exports them as stored, and
+            passing either re-centres every class's bank on ``X``'s rows under that mass.
+            Predictions never change either way.
         exposure : array-like of shape (n_samples,) or str, optional
             Per-row exposure for ``X``, aligned to ``X``'s rows; a ``str`` names a column of
             the polars ``X``. See ``sample_weight`` — the
@@ -8232,19 +8394,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         target: _MultiClassModel | _MultiClassTableModel | _Model | _TableModel = (
             mm if mm is not None else self._model
         )
-        # Explicit call-time mass wins; otherwise default to the fit-time stash (multiclass
-        # fits never stash exposure — fit() rejects it for K>=3 — so only sample_weight can
-        # default there). See the regressor docstring's non-fit-time-X caveat.
-        weight32 = (
-            _as_float32_1d(sample_weight, "sample_weight")
-            if sample_weight is not None
-            else getattr(self, "_fit_sample_weight_", None)
-        )
-        exposure32 = (
-            _as_float32_1d(exposure, "exposure")
-            if exposure is not None
-            else getattr(self, "_fit_exposure_", None)
-        )
+        weight32, exposure32 = self._explain_mass(sample_weight, exposure, target)
         payload = target.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),

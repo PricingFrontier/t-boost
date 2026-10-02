@@ -2612,6 +2612,55 @@ pub fn prune_multiclass_to_keepset(
     Ok(out)
 }
 
+/// The lossless tables-only form of a multiclass model: every class's full purified bank under
+/// `w_measure`, with no table dropped and NO intercept re-anchor, so it predicts as the
+/// ensemble does (within the §08 reconstruction tolerance). The multiclass twin of
+/// [`TableModel::from_model`]; [`prune_multiclass_to_keepset`] is not, because its re-anchor
+/// shifts the logits even when every table is kept.
+///
+/// # Errors
+/// Propagates per-class bank construction and container validation failures.
+pub fn multiclass_full_tables(
+    mc: &MultiClassModel,
+    serve: &ServeBinnedMatrix,
+    w: &[f32],
+    w_measure: RefMeasure,
+) -> Result<MultiClassTableModel, PbError> {
+    let n = serve.0.n_rows as usize;
+    if w.len() != n {
+        return Err(PbError::ShapeMismatch {
+            what: format!("full tables: w {} != serve rows {n}", w.len()),
+        });
+    }
+    let mass = measure_mass(&w_measure, w, None);
+    let classes: Vec<TableModel> = mc
+        .classes
+        .par_iter()
+        .map(|m| -> Result<TableModel, PbError> {
+            let bank = m.explain_bank_with_mass(
+                serve,
+                w_measure.clone(),
+                crate::explain::TableBudget::default(),
+                false,
+                mass.as_deref(),
+            )?;
+            Ok(TableModel::from_model_and_bank(m, bank))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let class_version = classes
+        .iter()
+        .map(|c| c.schema_version)
+        .max()
+        .unwrap_or(mc.schema_version);
+    let out = MultiClassTableModel {
+        classes,
+        class_labels: mc.class_labels.clone(),
+        schema_version: class_version,
+    };
+    out.validate()?;
+    Ok(out)
+}
+
 /// [`prune_multiclass_to_keepset`] with a DEPLOYED-BOX BUDGET (see [`apply_box_budget`]).
 ///
 /// The keep-set is shared across classes, so the budget is too: a support's cost is the sum of

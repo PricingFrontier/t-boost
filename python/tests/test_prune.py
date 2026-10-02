@@ -10,7 +10,7 @@ import pytest
 
 from t_boost._t_boost import _Booster, _Model, _MultiClassTableModel, _TableModel
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
-from _artifact import model_bytes
+from _artifact import ensemble_fit, model_bytes
 
 
 def _noisy_poisson(n: int = 3000, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -116,7 +116,7 @@ def test_se_rule_is_honored_on_the_multiclass_path() -> None:
 
 def test_prune_default_on_deploys_table_model() -> None:
     # 2026-07-15 benchmark parity: prune defaults ON (every insur-arena cell deployed the
-    # CV-pruned tables-only artifact); prune=False opts back into the full tree ensemble.
+    # CV-pruned tables-only artifact); prune=False deploys the full, unpruned table bank.
     x, y = _noisy_poisson(n=1000)
     est = TBoostRegressor(objective="poisson", n_trees=100, n_bags=1, seed=0).fit(x, y)
     assert isinstance(est._model, _TableModel)
@@ -125,7 +125,8 @@ def test_prune_default_on_deploys_table_model() -> None:
     off = TBoostRegressor(
         objective="poisson", n_trees=100, n_bags=1, seed=0, prune=False
     ).fit(x, y)
-    assert isinstance(off._model, _Model)
+    assert isinstance(off._model, _TableModel)
+    assert off._model.deployed_table_count() >= est._model.deployed_table_count()
     assert not hasattr(off, "pruning_report_")
 
 
@@ -471,8 +472,8 @@ def test_bag_bank_jsons_returns_honest_replicates_behind_the_soup() -> None:
     x = (rng.integers(0, 9, size=4000).astype(np.float32)).reshape(-1, 1)
     mu = np.exp(0.25 * np.sin(x[:, 0]))
     y = rng.poisson(mu).astype(np.float32)
-    est = TBoostRegressor(objective="poisson", n_trees=200, n_bags=4, seed=0, prune=False).fit(
-        x, y
+    est = ensemble_fit(
+        TBoostRegressor(objective="poisson", n_trees=200, n_bags=4, seed=0, prune=False), x, y
     )  # bag_bank_jsons is the UNPRUNED _Model's replicate API
     assert isinstance(est._model, _Model)
 
@@ -505,9 +506,9 @@ def test_bag_bank_jsons_returns_honest_replicates_behind_the_soup() -> None:
     )
 
     # No bag partition -> typed error: single fits and wire round-trips both lack it.
-    single = TBoostRegressor(
-        objective="poisson", n_trees=50, n_bags=1, seed=0, prune=False
-    ).fit(x, y)
+    single = ensemble_fit(
+        TBoostRegressor(objective="poisson", n_trees=50, n_bags=1, seed=0, prune=False), x, y
+    )
     with pytest.raises(Exception, match="bag partition"):
         single._model.bag_bank_jsons(np.ascontiguousarray(x), keep)
     back = TBoostRegressor.from_bytes(est.to_bytes())
@@ -971,11 +972,11 @@ def test_prune_guard_single_bag_fit_has_no_oob_rows_and_is_skipped() -> None:
     assert g["skipped"] == "no out-of-bag evidence (single-bag fit)"
     # The guard ASKS the model rather than catching an error, so the predicate itself must be
     # false here (a caught error would be indistinguishable from a real failure).
-    unpruned = TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=1, seed=0,
-                                 prune=False, categorical_features=["c"]).fit(X, y)
+    unpruned = ensemble_fit(TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=1,
+                                            seed=0, prune=False, categorical_features=["c"]), X, y)
     assert unpruned._model.bag_oob_available() is False
-    bagged = TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=2, seed=0,
-                               prune=False, categorical_features=["c"]).fit(X, y)
+    bagged = ensemble_fit(TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=2,
+                                          seed=0, prune=False, categorical_features=["c"]), X, y)
     assert bagged._model.bag_oob_available() is True
     assert model_bytes(on) == model_bytes(off)
 
@@ -1099,7 +1100,7 @@ def test_prune_guard_evidence_is_the_raw_bank_and_biases_toward_firing() -> None
     # The unpruned twin: same params, same seed => the same seeded bag draw, so its recorded
     # membership IS the deploy fit's. If that ever stopped holding, assertion (1) below would
     # fail loudly rather than quietly measure the wrong rows.
-    twin = TBoostRegressor(graduate=False, **kw, prune=False).fit(x, y)
+    twin = ensemble_fit(TBoostRegressor(graduate=False, **kw, prune=False), x, y)
     m = twin._model
     assert isinstance(m, _Model)
     xc = np.ascontiguousarray(x)
@@ -1178,8 +1179,8 @@ def test_bag_membership_and_oob_scorer_are_thread_and_layout_deterministic() -> 
     x = np.column_stack([rng.uniform(0, 1, n), rng.uniform(0, 1, n)]).astype(np.float32)
     mu = np.exp(0.4 * np.sin(5 * x[:, 0]) + 0.3 * (x[:, 1] > 0.5))
     y = rng.poisson(mu).astype(np.float32)
-    est = TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=4, bag_subsample=0.7,
-                            seed=0, prune=False).fit(x, y)
+    est = ensemble_fit(TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=4,
+                                       bag_subsample=0.7, seed=0, prune=False), x, y)
     m = est._model
     assert isinstance(m, _Model)
 

@@ -7,7 +7,7 @@ from sklearn.base import clone
 
 from t_boost import TBoostClassifier, TBoostRegressor
 from t_boost.sklearn import _TableModel
-from _artifact import model_bytes
+from _artifact import ensemble_fit, model_bytes
 
 
 @pytest.mark.parametrize('alpha', [-0.1, 1.1, np.nan, np.inf, True, '0.5', None])
@@ -88,10 +88,10 @@ def test_native_diffusion_export_roundtrip_and_box_budget(order):
     y = (1.2 * (x[:, 0] > 0) - .8 * (x[:, 1] > 0)
          + 3 * np.all(x[:, :order] > 0, axis=1)
          + rng.normal(size=len(x))).astype(np.float32)
-    fitted = TBoostRegressor(n_trees=6, n_bags=1, n_jobs=1, validation_fraction=None,
-                             max_depth=order + 1, max_interaction_order=order,
-                             prune=False, interaction_gain_hurdle=0,
-                             colsample_bytree=1, leaf_refine_steps=0).fit(x, y)
+    fitted = ensemble_fit(TBoostRegressor(n_trees=6, n_bags=1, n_jobs=1, validation_fraction=None,
+                                          max_depth=order + 1, max_interaction_order=order,
+                                          prune=False, interaction_gain_hurdle=0,
+                                          colsample_bytree=1, leaf_refine_steps=0), x, y)
     weights = np.ones(len(y), dtype=np.float32)
     native = fitted._model
     source = native.apply_keepset(x, y, weights, native.table_supports(x), reanchor=False)

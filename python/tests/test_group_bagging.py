@@ -8,6 +8,7 @@ import numpy as np
 import polars as pl
 
 from t_boost import TBoostClassifier, TBoostRegressor
+from _artifact import ensemble_fit
 
 
 def _panel(n_groups: int = 600, rows_per_group: int = 4, seed: int = 0):
@@ -24,7 +25,7 @@ def _panel(n_groups: int = 600, rows_per_group: int = 4, seed: int = 0):
 def test_bags_never_split_a_group_on_the_single_output_path() -> None:
     frame, lin, g = _panel()
     y = (lin + np.random.default_rng(1).normal(scale=0.5, size=lin.size) > 0).astype(int)
-    est = TBoostClassifier(n_trees=60, n_bags=4, seed=0, prune=False).fit(frame, y, groups=g)
+    est = ensemble_fit(TBoostClassifier(n_trees=60, n_bags=4, seed=0, prune=False), frame, y, groups=g)
     mask = np.asarray(est._model.bag_in_bag_mask())  # (n_bags, n_rows)
     assert mask.shape == (4, y.size)
     for bag in mask:

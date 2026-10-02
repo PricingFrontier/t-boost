@@ -94,8 +94,17 @@ freq.feature_importances_                                        # Sobol shares 
 ```
 
 `exposure=` adds a `log(exposure)` contribution, so `prediction_value` becomes the expected total
-(`predict(X) * exposure`) rather than the rate per unit exposure. Both need the deployed rating
-tables, which `prune=True` (the default) produces. Multiclass models are not supported yet.
+(`predict(X) * exposure`) rather than the rate per unit exposure. A multiclass model decomposes
+each class logit the same way: each record holds a `classes` list, and each class's
+`prediction_value` is its softmax probability.
+
+Every model is stored as its rating tables. `prune=True` (the default) keeps the tables that earn
+their place. `prune=False` keeps all of them, which is quicker to fit but gives a much larger
+file: tens of MB on wide data, against well under 1 MB for a pruned model.
+
+`tables(X)` exports the tables as stored, centred on the training rows. Passing `sample_weight=`
+or `exposure=` re-centres them on `X`'s rows under that mass instead. That changes how the effect
+is shared between tables, but never a prediction.
 
 ## Saving and loading
 
@@ -122,7 +131,7 @@ the envelope: estimator metadata at the top level, and the model document as a J
 
 | Preserved | Notes |
 |-----------|-------|
-| The model (trees or pruned rating tables) | Bit-identical predictions after loading |
+| The model (its rating tables, pruned or full) | Bit-identical predictions after loading |
 | Constructor parameters | `get_params()` matches the fitted estimator |
 | Feature names, categorical layout, `classes_` | Needed to serve by column name |
 | Column specs | `_response_spec`, `_weights_spec`, `_exposure_spec`, `_groups_spec`: the column names given to `fit`, or `None` when passed as arrays |

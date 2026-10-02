@@ -321,6 +321,23 @@ impl TableModel {
         Ok(out)
     }
 
+    /// This model's bank re-centred on the rows of `x`, weighted by `mass` (per row; `None`
+    /// counts rows), under `w` — see [`TableBank::recentre_on`]. The same function, so the same
+    /// predictions; only how it is shared between tables changes.
+    ///
+    /// # Errors
+    /// Propagates the cell lookup and [`TableBank::recentre_on`].
+    pub fn recentred_bank(
+        &self,
+        x: &BinnedMatrix,
+        mass: Option<&[f32]>,
+        w: RefMeasure,
+    ) -> Result<TableBank, PbError> {
+        self.validate_binned_matrix(x)?;
+        let cells = self.column_cells(x)?;
+        self.bank.recentre_on(&cells, mass, w)
+    }
+
     /// The raw feature ids of every effect, in the order [`TableModel::effect_contributions`]
     /// reports them: the dense tables, then the factored effects.
     #[must_use]
@@ -989,6 +1006,48 @@ mod tests {
                 let sum = row.iter().fold(tm.bank.f0, |acc, v| acc + v);
                 assert_eq!(sum as f32, *served);
             }
+        }
+    }
+
+    /// Re-centring on rows never changes the function: every row scores the same. On the very
+    /// rows the bank was purified on (flat count, same measure) it reproduces the stored ledger;
+    /// a skewed per-row mass moves the supports.
+    #[test]
+    fn recentring_keeps_the_function_and_reproduces_the_stored_ledger() {
+        for (model, x) in [
+            (fixture_model(), fixture_serve()),
+            (fixture_multichannel_model(), fixture_multichannel_serve()),
+        ] {
+            let tm = TableModel::from_model(&model, &x, RefMeasure::Uniform).unwrap();
+            let cells = tm.row_cells(&x.0).unwrap();
+            let same = tm.recentred_bank(&x.0, None, RefMeasure::Uniform).unwrap();
+            for (a, b) in tm.bank.tables.iter().zip(&same.tables) {
+                assert_eq!(a.u, b.u);
+                for (va, vb) in a.values.values().iter().zip(b.values.values().iter()) {
+                    assert!((va - vb).abs() < 1e-12, "{va} vs {vb}");
+                }
+                assert_eq!(a.support, b.support);
+            }
+            let n = x.0.n_rows as usize;
+            let skew: Vec<f32> = (0..n).map(|r| if r % 2 == 0 { 9.0 } else { 1.0 }).collect();
+            let moved = tm
+                .recentred_bank(
+                    &x.0,
+                    Some(&skew),
+                    RefMeasure::ExposureMarginals { floor: 1e-3 },
+                )
+                .unwrap();
+            assert_ne!(moved.tables, tm.bank.tables);
+            for row in &cells {
+                let (a, b) = (tm.bank.score(row).unwrap(), moved.score(row).unwrap());
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "re-centring moved a score: {a} vs {b}"
+                );
+            }
+            assert!(tm
+                .recentred_bank(&x.0, skew.get(1..), RefMeasure::Uniform)
+                .is_err());
         }
     }
 

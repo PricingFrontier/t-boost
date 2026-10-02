@@ -48,7 +48,7 @@ use t_boost_core::loss::{
 use t_boost_core::prune::{
     bag_banks_for_keepset, bag_oob_evidence_available, bag_oob_group_sums_with,
     bag_raw_scores_for_rows, multiclass_bag_oob_evidence_available, multiclass_carve_arms,
-    multiclass_oob_arms, multiclass_prune_guard, multiclass_ranked_path,
+    multiclass_full_tables, multiclass_oob_arms, multiclass_prune_guard, multiclass_ranked_path,
     multiclass_realized_supports, prune_model_to_keepset, prune_model_to_tables,
     prune_model_to_tables_pinned, prune_multiclass_to_keepset,
     prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, MulticlassGuardEvidence,
@@ -6055,36 +6055,32 @@ impl PyTableModel {
         weight: Option<PyReadonlyArray1<'_, f32>>,
         exposure: Option<PyReadonlyArray1<'_, f32>>,
     ) -> PyResult<String> {
-        // The bank is already built and frozen: `x`/`weight`/`exposure` are ignored (a pruned
-        // tables-only model has fixed tables, independent of any serve matrix — accepted only
-        // so callers that pass them uniformly across `_Model` and `_TableModel` don't hit an
-        // unexpected-keyword-argument error). `ref_measure`, however, is HONOURED (2026-09-06):
-        // a measure other than the one the bank was purified under re-expresses the SAME
-        // function — the same table sum on every cell, so the same predictions — as a
-        // different ledger, via `TableBank::recompute_under` on the bank's own stored support.
-        // `None` keeps the deployed ledger.
+        // The bank was purified on the training rows at fit. A call-time `weight`/`exposure`
+        // re-centres it on the rows of `x` (`TableBank::recentre_on`), and a `ref_measure`
+        // other than the bank's re-expresses it under that measure; either way the table sum
+        // on every cell, so every prediction, is unchanged. Neither keeps the deployed ledger.
         let basis = parse_rating_basis(basis_json)?;
         let m = &self.model;
-        let recomputed;
-        let bank = match ref_measure {
-            Some(name) => {
-                let w = parse_ref_measure(Some(name), laplace, measure_floor).map_err(py_err)?;
-                if w == m.bank.w {
-                    &m.bank
-                } else if w == RefMeasure::Joint {
-                    recomputed = t_boost_core::joint::rejoint(
-                        &m.bank,
-                        &t_boost_core::joint::JointOptions::default(),
-                    )
-                    .map_err(py_err)?;
-                    &recomputed
-                } else {
-                    recomputed = m.bank.recompute_under(w).map_err(py_err)?;
-                    &recomputed
-                }
-            }
-            None => &m.bank,
+        let requested = ref_measure
+            .map(|name| parse_ref_measure(Some(name), laplace, measure_floor))
+            .transpose()
+            .map_err(py_err)?;
+        let mass = combined_explain_weight(weight, exposure)?;
+        let binned = match (&mass, x) {
+            (Some(_), Some(x)) => Some(
+                serve_binned_for_tables(m, raw_columns_from_array(x)?, cat_x, None)
+                    .map_err(py_err)?,
+            ),
+            _ => None,
         };
+        let bank = export_bank(
+            m,
+            binned.as_ref(),
+            mass.as_deref(),
+            requested.as_ref(),
+            measure_floor,
+        )
+        .map_err(py_err)?;
         bank.to_rating_export(
             m.link,
             &m.mode,
@@ -6284,6 +6280,43 @@ impl PyMultiClassModel {
             })
             .map_err(py_err)?;
         Ok(out)
+    }
+
+    /// The lossless tables-only form of this model: every class's full bank purified on the
+    /// training design `x` under the measure, no table dropped, no intercept re-anchor (see
+    /// `multiclass_full_tables`). What an unpruned multiclass fit deploys.
+    #[pyo3(signature = (x, weight, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: the design plus the measure's knobs.
+    fn to_tables(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        ref_measure: Option<String>,
+        laplace: f32,
+        measure_floor: f32,
+    ) -> PyResult<PyMultiClassTableModel> {
+        let columns = raw_columns_from_array(x)?;
+        let w_vec = weight
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
+            .to_vec();
+        let model = Arc::clone(&self.model);
+        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
+        let tm = py
+            .detach(move || {
+                let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                    what: "multiclass model has no classes".into(),
+                })?;
+                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
+                multiclass_full_tables(&model, &ServeBinnedMatrix(binned), &w_vec, w_measure)
+            })
+            .map_err(py_err)?;
+        Ok(PyMultiClassTableModel {
+            model: Arc::new(tm),
+            serve: Default::default(),
+        })
     }
 
     /// PROBE (2026-09-07): retain an arbitrary keep-set on this model (the K>=3 deploy step).
@@ -6715,6 +6748,72 @@ impl PyMultiClassTableModel {
         multiclass_array2(py, flat, k)
     }
 
+    /// `_TableModel.effect_contributions` for every class logit: one `(f0, values,
+    /// feature_sets)` per class, in `class_labels` order.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of (scalar, array, list) tuples.
+    fn effect_contributions<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
+    ) -> PyResult<Vec<(f64, Bound<'py, PyArray2<f64>>, Vec<Vec<u32>>)>> {
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let (per_class, n_rows) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass tables model has no classes".into(),
+                    })?;
+                    let ts = multiclass_table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
+                    let per_class = model
+                        .classes
+                        .iter()
+                        .map(|tm| tm.effect_contributions(&binned))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((per_class, binned.n_rows as usize))
+                })
+            })
+            .map_err(py_err)?;
+        per_class
+            .into_iter()
+            .zip(&self.model.classes)
+            .map(|(values, tm)| {
+                let feature_sets = tm.effect_feature_sets();
+                let values = values
+                    .into_pyarray(py)
+                    .reshape([n_rows, feature_sets.len()])
+                    .map_err(|err| {
+                        InternalError::new_err(format!(
+                            "could not reshape contribution array: {err}"
+                        ))
+                    })?;
+                Ok((tm.bank.f0, values, feature_sets))
+            })
+            .collect()
+    }
+
+    /// `_TableModel.sobol` for every class logit, in `class_labels` order.
+    fn sobol(&self) -> Vec<Vec<(Vec<u32>, f64)>> {
+        self.model
+            .classes
+            .iter()
+            .map(|tm| {
+                tm.bank
+                    .sobol()
+                    .into_iter()
+                    .map(|(u, s)| (u.0.iter().map(|f| f.0).collect(), s))
+                    .collect()
+            })
+            .collect()
+    }
+
     /// Per-class rating tables as a JSON object keyed by class label (each the stored pruned bank's
     /// export). `x`/`ref_measure`/`weight`/`exposure` are ignored — the banks are frozen.
     #[pyo3(signature = (x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None))]
@@ -6733,31 +6832,31 @@ impl PyMultiClassTableModel {
     ) -> PyResult<String> {
         let basis = parse_rating_basis(basis_json)?;
         let m = &self.model;
-        // Same contract as the scalar `_TableModel.tables`: `ref_measure` re-expresses each
-        // class's frozen bank under another ledger without touching predictions.
+        // Same contract as the scalar `_TableModel.tables`, class by class: a call-time
+        // `weight`/`exposure` re-centres each class's bank on the rows of `x`, and `ref_measure`
+        // re-expresses it under another ledger, without touching predictions.
         let requested = ref_measure
             .map(|name| parse_ref_measure(Some(name), laplace, measure_floor))
             .transpose()
             .map_err(py_err)?;
+        let mass = combined_explain_weight(weight, exposure)?;
+        let binned = match (&mass, x, m.classes.first()) {
+            (Some(_), Some(x), Some(first)) => Some(
+                serve_binned_for_tables(first, raw_columns_from_array(x)?, cat_x, None)
+                    .map_err(py_err)?,
+            ),
+            _ => None,
+        };
         let mut map = serde_json::Map::new();
         for (label, tm) in m.class_labels.iter().zip(&m.classes) {
-            let recomputed;
-            let bank = match &requested {
-                Some(w) if *w == tm.bank.w => &tm.bank,
-                Some(w) if *w == RefMeasure::Joint => {
-                    recomputed = t_boost_core::joint::rejoint(
-                        &tm.bank,
-                        &t_boost_core::joint::JointOptions::default(),
-                    )
-                    .map_err(py_err)?;
-                    &recomputed
-                }
-                Some(w) => {
-                    recomputed = tm.bank.recompute_under(w.clone()).map_err(py_err)?;
-                    &recomputed
-                }
-                None => &tm.bank,
-            };
+            let bank = export_bank(
+                tm,
+                binned.as_ref(),
+                mass.as_deref(),
+                requested.as_ref(),
+                measure_floor,
+            )
+            .map_err(py_err)?;
             let export = bank
                 .to_rating_export(
                     tm.link,
@@ -8340,6 +8439,46 @@ fn measure_mass_py(
         return Ok(None);
     }
     combined_explain_weight(weight, exposure)
+}
+
+/// The bank a tables-only model's `tables()` exports: the stored bank, re-centred on the rows of
+/// `binned` when a per-row `mass` (call-time weight x exposure) was passed, then re-expressed
+/// under `requested` when that names another measure. None of this changes a prediction.
+fn export_bank<'a>(
+    tm: &'a TableModel,
+    binned: Option<&t_boost_core::data::BinnedMatrix>,
+    mass: Option<&[f32]>,
+    requested: Option<&RefMeasure>,
+    measure_floor: f32,
+) -> Result<std::borrow::Cow<'a, t_boost_core::explain::TableBank>, PbError> {
+    use std::borrow::Cow;
+    let rejoint = |bank: &t_boost_core::explain::TableBank| {
+        t_boost_core::joint::rejoint(bank, &t_boost_core::joint::JointOptions::default())
+    };
+    if let Some(mass) = mass {
+        let binned = binned.ok_or_else(|| PbError::InvalidInput {
+            what: "a call-time weight or exposure needs the rows it weights".into(),
+        })?;
+        // The joint ledger is export-only: re-centre under the exposure measure, then rejoint.
+        let base_w = match requested {
+            None => tm.bank.w.clone(),
+            Some(RefMeasure::Joint) => RefMeasure::ExposureMarginals {
+                floor: measure_floor,
+            },
+            Some(w) => w.clone(),
+        };
+        let bank = tm.recentred_bank(binned, Some(mass), base_w)?;
+        return Ok(Cow::Owned(match requested {
+            Some(RefMeasure::Joint) => rejoint(&bank)?,
+            _ => bank,
+        }));
+    }
+    Ok(match requested {
+        None => Cow::Borrowed(&tm.bank),
+        Some(w) if *w == tm.bank.w => Cow::Borrowed(&tm.bank),
+        Some(RefMeasure::Joint) => Cow::Owned(rejoint(&tm.bank)?),
+        Some(w) => Cow::Owned(tm.bank.recompute_under(w.clone())?),
+    })
 }
 
 fn combined_explain_weight(

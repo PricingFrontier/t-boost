@@ -14,6 +14,7 @@ import polars as pl
 import pytest
 
 from t_boost import TBoostClassifier, TBoostRegressor
+from t_boost._t_boost import _Booster, _Model, _TableModel
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -189,18 +190,70 @@ def test_feature_importances_are_sobol_shares_by_input_feature(frequency) -> Non
     assert int(np.argmax(imp)) == 1  # age carries the strongest signal in the fixture
 
 
-def test_unsupported_models_say_why() -> None:
-    df = _frame(n=600, seed=4)
-    unpruned = TBoostRegressor(n_trees=30, n_bags=1, prune=False).fit(
-        df.drop("Exposure"), "ClaimCount"
-    )
-    assert not hasattr(unpruned, "feature_importances_")
-    with pytest.raises(ValueError, match="prune=True"):
-        unpruned.predict_contributions(df.head(2))
-    multi = TBoostClassifier(n_trees=30, n_bags=1).fit(
-        df.drop("ClaimCount", "Exposure"), np.arange(df.height) % 3
-    )
-    with pytest.raises(ValueError, match="multiclass"):
-        multi.predict_contributions(df.head(2))
+def test_unpruned_fits_deploy_the_full_table_bank() -> None:
+    """prune=False keeps every table rather than the tree ensemble, so it decomposes too."""
+    df = _frame(n=2000, seed=4)
+    model = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0)
+    model.fit(df, "ClaimCount", exposure="Exposure")
+    assert isinstance(model._model, _TableModel)
+    rows = df.head(100)
+    records = model.predict_contributions(rows, exposure="Exposure")  # validated
+    assert len(records) == 100
+    assert model.feature_importances_.sum() == pytest.approx(1.0)
+    loaded = TBoostRegressor.from_bytes(model.to_bytes())
+    assert loaded.predict_contributions(rows) == model.predict_contributions(rows)
+
+
+def test_unpruned_tables_match_the_ensemble() -> None:
+    """The unpruned deploy is a re-representation of the ensemble, not a refit."""
+    df = _frame(n=2000, seed=5)
+    model = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0)
+    model.fit(df, "ClaimCount", exposure="Exposure")
+    # The ensemble is not kept, so refit the same seed and skip the conversion to compare.
+    ensemble = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0)
+    ensemble._full_tables = lambda m, *a, **k: m
+    ensemble.fit(df, "ClaimCount", exposure="Exposure")
+    assert isinstance(ensemble._model, _Model)
+    np.testing.assert_allclose(model.predict(df), ensemble.predict(df), rtol=1e-5)
+
+
+@pytest.mark.parametrize("prune", [True, False])
+def test_multiclass_decomposes_every_class_logit(prune: bool) -> None:
+    df = _frame(n=3000, seed=6)
+    x = df.drop("ClaimCount", "Exposure")
+    y = np.digitize(df["age"].to_numpy() + 0.5 * df["veh"].to_numpy(), [-0.5, 0.5])
+    labels = np.asarray(["low", "mid", "high"])[y]
+    clf = TBoostClassifier(n_trees=150, n_bags=1, seed=0, prune=prune).fit(x, labels)
+    rows = x.head(50)
+    records = clf.predict_contributions(rows)  # validate=True checks every class of every row
+    proba = clf.predict_proba(rows)
+    for i, rec in enumerate(records):
+        assert rec["family"] == "multinomial" and rec["link"] == "softmax"
+        assert rec["prediction_space"] == "probability"
+        assert [c["class"] for c in rec["classes"]] == list(clf.classes_)
+        for k, cls in enumerate(rec["classes"]):
+            assert set(cls) == RECORD_KEYS - {"family", "link", "output_space", "prediction_space"} | {"class"}
+            total = cls["base_value"] + sum(c["contribution"] for c in cls["contributions"])
+            assert total == pytest.approx(cls["prediction_from_contributions"], abs=1e-9)
+            assert cls["prediction_value"] == pytest.approx(proba[i, k], abs=1e-6)
+    long = clf.predict_contributions(rows, return_format="dataframe", split_interactions=True)
+    assert set(long["class"].unique()) == set(clf.classes_)
+    assert long.height == 50 * 3 * 3  # rows x classes x input features
+    imp = clf.feature_importances_
+    assert imp.shape == (3,) and imp.sum() == pytest.approx(1.0)
+    with pytest.raises(ValueError, match="log-link"):
+        clf.predict_contributions(rows, exposure=np.ones(50))
+
+
+def test_legacy_ensemble_models_say_why() -> None:
+    """A model saved by an older t-boost as a tree ensemble has no tables to decompose."""
+    df = _frame(n=600, seed=7)
+    x = df.select("age", "veh").to_numpy().astype(np.float32)
+    y = df["ClaimCount"].to_numpy().astype(np.float32)
+    booster = _Booster(objective="squared_error", n_trees=30, seed=0)
+    legacy = TBoostRegressor.from_bytes(booster.fit(x, y).to_bytes())
+    assert not hasattr(legacy, "feature_importances_")
+    with pytest.raises(ValueError, match="older t-boost"):
+        legacy.predict_contributions(x[:2])
     with pytest.raises(Exception, match="not fitted"):
-        TBoostRegressor().predict_contributions(df.head(2))
+        TBoostRegressor().predict_contributions(x[:2])
