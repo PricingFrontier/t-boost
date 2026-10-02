@@ -19,7 +19,7 @@ name       = "_t_boost"          # the compiled module is `t_boost._t_boost` (§
 crate-type = ["cdylib"]
 
 [dependencies]
-t-boost-core = { path = "../t-boost-core", version = "0.6.0" }
+t-boost-core = { path = "../t-boost-core", version = "0.6.1" }
 rayon = { workspace = true }
 pyo3  = { workspace = true, features = ["extension-module", "abi3-py310"] }
 numpy = { workspace = true }

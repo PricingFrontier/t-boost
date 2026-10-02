@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "t-boost-core"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "bincode",
  "itertools",
@@ -586,7 +586,7 @@ dependencies = [
 
 [[package]]
 name = "t-boost-py"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "numpy",
  "pyo3",
@@ -699,7 +699,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "xtask"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "rayon",
  "serde",

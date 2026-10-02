@@ -10,7 +10,7 @@ default-members = ["crates/t-boost-core", "xtask"]
 resolver     = "2"
 
 [workspace.package]
-version      = "0.6.0"                 # shared crate semver; the wire schema_version is separate (§02.8)
+version      = "0.6.1"                 # shared crate semver; the wire schema_version is separate (§02.8)
 edition      = "2021"
 # MSRV: the floor the locked dependencies allow (bincode 2 needs 1.85).
 rust-version = "1.85"

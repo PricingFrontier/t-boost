@@ -48,6 +48,7 @@ dev = [
 python-source = "python"
 module-name = "t_boost._t_boost"
 manifest-path = "crates/t-boost-py/Cargo.toml"
+include = [{ path = "LICENSE", format = "sdist" }] # PyPI rejects an sdist missing its License-File
 features = ["pyo3/extension-module"]
 
 [tool.mypy]
