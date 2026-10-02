@@ -450,6 +450,14 @@ class _TableModel:
         self, x: np.ndarray, cat_x: Sequence[Sequence[str]] | None = None
     ) -> np.ndarray: ...
     def raw_feature_names(self) -> list[str]: ...
+    def effect_contributions(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
+    ) -> tuple[float, np.ndarray, list[list[int]]]: ...
+    def sobol(self) -> list[tuple[list[int], float]]: ...
     def band(
         self,
         x: np.ndarray,

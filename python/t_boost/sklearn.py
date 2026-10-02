@@ -1481,6 +1481,24 @@ def _column_as_str_list(x: Any, j: int) -> list[str]:
     return [_cat_level(v) for v in arr[:, j].tolist()]
 
 
+def _input_column_values(x: Any, j: int, name: str) -> list[Any]:
+    """The caller's own values of input column ``j`` (named ``name`` on a frame), as Python
+    scalars: the ``feature_value`` a contribution reports."""
+    if is_polars_eager(x):
+        return list(x.get_column(name).to_list())
+    if hasattr(x, "iloc"):
+        return list(x.iloc[:, j].tolist())
+    return list(np.asarray(x)[:, j].tolist())
+
+
+def _inverse_link(eta: "np.ndarray", link: str) -> "np.ndarray":
+    if link == "log":
+        return np.asarray(np.exp(eta))
+    if link == "logit":
+        return np.asarray(1.0 / (1.0 + np.exp(-eta)))
+    return eta
+
+
 # Below this many rows the per-value loop beats factorize's fixed cost; both give the same list.
 _FACTORIZE_MIN_ROWS = 64
 
@@ -5113,6 +5131,264 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 "(a polars DataFrame or another frame with column names)"
             )
         return [str(n) for n in names]
+
+    # --- Contributions and importances (rustystats `predict_contributions` contract) ---------
+
+    def _deployed_tables(self) -> _TableModel:
+        """The deployed rating-table model, which both contributions and importances read."""
+        check_is_fitted(self)
+        if getattr(self, "_multi_model", None) is not None:
+            raise ValueError("contributions and importances are not supported for multiclass models")
+        model = self._model
+        if not isinstance(model, _TableModel):
+            raise ValueError(
+                "contributions and importances read the deployed rating tables, which a model "
+                "fitted with prune=False does not have; refit with prune=True (the default)"
+            )
+        return model
+
+    def _input_feature_names(self) -> list[str]:
+        """One name per input column: `feature_names_in_`, or `f{j}` by column position."""
+        names = getattr(self, "feature_names_in_", None)
+        if names is not None:
+            return [str(n) for n in names]
+        return [f"f{j}" for j in range(int(self.n_features_in_))]
+
+    def _raw_to_input_column(self) -> list[int]:
+        """The input column of each native raw feature id. The native model orders its raw
+        features numeric columns first, then categoricals in `_cat_indices_` order."""
+        cats = [int(i) for i in (getattr(self, "_cat_indices_", None) or [])]
+        n_in = int(self.n_features_in_)
+        return [j for j in range(n_in) if j not in set(cats)] + cats
+
+    @property
+    def link(self) -> str:
+        """The link between the raw score and the prediction: ``identity``, ``log`` or
+        ``logit``."""
+        if self.objective == "logistic":
+            return "logit"
+        return "identity" if self.objective == "squared_error" else "log"
+
+    @property
+    def feature_importances_(self) -> np.ndarray:
+        """Importance of each input feature, in input column order, summing to 1.
+
+        Each deployed effect's Sobol share (its variance over the model's, under the reference
+        measure the tables were purified against) is split equally among the features it
+        involves, as in the Shapley split of ``predict_contributions``. Read from the model;
+        needs no data.
+        """
+        try:
+            model = self._deployed_tables()
+        except ValueError as exc:  # hasattr() must see an unsupported model as lacking it
+            raise AttributeError(str(exc)) from exc
+        to_input = self._raw_to_input_column()
+        out = np.zeros(int(self.n_features_in_), dtype=np.float64)
+        for raws, share in model.sobol():
+            for raw in raws:
+                out[to_input[raw]] += share / len(raws)
+        total = out.sum()
+        return out / total if total > 0 else out
+
+    def predict_contributions(
+        self,
+        X: Any,
+        *,
+        exposure: Any | None = None,
+        split_interactions: bool = False,
+        return_format: str = "records",
+        validate: bool = True,
+        atol: float = 1e-6,
+        rtol: float = 1e-6,
+    ) -> Any:
+        """Decompose each prediction into per-effect contributions.
+
+        For every row of ``X``::
+
+            base_value + sum(contributions) == raw score (link scale)
+            inverse_link(raw score)         == prediction
+
+        exactly, because the deployed model IS its rating tables: ``base_value`` is the tables'
+        intercept and each contribution is one table's value for the row. Same record shape as
+        rustystats' ``GLMModel.predict_contributions``.
+
+        Parameters
+        ----------
+        X : array-like, polars DataFrame/LazyFrame, of shape (n_samples, n_features)
+            Rows to decompose, matched to the fit-time features as in :meth:`predict`.
+        exposure : str or array-like, optional
+            Positive exposure for a log-link model. ``str`` names a column of a polars ``X``.
+            Adds an ``"exposure"`` contribution of ``log(exposure)``, so ``prediction_value``
+            becomes the expected total (``predict(X) * exposure``) instead of the rate per
+            unit exposure that :meth:`predict` returns.
+        split_interactions : bool, default False
+            ``False``: one contribution per effect, main effects (``term_type="main"``) and
+            interactions (``"interaction"``, named ``"a:b"``) alike. ``True``: one contribution
+            per input feature (``term_type="feature"``), each interaction shared equally among
+            its features. These are exact interventional Shapley values.
+        return_format : {"records", "dataframe"}, default "records"
+            ``"records"``: one dict per row with a nested ``contributions`` list.
+            ``"dataframe"``: a long polars DataFrame, one row per ``(row_index, term)``.
+        validate : bool, default True
+            Check both identities above against the model's own raw score and prediction (the
+            positive-class probability for a classifier), raising ``ValueError`` on a breach.
+        atol, rtol : float
+            Tolerance ``|delta| <= atol + rtol * |actual|``. Predictions are float32, so the
+            defaults are looser than rustystats'.
+
+        Returns
+        -------
+        list[dict] or polars.DataFrame
+            Per row: ``family``, ``link``, ``output_space``, ``prediction_space``,
+            ``base_value``, ``sum_contributions``, ``prediction_from_contributions``,
+            ``prediction_value`` and ``contributions`` (each with ``term``, ``term_type``,
+            ``feature``, ``feature_value``, ``contribution`` and ``rank`` by absolute size).
+
+        Raises
+        ------
+        ValueError
+            For a multiclass model, a model fitted with ``prune=False`` (no deployed tables),
+            exposure on a non-log-link model, or non-positive exposure.
+        """
+        if return_format not in ("records", "dataframe"):
+            raise ValueError(f"return_format must be 'records' or 'dataframe', got {return_format!r}")
+        model = self._deployed_tables()
+        if is_polars_frame(X):
+            names = getattr(self, "feature_names_in_", None)
+            needed = None
+            if names is not None:
+                needed = [str(n) for n in names] + ([exposure] if isinstance(exposure, str) else [])
+            X = collect_frame(X, needed)
+        frame = X if is_polars_eager(X) else None
+        exposure = resolve_vector(frame, exposure, "exposure")
+        x32, cat_kw = self._serve_kwargs(X, model)
+        f0, values, feature_sets = model.effect_contributions(
+            x32, **cat_kw, n_jobs=self._resolve_n_jobs()
+        )
+        n_rows = values.shape[0]
+        # Summed left to right from f0, exactly as the native scorer sums, so the raw score is
+        # reproduced to the last float64 bit before its float32 rounding.
+        eta = np.cumsum(np.column_stack([np.full(n_rows, f0), values]), axis=1)[:, -1]
+
+        names = self._input_feature_names()
+        to_input = self._raw_to_input_column()
+        columns = [_input_column_values(X, j, names[j]) for j in range(len(names))]
+        terms: list[tuple[str, str, list[Any]]] = []  # (term, term_type, per-row feature values)
+        if split_interactions:
+            matrix = np.zeros((n_rows, len(names)), dtype=np.float64)
+            for k, raws in enumerate(feature_sets):
+                for raw in raws:
+                    matrix[:, to_input[raw]] += values[:, k] / len(raws)
+            for j, name in enumerate(names):
+                terms.append((name, "feature", columns[j]))
+        else:
+            matrix = values
+            for raws in feature_sets:
+                cols = [to_input[raw] for raw in raws]
+                if len(cols) == 1:
+                    terms.append((names[cols[0]], "main", columns[cols[0]]))
+                else:
+                    joint = [{names[j]: columns[j][i] for j in cols} for i in range(n_rows)]
+                    terms.append((":".join(names[j] for j in cols), "interaction", joint))
+
+        link = self.link
+        if exposure is not None:
+            if link != "log":
+                raise ValueError("exposure= is only meaningful for log-link models")
+            exp_arr = np.asarray(exposure, dtype=np.float64).reshape(-1)
+            if exp_arr.shape[0] != n_rows:
+                raise ValueError(f"exposure has {exp_arr.shape[0]} rows, X has {n_rows}")
+            if not np.all(np.isfinite(exp_arr) & (exp_arr > 0)):
+                raise ValueError("exposure must be finite and strictly positive")
+            log_exposure = np.log(exp_arr)
+            matrix = np.column_stack([matrix, log_exposure])
+            eta = eta + log_exposure
+            terms.append(("exposure", "exposure", exp_arr.tolist()))
+
+        mu = _inverse_link(eta, link)
+        if validate:
+            self._validate_contributions(X, eta, mu, exposure, atol, rtol)
+
+        base = np.full(n_rows, float(f0))
+        sums = matrix.sum(axis=1) if matrix.size else np.zeros(n_rows)
+        order = np.argsort(-np.abs(matrix), axis=1, kind="stable")
+        ranks = np.empty_like(order)
+        np.put_along_axis(ranks, order, np.arange(1, matrix.shape[1] + 1)[None, :], axis=1)
+        output_space = "response" if link == "identity" else "linear_predictor"
+        family = self.objective
+        if return_format == "dataframe":
+            import polars as pl
+
+            n_terms = len(terms)
+            return pl.DataFrame(
+                {
+                    "row_index": np.repeat(np.arange(n_rows, dtype=np.int64), n_terms),
+                    "term": [t for _ in range(n_rows) for t, _, _ in terms],
+                    "term_type": [tt for _ in range(n_rows) for _, tt, _ in terms],
+                    "feature": [t for _ in range(n_rows) for t, _, _ in terms],
+                    "feature_value": [str(fv[i]) for i in range(n_rows) for _, _, fv in terms],
+                    "contribution": matrix.reshape(-1),
+                    "rank": ranks.reshape(-1),
+                    "base_value": np.repeat(base, n_terms),
+                    "sum_contributions": np.repeat(sums, n_terms),
+                    "prediction_from_contributions": np.repeat(eta, n_terms),
+                    "prediction_value": np.repeat(mu, n_terms),
+                    "output_space": [output_space] * (n_rows * n_terms),
+                    "prediction_space": ["response"] * (n_rows * n_terms),
+                    "family": [family] * (n_rows * n_terms),
+                    "link": [link] * (n_rows * n_terms),
+                }
+            )
+        return [
+            {
+                "family": family,
+                "link": link,
+                "output_space": output_space,
+                "prediction_space": "response",
+                "base_value": float(base[i]),
+                "sum_contributions": float(sums[i]),
+                "prediction_from_contributions": float(eta[i]),
+                "prediction_value": float(mu[i]),
+                "contributions": [
+                    {
+                        "term": term,
+                        "term_type": term_type,
+                        "feature": term,
+                        "feature_value": fv[i],
+                        "contribution": float(matrix[i, k]),
+                        "rank": int(ranks[i, k]),
+                    }
+                    for k, (term, term_type, fv) in enumerate(terms)
+                ],
+            }
+            for i in range(n_rows)
+        ]
+
+    def _validate_contributions(
+        self, X: Any, eta: np.ndarray, mu: np.ndarray, exposure: Any, atol: float, rtol: float
+    ) -> None:
+        x32, cat_kw = self._serve_kwargs(X, self._model)
+        raw = np.asarray(
+            self._model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
+        )
+        if self.objective == "logistic":
+            pred = np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1]
+        else:
+            pred = np.asarray(self.predict(X), dtype=np.float64)
+        if exposure is not None:
+            log_exposure = np.log(np.asarray(exposure, dtype=np.float64).reshape(-1))
+            raw = raw + log_exposure
+            pred = pred * np.exp(log_exposure)
+        for what, got, want in (("raw score", eta, raw), ("prediction", mu, pred)):
+            bad = np.abs(got - want) > atol + rtol * np.abs(want)
+            if bad.any():
+                worst = int(np.argmax(np.abs(got - want)))
+                raise ValueError(
+                    f"predict_contributions failed its additivity check on the {what} at "
+                    f"{int(bad.sum())} of {len(want)} row(s); worst row {worst}: "
+                    f"{got[worst]!r} from contributions vs {want[worst]!r}. This is a t-boost "
+                    "bug; please report it with the model and input."
+                )
 
     def __getstate__(self) -> dict[str, Any]:
         # The Rust model handles (`_Model` / `_MultiClassModel`) are `@final` pyo3 classes that

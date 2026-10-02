@@ -76,6 +76,27 @@ tables = json.loads(freq.tables(train))     # fANOVA rating tables (JSON)
 Each fitted model decomposes into main effects and interactions that reproduce the raw
 score with mathematical exactness within floating-point tolerance (for a multiclass model, one table bank per class logit).
 
+### Per-prediction contributions
+
+`predict_contributions` breaks each prediction into one contribution per rating table. The
+record format is the same as rustystats' `GLMModel.predict_contributions`. Because the deployed
+model *is* its tables, the breakdown is exact: `base_value + sum(contributions)` is the raw
+(link-scale) score, and the inverse link of that is the prediction.
+
+```python
+rows = freq.predict_contributions(test.head(5))                  # one dict per row
+rows[0]["contributions"]          # [{"term": "age", "term_type": "main", "contribution": ...},
+                                  #  {"term": "age:region", "term_type": "interaction", ...}, ...]
+freq.predict_contributions(test, exposure="Exposure")            # adds a log(exposure) term
+freq.predict_contributions(test, split_interactions=True)        # exact Shapley value per feature
+freq.predict_contributions(test, return_format="dataframe")      # long polars DataFrame
+freq.feature_importances_                                        # Sobol shares per input feature
+```
+
+`exposure=` adds a `log(exposure)` contribution, so `prediction_value` becomes the expected total
+(`predict(X) * exposure`) rather than the rate per unit exposure. Both need the deployed rating
+tables, which `prune=True` (the default) produces. Multiclass models are not supported yet.
+
 ## Saving and loading
 
 A fitted estimator serializes to bytes (compact) or JSON (diffable) and loads back as a fitted

@@ -5823,6 +5823,55 @@ impl PyTableModel {
         write_or_return_array1(py, raw, out)
     }
 
+    /// The exact additive decomposition of `predict_raw`: `(f0, values, feature_sets)` with
+    /// `values` a `(n_rows, n_effects)` float64 array of each deployed effect's value per row and
+    /// `feature_sets` each effect's raw feature ids. `f0 + values.sum(axis=1)` (summed left to
+    /// right) is the float64 score `predict_raw` rounds to float32.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain (scalar, array, list) Python tuple.
+    fn effect_contributions<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
+    ) -> PyResult<(f64, Bound<'py, PyArray2<f64>>, Vec<Vec<u32>>)> {
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let (values, n_rows) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    let ts = table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(&model, columns, cats, Some(&ts.cats))?;
+                    Ok((model.effect_contributions(&binned)?, binned.n_rows as usize))
+                })
+            })
+            .map_err(py_err)?;
+        let feature_sets = self.model.effect_feature_sets();
+        let values = values
+            .into_pyarray(py)
+            .reshape([n_rows, feature_sets.len()])
+            .map_err(|err| {
+                InternalError::new_err(format!("could not reshape contribution array: {err}"))
+            })?;
+        Ok((self.model.bank.f0, values, feature_sets))
+    }
+
+    /// Sobol share `σ²(f_u)/σ²(F)` of every deployed effect under the bank's reference measure,
+    /// as `(raw feature ids, share)` sorted by share descending. Read from the cached table
+    /// variances: no data needed.
+    fn sobol(&self) -> Vec<(Vec<u32>, f64)> {
+        self.model
+            .bank
+            .sobol()
+            .into_iter()
+            .map(|(u, s)| (u.0.iter().map(|f| f.0).collect(), s))
+            .collect()
+    }
+
     #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
     fn predict_proba<'py>(
         &self,
