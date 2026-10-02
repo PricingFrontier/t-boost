@@ -81,5 +81,5 @@ def test_categorical_missing_rare_and_unseen_are_not_interchangeable():
     nx, cats = model._serve_design(pl.DataFrame({'cat': ['rare', 'never-seen', None]}))
     cells = np.asarray(model._model.cell_indices(nx, cat_x=cats))[:, 0]
     assert cells[0] == levels['<rare>']
-    assert cells[2] == levels['__tri_missing__'] and cells[2] != 0
+    assert cells[2] == levels['__t_boost_missing__'] and cells[2] != 0
     assert cells[1] != cells[0], 'unseen uses encoder base, not the rare bucket'

@@ -22,8 +22,9 @@ except ImportError:
 
 # All missing markers in a categorical column collapse to this ONE reserved level, instead of
 # splitting into distinct "nan" / "None" / "<NA>" strings (which every rival GBM avoids by routing
-# missing to a single direction). Consistent between fit and serve.
-_CAT_MISSING = "__tri_missing__"
+# missing to a single direction). Consistent between fit and serve. Models saved by 0.6.x used a
+# different label, so they are refused at load (see `_check_envelope`) rather than mis-serving nulls.
+_CAT_MISSING = "__t_boost_missing__"
 
 
 def _cat_level(v: Any) -> str:

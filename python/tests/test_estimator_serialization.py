@@ -130,28 +130,28 @@ def test_pruned_multiclass_with_categoricals_round_trips_bytes_and_json() -> Non
 
 def test_old_buggy_multi_kind_envelope_still_loads_via_magic_sniff() -> None:
     """Backward compat: a blob saved by the pre-fix code — envelope kind='multi' wrapping the
-    TBMT tables container, the exact H8 bug — must still load via the sniff fallback."""
+    TBMT tables container, the exact H8 bug — must still load via the sniff fallback. (Numeric
+    features: a 0.6.x categorical model is refused instead, see the test below.)"""
     x, y = _categorical_multiclass_fixture(n=500, seed=2)
+    x = x[:, :4].astype(np.float32)
     clf = TBoostClassifier(
         objective="logistic",
         n_trees=40,
         n_bags=1,
         seed=0,
-        categorical_features=[4],
         prune=True,
         prune_se_rule=1.0,
     ).fit(x, y)
     assert isinstance(clf._multi_model, _MultiClassTableModel)
     proba = clf.predict_proba(x[:10])
+    old_md = {
+        "kind": "multi",  # pre-fix bug: multi_tables mis-recorded as plain 'multi'
+        "classes_": np.asarray(clf.classes_).tolist(),
+    }
 
     # -- bytes path: hand-pack the OLD (buggy) envelope directly -----------------------------
     inner = clf._multi_model.to_bytes()
     assert inner[:4] == b"TBMT"
-    old_md = {
-        "kind": "multi",  # pre-fix bug: multi_tables mis-recorded as plain 'multi'
-        "cat_indices": [int(i) for i in clf._cat_indices_],
-        "classes_": np.asarray(clf.classes_).tolist(),
-    }
     old_header = json.dumps(old_md).encode("utf-8")
     old_blob = _ESTIMATOR_MAGIC + len(old_header).to_bytes(4, "big") + old_header + inner
 
@@ -160,20 +160,42 @@ def test_old_buggy_multi_kind_envelope_still_loads_via_magic_sniff() -> None:
     np.testing.assert_array_equal(restored.classes_, clf.classes_)
 
     # -- json path: same old-style envelope, JSON inner model --------------------------------
+    # 0.6.x also wrote a marker key of its own; the envelope is recognized by shape without it.
     inner_json = clf._multi_model.to_json()
     assert '"t-boost-multiclass-tables"' in inner_json
-    old_text = json.dumps(
-        {
-            "kind": "multi",
-            "__tri_estimator__": 1,
-            "model": inner_json,
-            "cat_indices": [int(i) for i in clf._cat_indices_],
-            "classes_": np.asarray(clf.classes_).tolist(),
-        }
-    )
-    restored_json = TBoostClassifier.from_json(old_text)
+    restored_json = TBoostClassifier.from_json(json.dumps({**old_md, "model": inner_json}))
     np.testing.assert_allclose(restored_json.predict_proba(x[:10]), proba, atol=1e-5)
     np.testing.assert_array_equal(restored_json.classes_, clf.classes_)
+
+
+def test_old_categorical_model_is_refused() -> None:
+    """0.6.x labelled the missing-value level of a categorical differently, so loading one of
+    its categorical models would score nulls as an unseen level. It must fail loudly."""
+    x, y = _categorical_multiclass_fixture(n=500, seed=2)
+    clf = TBoostClassifier(n_trees=20, n_bags=1, seed=0, categorical_features=[4], prune=False)
+    clf.fit(x, y)
+    old_md = {
+        "kind": "multi",
+        "cat_indices": [int(i) for i in clf._cat_indices_],
+        "classes_": np.asarray(clf.classes_).tolist(),
+    }
+    inner = clf._multi_model.to_bytes()
+    old_header = json.dumps(old_md).encode("utf-8")
+    old_blob = _ESTIMATOR_MAGIC + len(old_header).to_bytes(4, "big") + old_header + inner
+    with pytest.raises(SerializationError, match="Refit"):
+        TBoostClassifier.from_bytes(old_blob)
+    old_text = json.dumps({**old_md, "model": clf._multi_model.to_json()})
+    with pytest.raises(SerializationError, match="Refit"):
+        TBoostClassifier.from_json(old_text)
+
+
+def test_missing_level_label_has_no_legacy_name() -> None:
+    import polars as pl_
+
+    df = pl_.DataFrame({"cat": ["a"] * 60 + ["b"] * 60 + [None] * 20})
+    y = np.array([0.0] * 60 + [2.0] * 60 + [5.0] * 20, dtype=np.float32)
+    reg = _small_regressor().fit(df, y)
+    assert "__t_boost_missing__" in reg.to_json()
 
 
 def _small_regressor(**kw: Any) -> TBoostRegressor:
@@ -230,7 +252,7 @@ def test_numeric_regressor_is_enveloped_and_legacy_raw_blobs_still_load() -> Non
     blob = reg.to_bytes()
     assert blob[:4] == b"TBP1"
     text = reg.to_json()
-    assert "__t_boost_estimator__" in text and "__tri" not in text
+    assert "__t_boost_estimator__" in text
     for restored in (TBoostRegressor.from_bytes(blob), TBoostRegressor.from_json(text)):
         np.testing.assert_array_equal(restored.predict(x), pred)
         assert restored.get_params() == reg.get_params()
@@ -366,12 +388,17 @@ def test_loading_with_the_wrong_estimator_class_is_refused() -> None:
         TBoostClassifier.from_json(reg.to_json())
 
 
-def test_pickles_from_older_releases_still_load() -> None:
-    """Releases up to 0.6.1 pickled the native model under `__tri_model_bytes__`."""
+def test_pickles_from_older_releases_are_refused() -> None:
+    """0.6.x pickled the native model under other keys; unpickling one must fail loudly rather
+    than produce an estimator that silently has no model."""
     x, y = _small_regression_fixture()
     reg = _small_regressor().fit(x, y)
     state = reg.__getstate__()
-    state["__tri_model_bytes__"] = state.pop("__t_boost_model_bytes__")
+    del state["__t_boost_schema_version__"]
+    state["legacy_model_bytes"] = state.pop("__t_boost_model_bytes__")
     old = TBoostRegressor.__new__(TBoostRegressor)
-    old.__setstate__(state)
-    np.testing.assert_array_equal(old.predict(x), reg.predict(x))
+    with pytest.raises(SerializationError, match="0.6.x"):
+        old.__setstate__(state)
+    # An unfitted estimator pickles and unpickles as before.
+    fresh = pickle.loads(pickle.dumps(TBoostRegressor(n_trees=7)))
+    assert fresh.get_params()["n_trees"] == 7

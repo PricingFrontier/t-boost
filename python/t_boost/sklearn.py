@@ -1184,9 +1184,12 @@ _MULTICLASS_PRUNE_FOLD_ES_PATIENCE = 100
 # reads the exposure column of either library the same way.
 _COLUMN_SPECS = ("_response_spec", "_weights_spec", "_exposure_spec", "_groups_spec")
 
-# Marks a JSON document as an estimator envelope. Releases up to 0.6.1 wrote the legacy key.
+# Marks a JSON document as an estimator envelope. 0.6.x wrote a differently named marker; its
+# envelopes are recognized by shape instead (a "kind" plus the model document as a string).
 _JSON_ENVELOPE_KEY = "__t_boost_estimator__"
-_LEGACY_JSON_ENVELOPE_KEY = "__tri_estimator__"
+
+# Marks a pickled estimator's state as written by this envelope schema (see `__setstate__`).
+_PICKLE_SCHEMA_KEY = "__t_boost_schema_version__"
 
 
 def _encode_param(name: str, value: Any) -> Any:
@@ -1288,6 +1291,15 @@ def _check_envelope(cls: type, md: dict[str, Any]) -> None:
             f"{_t_boost_version()}). It was written by t-boost "
             f"{md.get('t_boost_version', 'unknown')}; load it with that version or newer."
         )
+    if version < 2 and md.get("cat_indices"):
+        # 0.6.x stored the reserved missing-value level of every categorical feature under a
+        # label this build no longer produces, so its nulls would silently score as an unseen
+        # level. Numeric 0.6.x models are unaffected and still load.
+        raise SerializationError(
+            "Cannot load model: it was saved by t-boost 0.6.x and has categorical features, "
+            "whose missing-value level this version labels differently. Refit it with this "
+            "version of t-boost."
+        )
     written_by = md.get("estimator")
     if written_by is not None and written_by != cls.__name__:
         raise SerializationError(
@@ -1376,7 +1388,8 @@ def _pack_json(est: "_BaseTBoost", inner_json: str) -> str:
 def _unpack_json(text: str) -> tuple[dict[str, Any], str]:
     obj = json.loads(text)
     envelope = isinstance(obj, dict) and (
-        obj.get(_JSON_ENVELOPE_KEY) or obj.get(_LEGACY_JSON_ENVELOPE_KEY)
+        obj.get(_JSON_ENVELOPE_KEY)
+        or (isinstance(obj.get("model"), str) and "kind" in obj)  # 0.6.x envelope
     )
     if envelope:
         inner = str(obj["model"])
@@ -5113,12 +5126,26 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             state["__t_boost_multi_bytes__"] = multi.to_bytes()
         elif model is not None:
             state["__t_boost_model_bytes__"] = model.to_bytes()
+        state[_PICKLE_SCHEMA_KEY] = _ENVELOPE_SCHEMA_VERSION
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        # Pickles from releases up to 0.6.1 used the `__tri_*` keys.
-        multi_bytes = state.pop("__t_boost_multi_bytes__", state.pop("__tri_multi_bytes__", None))
-        model_bytes = state.pop("__t_boost_model_bytes__", state.pop("__tri_model_bytes__", None))
+        version = state.pop(_PICKLE_SCHEMA_KEY, None)
+        if version is None and "n_features_in_" in state:
+            # A fitted pickle from 0.6.x, which stored the model under other keys (and, for
+            # categoricals, the old missing-value label). Refuse rather than unpickle an
+            # estimator that silently has no model.
+            raise SerializationError(
+                "Cannot unpickle model: it was pickled by t-boost 0.6.x. Refit it with this "
+                "version of t-boost."
+            )
+        if version is not None and version > _ENVELOPE_SCHEMA_VERSION:
+            raise SerializationError(
+                f"Cannot unpickle model: its schema_version {version!r} is newer than this "
+                f"t-boost build supports (schema_version {_ENVELOPE_SCHEMA_VERSION})."
+            )
+        multi_bytes = state.pop("__t_boost_multi_bytes__", None)
+        model_bytes = state.pop("__t_boost_model_bytes__", None)
         self.__dict__.update(state)
         if multi_bytes is not None:
             if multi_bytes[:4] == _MULTICLASS_TABLES_MAGIC:

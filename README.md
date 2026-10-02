@@ -114,6 +114,10 @@ exposure/weights are not saved.
 schema than the running t-boost supports is refused with `SerializationError` rather than
 half-read. So is loading a classifier blob with `TBoostRegressor.from_bytes`, or the reverse.
 
+Two kinds of 0.6.x model are refused and must be refit: models with categorical features (0.6.x
+labelled their missing-value level differently, so nulls would score wrongly), and pickles.
+Numeric 0.6.x models saved with `to_bytes` / `to_json` still load.
+
 ## Objectives
 
 | Objective | Task | Link |
