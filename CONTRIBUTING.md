@@ -67,7 +67,7 @@ exactly the same things.
 **Slow tests.** Integration tests that take more than about 30 s in release are marked
 ``#[ignore = "slow: run with `cargo test --release -- --ignored`"]``, so the default suite stays
 fast. Run them (the command above) whenever you change `t-boost-core`, `Cargo.toml` or
-`Cargo.lock`; CI and Release run them only for such changes (see below). Give any new test of
+`Cargo.lock`. CI runs them only while a release is pending (see below). Give any new test of
 that cost the same attribute. Keep slow tests in `tests/` (integration tests): the slow command
 selects `--test '*'`, and the one ignored unit test, `bench_row_scatter`, is a benchmark that
 must not run in CI.
@@ -90,7 +90,7 @@ cmp target/bit-repro-a.bin target/bit-repro-b.bin
 | `py-lint` | clippy on the PyO3 binding |
 | `python` | runtime-only install check (`uv sync --locked --no-dev`, no scikit-learn), then pytest, `mypy --strict`, stubtest |
 | `test` | core tests (`--all-features`, `--doc`), determinism (`n_threads ∈ {1,2,8}`, byte-compared), invariants, overflow trap, bit-repro |
-| `slow-tests` | the slow core tests, only when `scripts/model_changed.py` finds model code in the change (the core crate, or `Cargo.toml`/`Cargo.lock` beyond a version bump); always on nightly and manual runs |
+| `slow-tests` | the slow core tests, only while a release is pending — the workspace version is not on PyPI yet (`scripts/release_version.py pending`); always on nightly and manual runs |
 | `m6-preflight` | `cargo test -p xtask`, `xtask accuracy` (plain + adversarial), `xtask release-preflight` |
 | `msrv` | build + test on Rust 1.85 |
 | `features` | the core builds under each feature combination (`arrow`, `nightly`) |
@@ -209,12 +209,11 @@ hand. An agent's part is preparing the version bump; run the workflow only if as
    `Cargo.toml`'s `[workspace.package] version`, the `t-boost-core` requirement in
    `crates/t-boost-py/Cargo.toml` and `xtask/Cargo.toml`, and three `Cargo.lock` entries. The
    script rewrites all five; never edit them by hand.
-2. **Merge, then wait for main's CI** (`ci.yml`) to pass on the merge commit.
+2. **Merge, then wait for main's CI** (`ci.yml`) to pass on the merge commit. With the version
+   bumped past PyPI's, this CI run includes the slow core tests (~25 min).
 3. **Run Release** from the Actions tab, on `main`. It refuses to start unless main's CI
    passed on that exact commit, the five version records agree, and the version is newer than
    every release on PyPI and not yet tagged. It then:
-   - runs the slow core tests if model code changed since the last release tag (always for
-     the first release), and publishes only if they pass;
    - builds one abi3 wheel per platform (Linux x86_64/aarch64, Windows x64, macOS
      x86_64/arm64) plus an sdist;
    - install-smoke-tests the Linux, Windows and macOS-arm64 wheels and the sdist in fresh

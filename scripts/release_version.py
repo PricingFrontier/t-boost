@@ -13,7 +13,9 @@ release version therefore appears in five places, which must agree:
 workflow runs: it refuses a version the five places disagree on, one PyPI already has, or
 one that is not newer than every release there, so an unbumped ``main`` cannot be
 released twice. On success it writes the version to the GitHub output file so later jobs
-can check, tag and name the release.
+can check, tag and name the release. ``pending`` is what CI runs: it reports whether the
+declared version is not on PyPI yet, i.e. a release is being prepared, which is when CI
+runs the slow tests.
 """
 
 from __future__ import annotations
@@ -141,20 +143,6 @@ def _replace_one(text: str, pattern: re.Pattern[str], version: str, where: str) 
     return new
 
 
-def mask_version(filename: str, text: str) -> str:
-    """*text* of the root ``Cargo.toml`` or ``Cargo.lock`` with the release version blanked out.
-
-    Two revisions whose masked texts are equal differ at most by a version bump.
-    """
-    if filename == "Cargo.toml":
-        return _WORKSPACE_VERSION.sub(lambda m: f"{m[1]}*{m[3]}", text, count=1)
-    if filename == "Cargo.lock":
-        for name in _LOCKED_PACKAGES:
-            text = _locked_entry(name).sub(lambda m: f"{m[1]}*{m[3]}", text, count=1)
-        return text
-    raise ValueError(f"no release version is recorded in {filename}")
-
-
 def write_version(root: Path, version: str) -> None:
     """Rewrite every place the release version is recorded to *version*."""
     edits: list[tuple[Path, list[tuple[re.Pattern[str], str]]]] = [
@@ -190,7 +178,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         required=True,
         help="file the version is appended to as `version=X.Y.Z`",
     )
+    pending = commands.add_parser("pending", help="report whether the version is unreleased")
+    pending.add_argument(
+        "--pypi-json",
+        type=Path,
+        help="PyPI's JSON API response for the project; omit when it has never been published",
+    )
+    pending.add_argument(
+        "--github-output",
+        type=Path,
+        help="file `release_pending=true|false` is appended to",
+    )
     args = parser.parse_args(argv)
+    if args.command == "pending":
+        with (args.root / "Cargo.toml").open("rb") as stream:
+            version = str(tomllib.load(stream)["workspace"]["package"]["version"])
+        unreleased = version not in released_versions(args.pypi_json)
+        state = "true" if unreleased else "false"
+        print(f"{PROJECT} {version} is {'not yet' if unreleased else 'already'} on PyPI; release pending: {state}")
+        if args.github_output is not None:
+            with args.github_output.open("a", encoding="utf-8") as stream:
+                stream.write(f"release_pending={state}\n")
+        return 0
     try:
         if args.command == "bump":
             current = declared_version(args.root)
