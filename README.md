@@ -76,6 +76,44 @@ tables = json.loads(freq.tables(train))     # fANOVA rating tables (JSON)
 Each fitted model decomposes into main effects and interactions that reproduce the raw
 score with mathematical exactness within floating-point tolerance (for a multiclass model, one table bank per class logit).
 
+## Saving and loading
+
+A fitted estimator serializes to bytes (compact) or JSON (diffable) and loads back as a fitted
+estimator that predicts identically:
+
+```python
+from t_boost import TBoostRegressor
+
+with open("freq.tboost", "wb") as f:
+    f.write(freq.to_bytes())
+
+with open("freq.tboost", "rb") as f:
+    loaded = TBoostRegressor.from_bytes(f.read())   # TBoostClassifier.from_bytes for classifiers
+
+rate = loaded.predict(test)
+test.select(loaded.required_columns)               # the raw feature columns predict reads
+loaded._exposure_spec                              # "Exposure": the column named at fit, or None
+```
+
+`to_json()` / `from_json()` work the same way. Pickle and joblib work too. The JSON document is
+the envelope: estimator metadata at the top level, and the model document as a JSON string under
+`"model"`. In 0.6.1 and earlier, a numeric regressor's `to_json()` was the bare model document.
+
+| Preserved | Notes |
+|-----------|-------|
+| The model (trees or pruned rating tables) | Bit-identical predictions after loading |
+| Constructor parameters | `get_params()` matches the fitted estimator |
+| Feature names, categorical layout, `classes_` | Needed to serve by column name |
+| Column specs | `_response_spec`, `_weights_spec`, `_exposure_spec`, `_groups_spec`: the column names given to `fit`, or `None` when passed as arrays |
+
+Fit-time reports (`pruning_report_`, `graduation_report_`, …), training data, and fit-time
+exposure/weights are not saved.
+
+**Version compatibility.** Each blob records the t-boost version that wrote it and a
+`schema_version`. A newer t-boost loads blobs written by older releases. A blob from a newer
+schema than the running t-boost supports is refused with `SerializationError` rather than
+half-read. So is loading a classifier blob with `TBoostRegressor.from_bytes`, or the reverse.
+
 ## Objectives
 
 | Objective | Task | Link |

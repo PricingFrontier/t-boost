@@ -30,6 +30,7 @@ from ._compat import (
 
 from ._t_boost import (
     BUILD_PROFILE,
+    SerializationError,
     _Booster,
     _Model,
     _MultiClassModel,
@@ -68,13 +69,17 @@ def _reject_sparse(x: Any) -> None:
         )
 
 
-# --- Estimator serialization envelope (preserves the Python-side categorical layout) ------------
-# A serialized `_Model`/`_MultiClassModel` records the numeric-first *reordered* axis layout, so it
-# alone cannot reconstruct which ORIGINAL columns were categorical (needed to re-split X at serve).
-# When a model has categoricals, `to_bytes`/`to_json` wrap the raw model blob in this tiny envelope
-# carrying `_cat_indices_` / `feature_names_in_` / `classes_`; a NUMERIC model keeps the raw wire
-# format unchanged (back-compat). `from_bytes`/`from_json` sniff and restore.
+# --- Estimator serialization envelope -----------------------------------------------------------
+# A serialized `_Model`/`_MultiClassModel` records the numeric-first *reordered* axis layout and
+# nothing about the estimator around it, so `to_bytes`/`to_json` wrap the raw model blob in this
+# envelope: a JSON header carrying the estimator class, its `get_params()`, the fit-time column
+# specs (`y`/`sample_weight`/`exposure`/`groups` given by column name), `_cat_indices_` /
+# `feature_names_in_` / `classes_`, and the envelope `schema_version`. `from_bytes`/`from_json`
+# sniff and restore. Older releases wrote a header without `schema_version` (implicitly 1), and a
+# NUMERIC regressor with no envelope at all; both still load. A header from a NEWER schema is
+# refused rather than half-read (rustystats' fail-loud rule).
 _ESTIMATOR_MAGIC = b"TBP1"
+_ENVELOPE_SCHEMA_VERSION = 2
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
 _TABLES_MAGIC = b"TBTM"  # the Rust tables-only (pruned) container prefix (see serialize.rs)
 _MULTICLASS_TABLES_MAGIC = b"TBMT"  # the Rust pruned-multiclass tables container prefix
@@ -1174,6 +1179,52 @@ _PRUNE_FOLD_ES_PATIENCE = 250
 _MULTICLASS_PRUNE_FOLD_ES_PATIENCE = 100
 
 
+# Fit-time column specs: the column NAME each per-row fit vector was taken from, or None when it
+# was passed as data (or not at all). Same attribute names as rustystats' GLMModel, so a consumer
+# reads the exposure column of either library the same way.
+_COLUMN_SPECS = ("_response_spec", "_weights_spec", "_exposure_spec", "_groups_spec")
+
+# Marks a JSON document as an estimator envelope. Releases up to 0.6.1 wrote the legacy key.
+_JSON_ENVELOPE_KEY = "__t_boost_estimator__"
+_LEGACY_JSON_ENVELOPE_KEY = "__tri_estimator__"
+
+
+def _encode_param(name: str, value: Any) -> Any:
+    """A constructor parameter as JSON that `_decode_param` turns back into an equal value:
+    tuples, numpy arrays and non-string dict keys (e.g. ``monotone_constraints={0: 1}``) are
+    tagged so they survive the round trip."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return {"__ndarray__": value.tolist(), "dtype": value.dtype.str}
+    if isinstance(value, tuple):
+        return {"__tuple__": [_encode_param(name, v) for v in value]}
+    if isinstance(value, list):
+        return [_encode_param(name, v) for v in value]
+    if isinstance(value, dict):
+        return {"__dict__": [[_encode_param(name, k), _encode_param(name, v)]
+                             for k, v in value.items()]}
+    raise SerializationError(
+        f"cannot serialize parameter {name}={value!r} (type {type(value).__name__}); "
+        "pass it as a number, string, list, tuple, dict or numpy array"
+    )
+
+
+def _decode_param(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_decode_param(v) for v in value]
+    if isinstance(value, dict):
+        if "__ndarray__" in value:
+            return np.asarray(value["__ndarray__"], dtype=np.dtype(value["dtype"]))
+        if "__tuple__" in value:
+            return tuple(_decode_param(v) for v in value["__tuple__"])
+        if "__dict__" in value:
+            return {_decode_param(k): _decode_param(v) for k, v in value["__dict__"]}
+    return value
+
+
 def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     # Distinguish the pruned tables-only multiclass container (TBMT) from the full per-tree one
     # (TBMC) — both hang off `_multi_model`, but they decode through different Rust classes, so a
@@ -1185,7 +1236,17 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
         kind = "multi"
     else:
         kind = "single"
-    md: dict[str, Any] = {"kind": kind, "objective": est.objective, "tweedie_rho": est.tweedie_rho}
+    md: dict[str, Any] = {
+        "schema_version": _ENVELOPE_SCHEMA_VERSION,
+        "t_boost_version": _t_boost_version(),
+        "estimator": type(est).__name__,
+        "kind": kind,
+        "objective": est.objective,
+        "tweedie_rho": est.tweedie_rho,
+        "params": {k: _encode_param(k, v) for k, v in est.get_params(deep=False).items()},
+    }
+    for key in _COLUMN_SPECS:
+        md[key] = getattr(est, key, None)
     cat_idx = getattr(est, "_cat_indices_", None)
     if cat_idx:
         md["cat_indices"] = [int(i) for i in cat_idx]
@@ -1216,7 +1277,46 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     return md
 
 
+def _check_envelope(cls: type, md: dict[str, Any]) -> None:
+    """Refuse a header this build cannot read faithfully: a newer envelope schema, or a blob
+    written by the other estimator class. Headers from older releases carry neither key."""
+    version = md.get("schema_version", 1)
+    if not isinstance(version, int) or version > _ENVELOPE_SCHEMA_VERSION:
+        raise SerializationError(
+            f"Cannot load model: serialized schema_version {version!r} is newer than this "
+            f"t-boost build supports (schema_version {_ENVELOPE_SCHEMA_VERSION}, t-boost "
+            f"{_t_boost_version()}). It was written by t-boost "
+            f"{md.get('t_boost_version', 'unknown')}; load it with that version or newer."
+        )
+    written_by = md.get("estimator")
+    if written_by is not None and written_by != cls.__name__:
+        raise SerializationError(
+            f"Cannot load model: the blob holds a {written_by}, not a {cls.__name__}; "
+            f"use {written_by}.from_bytes / from_json."
+        )
+
+
+def _t_boost_version() -> str:
+    from . import __version__
+
+    return __version__
+
+
+def _restore_params(est: "_BaseTBoost", md: dict[str, Any]) -> None:
+    """Restore the constructor parameters. Must run BEFORE the model is attached: `set_params`
+    clears every fitted attribute."""
+    params = md.get("params")
+    if isinstance(params, dict):
+        # Parameters a later release removed are dropped: they shaped the fit, not the
+        # serialized model, which is what predicts.
+        known = est.get_params(deep=False)
+        est.set_params(**{k: _decode_param(v) for k, v in params.items() if k in known})
+
+
 def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
+    for key in _COLUMN_SPECS:
+        value = md.get(key)
+        setattr(est, key, value if isinstance(value, str) else None)
     if "objective" in md:
         est.objective = str(md["objective"])
     if "tweedie_rho" in md:
@@ -1227,6 +1327,12 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
         est._cat_indices_ = [int(i) for i in md["cat_indices"]]
     if md.get("feature_names_in_") is not None:
         est.feature_names_in_ = np.asarray(md["feature_names_in_"], dtype=object)
+    elif "schema_version" in md and hasattr(est, "feature_names_in_"):
+        # The header records `feature_names_in_` whenever the estimator had it, so its absence
+        # means a fit on unnamed columns: drop the `f{i}` placeholders the native model carries,
+        # keeping positional serving exactly as before the round trip. (Older headers did not
+        # say, so their loads keep the placeholders.)
+        del est.feature_names_in_
     if md.get("classes_") is not None:
         est.classes_ = np.asarray(md["classes_"])
     # Restore the INPUT column count over `_attach_model`'s axis count (see
@@ -1236,11 +1342,7 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
 
 
 def _pack_bytes(est: "_BaseTBoost", inner: bytes) -> bytes:
-    md = _estimator_metadata(est)
-    if (not md.get("cat_indices") and md.get("classes_") is None
-            and not md.get("_ae_requires_weight_") and not md.get("_ae_requires_exposure_")):
-        return inner  # numeric regressor: unchanged raw wire format
-    header = json.dumps(md).encode("utf-8")
+    header = json.dumps(_estimator_metadata(est)).encode("utf-8")
     return _ESTIMATOR_MAGIC + len(header).to_bytes(4, "big") + header + inner
 
 
@@ -1266,17 +1368,17 @@ def _unpack_bytes(data: bytes) -> tuple[dict[str, Any], bytes]:
 
 def _pack_json(est: "_BaseTBoost", inner_json: str) -> str:
     md = _estimator_metadata(est)
-    if (not md.get("cat_indices") and md.get("classes_") is None
-            and not md.get("_ae_requires_weight_") and not md.get("_ae_requires_exposure_")):
-        return inner_json  # numeric regressor: unchanged raw model JSON
-    md["__tri_estimator__"] = 1
+    md[_JSON_ENVELOPE_KEY] = 1
     md["model"] = inner_json
     return json.dumps(md)
 
 
 def _unpack_json(text: str) -> tuple[dict[str, Any], str]:
     obj = json.loads(text)
-    if isinstance(obj, dict) and obj.get("__tri_estimator__"):
+    envelope = isinstance(obj, dict) and (
+        obj.get(_JSON_ENVELOPE_KEY) or obj.get(_LEGACY_JSON_ENVELOPE_KEY)
+    )
+    if envelope:
         inner = str(obj["model"])
         # As in `_unpack_bytes`: trust the inner JSON's own kind string over a stale envelope
         # kind, so old 'multi'-labeled tables blobs still dispatch correctly (H8).
@@ -1991,6 +2093,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "_ae_requires_weight_",
             "_ae_requires_exposure_",
             "graduation_validation_",
+            *_COLUMN_SPECS,
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -4970,6 +5073,34 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             pass
         return tags
 
+    def _record_column_specs(
+        self, y: Any, sample_weight: Any, exposure: Any, groups: Any
+    ) -> None:
+        """Remember which fit vectors were named by column (rustystats' ``_exposure_spec`` and
+        friends) so the serialized model can say which column holds the exposure."""
+        for key, arg in zip(_COLUMN_SPECS, (y, sample_weight, exposure, groups)):
+            setattr(self, key, arg if isinstance(arg, str) else None)
+
+    @property
+    def required_columns(self) -> list[str]:
+        """Raw input columns needed to predict with this model, in fit order.
+
+        These are the feature columns ``predict`` reads by name; extra columns are ignored.
+        The exposure column is not among them, because ``predict`` returns the rate per unit
+        exposure. The column the model was fitted with, if it was named, is ``_exposure_spec``.
+        Use this to project a LazyFrame before collecting it::
+
+            df.select(model.required_columns).collect()
+        """
+        check_is_fitted(self)
+        names = getattr(self, "feature_names_in_", None)
+        if names is None:
+            raise RuntimeError(
+                "required_columns is only available for models fitted on named columns "
+                "(a polars DataFrame or another frame with column names)"
+            )
+        return [str(n) for n in names]
+
     def __getstate__(self) -> dict[str, Any]:
         # The Rust model handles (`_Model` / `_MultiClassModel`) are `@final` pyo3 classes that
         # cannot be pickled directly, so serialize them to bytes here (round-trips via the versioned
@@ -4979,14 +5110,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         model = state.pop("_model", None)
         multi = state.pop("_multi_model", None)
         if multi is not None:
-            state["__tri_multi_bytes__"] = multi.to_bytes()
+            state["__t_boost_multi_bytes__"] = multi.to_bytes()
         elif model is not None:
-            state["__tri_model_bytes__"] = model.to_bytes()
+            state["__t_boost_model_bytes__"] = model.to_bytes()
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
-        multi_bytes = state.pop("__tri_multi_bytes__", None)
-        model_bytes = state.pop("__tri_model_bytes__", None)
+        # Pickles from releases up to 0.6.1 used the `__tri_*` keys.
+        multi_bytes = state.pop("__t_boost_multi_bytes__", state.pop("__tri_multi_bytes__", None))
+        model_bytes = state.pop("__t_boost_model_bytes__", state.pop("__tri_model_bytes__", None))
         self.__dict__.update(state)
         if multi_bytes is not None:
             if multi_bytes[:4] == _MULTICLASS_TABLES_MAGIC:
@@ -5761,6 +5893,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         """
         est = cls()
         md, inner = _unpack_bytes(data)
+        _check_envelope(cls, md)
+        _restore_params(est, md)
         if inner[:4] == _TABLES_MAGIC:
             est._attach_model(_TableModel.from_bytes(inner))
         else:
@@ -5784,6 +5918,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         """
         est = cls()
         md, inner = _unpack_json(data)
+        _check_envelope(cls, md)
+        _restore_params(est, md)
         if '"t-boost-tables"' in inner:
             est._attach_model(_TableModel.from_json(inner))
         else:
@@ -5869,6 +6005,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
                 "groups": groups,
             },
         )
+        self._record_column_specs(y, sample_weight, exposure, groups)
         self._fit_model(
             X,
             resolved["y"],
@@ -6914,9 +7051,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             A new, already-fitted estimator instance.
         """
         est = cls()
-        # Optional TBP1 envelope carries the categorical layout; inner is a binary Model blob or a
-        # multiclass container (TBMC magic). Numeric models have no envelope (back-compat).
+        # The TBP1 envelope carries the estimator metadata; inner is a binary Model blob or a
+        # multiclass container (TBMC magic).
         md, inner = _unpack_bytes(data)
+        _check_envelope(cls, md)
+        _restore_params(est, md)
         if md.get("kind") == "multi":
             est._attach_multiclass_model(_MultiClassModel.from_bytes(inner))
         elif md.get("kind") == "multi_tables":
@@ -6944,6 +7083,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         """
         est = cls()
         md, inner = _unpack_json(data)
+        _check_envelope(cls, md)
+        _restore_params(est, md)
         if md.get("kind") == "multi":
             est._attach_multiclass_model(_MultiClassModel.from_json(inner))
         elif md.get("kind") == "multi_tables":
@@ -7262,6 +7403,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 "groups": groups,
             },
         )
+        self._record_column_specs(y, sample_weight, exposure, groups)
         y = resolved["y"]
         sample_weight = resolved["sample_weight"]
         exposure = resolved["exposure"]

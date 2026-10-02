@@ -9,6 +9,7 @@ from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
 from t_boost.sklearn import PrecisionWarning, TBoostClassifier, TBoostRegressor
+from _artifact import model_bytes
 
 
 def regression_fixture() -> tuple[np.ndarray, np.ndarray]:
@@ -214,8 +215,8 @@ def test_classifier_predict_proba_classes_and_roundtrip() -> None:
 
 def test_python_fit_is_thread_count_deterministic() -> None:
     x, y = regression_fixture()
-    a = small_regressor(n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
-    b = small_regressor(n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
+    a = model_bytes(small_regressor(n_jobs=1).fit(x.astype(np.float32), y))
+    b = model_bytes(small_regressor(n_jobs=2).fit(x.astype(np.float32), y))
     assert a == b
 
 
@@ -776,8 +777,8 @@ def test_classifier_native_categorical_predict_proba() -> None:
 def test_outer_bag_is_thread_count_deterministic() -> None:
     # Bagging folds convex weights into tree alphas — still byte-identical across n_jobs.
     x, y = regression_fixture()
-    a = small_regressor(n_bags=4, n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
-    b = small_regressor(n_bags=4, n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
+    a = model_bytes(small_regressor(n_bags=4, n_jobs=1).fit(x.astype(np.float32), y))
+    b = model_bytes(small_regressor(n_bags=4, n_jobs=2).fit(x.astype(np.float32), y))
     assert a == b
 
 
@@ -1501,10 +1502,10 @@ def test_categorical_model_serialize_round_trip() -> None:
     np.testing.assert_array_equal(r2.predict(x), pred)
     r3 = TBoostRegressor.from_json(r.to_json())
     np.testing.assert_array_equal(r3.predict(x), pred)
-    # A numeric model keeps the raw (non-enveloped) wire format — back-compat, unchanged.
+    # A numeric model is enveloped too (the header carries params and column specs).
     xr, yr = regression_fixture()
     rn = TBoostRegressor(n_trees=20, seed=0).fit(xr.astype(np.float32), yr)
-    assert rn.to_bytes()[:4] != b"TBP1"
+    assert rn.to_bytes()[:4] == b"TBP1"
 
 
 def test_binary_path_unchanged_no_multiclass_container() -> None:

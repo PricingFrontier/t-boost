@@ -14,6 +14,7 @@ path, so the tests below also assert the panel fit stays DIFFERENT from its ungr
 import numpy as np
 import pytest
 
+from _artifact import model_json
 from t_boost.sklearn import (
     TBoostClassifier,
     TBoostRegressor,
@@ -76,7 +77,7 @@ def test_singleton_groups_identical_to_no_groups_regressor(prune):
     b = TBoostRegressor(objective="poisson", n_trees=60, n_bags=2, seed=11, prune=prune)
     a.fit(X, y, groups=singleton)
     b.fit(X, y)
-    assert a.to_json() == b.to_json()
+    assert model_json(a) == model_json(b)
     assert np.array_equal(a.predict(X), b.predict(X))
 
 
@@ -90,7 +91,7 @@ def test_singleton_groups_identical_to_no_groups_shuffled_ids():
     b = TBoostRegressor(objective="poisson", n_trees=60, n_bags=2, seed=11)
     a.fit(X, y, groups=ids)
     b.fit(X, y)
-    assert a.to_json() == b.to_json()
+    assert model_json(a) == model_json(b)
 
 
 def test_singleton_groups_identical_to_no_groups_binary():
@@ -101,7 +102,7 @@ def test_singleton_groups_identical_to_no_groups_binary():
     b = TBoostClassifier(n_trees=60, n_bags=2, seed=11)
     a.fit(X, y, groups=singleton)
     b.fit(X, y)
-    assert a.to_json() == b.to_json()
+    assert model_json(a) == model_json(b)
 
 
 def test_singleton_groups_identical_to_no_groups_multiclass():
@@ -113,7 +114,7 @@ def test_singleton_groups_identical_to_no_groups_multiclass():
     b = TBoostClassifier(n_trees=60, n_bags=2, seed=11)
     a.fit(X, y, groups=singleton)
     b.fit(X, y)
-    assert a.to_json() == b.to_json()
+    assert model_json(a) == model_json(b)
 
 
 def test_singleton_groups_recover_the_es_carve_rows():
@@ -127,7 +128,7 @@ def test_singleton_groups_recover_the_es_carve_rows():
     ungrouped = TBoostRegressor(objective="poisson", n_trees=60, n_bags=2, seed=11,
                                   validation_fraction=0.1)
     ungrouped.fit(X, y)
-    assert est.to_json() == ungrouped.to_json()
+    assert model_json(est) == model_json(ungrouped)
 
 
 # ------------------------------------------------------- the converse: panels untouched
@@ -141,7 +142,7 @@ def test_genuine_panel_still_takes_the_grouped_path(prune):
     grouped.fit(X, y, groups=groups)
     plain.fit(X, y)
     assert not _is_degenerate_grouping(groups)
-    assert grouped.to_json() != plain.to_json()
+    assert model_json(grouped) != model_json(plain)
 
 
 def test_genuine_panel_multiclass_still_grouped():
@@ -155,7 +156,7 @@ def test_genuine_panel_multiclass_still_grouped():
     plain = TBoostClassifier(n_trees=60, n_bags=2, seed=11)
     grouped.fit(X, y, groups=groups)
     plain.fit(X, y)
-    assert grouped.to_json() != plain.to_json()
+    assert model_json(grouped) != model_json(plain)
 
 
 def test_mismatched_length_still_raises_for_singleton_ids():

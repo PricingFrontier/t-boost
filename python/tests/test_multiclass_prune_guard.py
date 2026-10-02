@@ -28,6 +28,7 @@ import polars as pl
 import pytest
 
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
+from _artifact import model_bytes
 
 
 def _fixture(n: int = 8000, p: int = 12, seed: int = 3, k_cuts=(0.3, 0.6, 0.85)):
@@ -75,7 +76,7 @@ def test_guard_off_is_byte_identical_to_guard_on_when_silent() -> None:
     on = _fit(frame, y, multiclass_prune_guard=True)
     guard = on.pruning_report_["guard"]
     assert guard["enabled"] and not guard["fired"], guard
-    assert off.to_bytes() == on.to_bytes()
+    assert model_bytes(off) == model_bytes(on)
     assert np.array_equal(off.predict_proba(frame), on.predict_proba(frame))
 
 
@@ -189,7 +190,7 @@ def test_guard_is_deterministic() -> None:
     frame, y = _fixture()
     a = _fit(frame, y, multiclass_prune_guard=True, prune_guard_tol=-1.0)
     b = _fit(frame, y, multiclass_prune_guard=True, prune_guard_tol=-1.0)
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
     # `evidence_seconds` is a wall clock, deliberately excluded.
     drop = {"evidence_seconds"}
     assert {k: v for k, v in a.pruning_report_["guard"].items() if k not in drop} == {
@@ -219,7 +220,7 @@ def test_binary_classifier_never_sees_the_multiclass_guard(k: int) -> None:
     on = TBoostClassifier(
         n_trees=60, seed=0, n_jobs=4, prune=True, multiclass_prune_guard=True
     ).fit(frame, y)
-    assert off.to_bytes() == on.to_bytes()
+    assert model_bytes(off) == model_bytes(on)
 
 
 def test_regressor_never_sees_the_multiclass_guard() -> None:
@@ -231,7 +232,7 @@ def test_regressor_never_sees_the_multiclass_guard() -> None:
     on = TBoostRegressor(
         n_trees=60, seed=0, n_jobs=4, prune=True, multiclass_prune_guard=True
     ).fit(frame, y)
-    assert off.to_bytes() == on.to_bytes()
+    assert model_bytes(off) == model_bytes(on)
 
 
 # --- av40: the guard and the TABLE BUDGET, composed --------------------------------------------

@@ -7,6 +7,7 @@ from sklearn.base import clone
 
 from t_boost import TBoostClassifier, TBoostRegressor
 from t_boost.sklearn import _TableModel
+from _artifact import model_bytes
 
 
 @pytest.mark.parametrize('alpha', [-0.1, 1.1, np.nan, np.inf, True, '0.5', None])
@@ -130,7 +131,7 @@ def test_estimator_fit_default_noop_and_enabled_reporting():
                   leaf_refine_steps=0, colsample_bytree=1)
     default = TBoostRegressor(**params).fit(x, y)
     zero = TBoostRegressor(**params, graduation_high_order_alpha=0).fit(x, y)
-    assert default.to_bytes() == zero.to_bytes()
+    assert model_bytes(default) == model_bytes(zero)
     enabled = TBoostRegressor(**params, graduation_high_order_alpha=0.2).fit(x, y)
     high = [r for r in enabled.graduation_report_ if r.get('method') == 'reference_diffusion']
     assert high and any(r['applied'] for r in high)

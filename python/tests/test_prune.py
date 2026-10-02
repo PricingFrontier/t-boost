@@ -10,6 +10,7 @@ import pytest
 
 from t_boost._t_boost import _Booster, _Model, _MultiClassTableModel, _TableModel
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
+from _artifact import model_bytes
 
 
 def _noisy_poisson(n: int = 3000, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -61,7 +62,8 @@ def test_pruned_model_round_trips_through_bytes_and_json() -> None:
     p = est.predict(x[:50])
 
     blob = est.to_bytes()
-    assert bytes(blob[:4]) == b"TBTM", "pruned model must serialize with the tables-only magic"
+    assert bytes(blob[:4]) == b"TBP1"
+    assert model_bytes(est)[:4] == b"TBTM", "pruned model must serialize with the tables-only magic"
     back = TBoostRegressor.from_bytes(blob)
     assert isinstance(back._model, _TableModel)
     assert np.allclose(p, back.predict(x[:50]), atol=1e-5)
@@ -790,7 +792,7 @@ def test_fold_patience_default_is_250_and_explicit_250_reproduces_it() -> None:
         objective="poisson", n_trees=120, n_bags=1, seed=0, prune=True, graduate=False,
         prune_fold_es_patience=250,
     ).fit(x, y)
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
 
 
 @pytest.mark.parametrize("objective", ["poisson", "gamma", "tweedie"])
@@ -871,7 +873,7 @@ def test_prune_guard_silent_is_identical() -> None:
     assert off.pruning_report_["guard"]["enabled"] is False
     assert off.pruning_report_["guard"]["fired"] is False
     assert off.pruning_report_["guard"]["selection_independent"] is False
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
 
 
 def test_prune_guard_ungrouped_fit_never_carves_and_is_the_guard_off_fit(
@@ -895,7 +897,7 @@ def test_prune_guard_ungrouped_fit_never_carves_and_is_the_guard_off_fit(
     # Same fit, guard off: the deploy booster.fit call sees the same (absent) holdout, so the
     # pruned artifacts coincide exactly while the guard is silent.
     off = TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y)
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
 
 
 def test_prune_guard_forced_fire_relaxes_keepset_and_improves_holdout() -> None:
@@ -952,7 +954,7 @@ def test_prune_guard_fires_on_a_tight_tolerance_and_stops_at_the_first_clean_run
     # A tolerance ABOVE the cost stays silent and ships the unguarded artifact.
     loose = TBoostRegressor(graduate=False, **kw, prune_guard_tol=cost * 2.0 + 1e-6).fit(X, y)
     assert loose.pruning_report_["guard"]["fired"] is False
-    assert loose.to_bytes() == base.to_bytes()
+    assert model_bytes(loose) == model_bytes(base)
 
 
 def test_prune_guard_single_bag_fit_has_no_oob_rows_and_is_skipped() -> None:
@@ -975,7 +977,7 @@ def test_prune_guard_single_bag_fit_has_no_oob_rows_and_is_skipped() -> None:
     bagged = TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=2, seed=0,
                                prune=False, categorical_features=["c"]).fit(X, y)
     assert bagged._model.bag_oob_available() is True
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
 
 
 def test_prune_guard_falls_back_to_the_carve_when_oob_is_unavailable() -> None:
@@ -997,7 +999,7 @@ def test_prune_guard_falls_back_to_the_carve_when_oob_is_unavailable() -> None:
     plain = TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=1, seed=0, prune=True,
                               categorical_features=["c"]).fit(X, y)
     assert sing.pruning_report_["guard"]["skipped"] == "no out-of-bag evidence (single-bag fit)"
-    assert sing.to_bytes() == plain.to_bytes()
+    assert model_bytes(sing) == model_bytes(plain)
 
 
 def test_prune_guard_tiny_dataset_is_skipped_for_want_of_evidence_rows() -> None:
@@ -1046,10 +1048,10 @@ def test_prune_guard_panel_fit_reads_honest_out_of_bag_rows_from_group_aware_bag
     assert g2["evidence"] == "oob" and g2["oob_rows"] > g["holdout_rows"]
     off = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
                             prune_guard=False).fit(X, y, groups=singleton)
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
     ungrouped = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0,
                                   prune=True).fit(X, y)
-    assert on.to_bytes() == ungrouped.to_bytes()
+    assert model_bytes(on) == model_bytes(ungrouped)
 
 
 def test_prune_guard_evidence_is_the_raw_bank_and_biases_toward_firing() -> None:
@@ -1157,7 +1159,7 @@ def test_prune_guard_evidence_is_the_raw_bank_and_biases_toward_firing() -> None
     # crossing that gap and nothing else.
     loose = TBoostRegressor(graduate=False, **kw, prune=True, prune_guard_tol=raw_gap + 1e-3).fit(x, y)
     assert loose.pruning_report_["guard"]["fired"] is False
-    assert loose.to_bytes() == est.to_bytes()
+    assert model_bytes(loose) == model_bytes(est)
 
 
 def test_prune_guard_params_roundtrip() -> None:
@@ -1257,7 +1259,7 @@ def test_evidence_gate_off_is_the_legacy_selection_and_reports_it_as_such() -> N
     # the gate is forced back onto the legacy selection and must reproduce it TO THE BYTE.
     pinned = TBoostRegressor(graduate=False, **kw, prune_drop_z=2.0, prune_keep_budget=0).fit(x, y)
     assert pinned.pruning_report_["evidence_admitted"] == []
-    assert pinned.to_bytes() == off.to_bytes()
+    assert model_bytes(pinned) == model_bytes(off)
 
 
 def test_evidence_gate_only_ever_keeps_more_never_fewer() -> None:
@@ -1306,7 +1308,7 @@ def test_evidence_gate_is_deterministic_across_thread_counts() -> None:
     b = TBoostRegressor(graduate=False, **kw, n_jobs=4).fit(x, y)
     assert a.pruning_report_["kept"] == b.pruning_report_["kept"]
     assert a.pruning_report_["evidence_admitted"] == b.pruning_report_["evidence_admitted"]
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
 
 
 def test_guard_z_silences_a_within_noise_breach_but_not_a_real_one() -> None:
@@ -1332,7 +1334,7 @@ def test_guard_z_silences_a_within_noise_breach_but_not_a_real_one() -> None:
     gq = quiet.pruning_report_["guard"]
     assert gq["fired"] is False
     assert gq["tol_effective"] == pytest.approx(z_silent * se, rel=1e-9)
-    assert quiet.to_bytes() == TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y).to_bytes()
+    assert model_bytes(quiet) == model_bytes(TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y))
     # ...and a gap far beyond the noise still breaches at the shipped z.
     loud = TBoostRegressor(graduate=False, **kw, prune_guard_tol=-0.5, prune_guard_z=1e-9).fit(X, y)
     assert loud.pruning_report_["guard"]["fired"] is True
@@ -1467,13 +1469,13 @@ def test_guard_z_dn_zero_is_the_pre_av39_guard_to_the_byte() -> None:
     for floor in (0.0, 0.005, 0.5):
         same = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=0.0,
                                  prune_guard_tol_floor=floor).fit(X, y)
-        assert same.to_bytes() == ref.to_bytes()
+        assert model_bytes(same) == model_bytes(ref)
     # This fixture's gap is real but sits INSIDE one SE, so the fixed 5% bar is silent and the
     # deployed model is the unguarded one — the state the tightened bar has to change.
     gap = g["dev_selected_initial"] / g["dev_full"] - 1.0
     assert gap > 0.0 and gap < g["gap_se"]
     assert g["fired"] is False
-    assert ref.to_bytes() == TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard=False).fit(X, y).to_bytes()
+    assert model_bytes(ref) == model_bytes(TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard=False).fit(X, y))
 
 
 def test_guard_z_dn_fires_on_a_sharp_jury_and_the_min_still_protects_a_blunt_one() -> None:
@@ -1495,20 +1497,20 @@ def test_guard_z_dn_fires_on_a_sharp_jury_and_the_min_still_protects_a_blunt_one
     assert gf["tol_effective"] < gf["tol"]
     assert gf["kept_final"] > gf["kept_initial"] == g0["kept_initial"]
     assert gf["dev_selected_final"] <= gf["dev_selected_initial"]
-    assert fired.to_bytes() != ctrl.to_bytes()
+    assert model_bytes(fired) != model_bytes(ctrl)
 
     # The floor is a real clamp: the SAME z_dn with a floor above the gap goes silent again.
     floored = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=z_fire,
                                 prune_guard_tol_floor=2.0 * gap).fit(X, y)
     assert floored.pruning_report_["guard"]["fired"] is False
-    assert floored.to_bytes() == ctrl.to_bytes()
+    assert model_bytes(floored) == model_bytes(ctrl)
 
     # And the neutrality guarantee in situ: a z_dn whose z*SE exceeds `tol` is pinned by the
     # `min` back onto the fixed tolerance — the blunt-jury (ohlsson_pp) case, bit-identical.
     blunt = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0,
                               prune_guard_z_dn=2.0 * g0["tol"] / se).fit(X, y)
     assert blunt.pruning_report_["guard"]["tol_effective"] == pytest.approx(g0["tol"])
-    assert blunt.to_bytes() == ctrl.to_bytes()
+    assert model_bytes(blunt) == model_bytes(ctrl)
 
 
 def test_guard_z_dn_governs_the_ladder_stopping_rule_too() -> None:

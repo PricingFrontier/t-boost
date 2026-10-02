@@ -31,6 +31,7 @@ import numpy as np
 import polars as pl
 
 from t_boost.sklearn import TBoostClassifier
+from _artifact import model_bytes
 
 
 def _fixture(n: int = 4000, p: int = 8, seed: int = 5, classes: int = 4):
@@ -55,14 +56,14 @@ def test_default_is_full_sampling_and_does_not_raise() -> None:
     frame, y = _fixture()
     a = _fit(frame, y)
     b = _fit(frame, y, subsample=None, mvs_min_rows=1)
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
 
 
 def test_subsample_one_is_full_sampling() -> None:
     # Invariant 4. rate=1.0 ⇒ k == n ⇒ the `k == n` short circuit ⇒ no reweighting, no re-walk,
     # byte-identical to the unsampled fit. This is what makes the knob safe to leave at 1.0.
     frame, y = _fixture()
-    assert _fit(frame, y).to_bytes() == _fit(frame, y, subsample=1.0).to_bytes()
+    assert model_bytes(_fit(frame, y)) == model_bytes(_fit(frame, y, subsample=1.0))
 
 
 def test_subsample_changes_the_fit_deterministically() -> None:
@@ -71,8 +72,8 @@ def test_subsample_changes_the_fit_deterministically() -> None:
     full = _fit(frame, y)
     mvs = _fit(frame, y, subsample=0.5)
     again = _fit(frame, y, subsample=0.5)
-    assert mvs.to_bytes() != full.to_bytes()
-    assert mvs.to_bytes() == again.to_bytes()
+    assert model_bytes(mvs) != model_bytes(full)
+    assert model_bytes(mvs) == model_bytes(again)
     assert np.array_equal(mvs.predict_proba(frame), again.predict_proba(frame))
 
 
@@ -87,7 +88,7 @@ def test_subsample_is_thread_count_independent() -> None:
     many = TBoostClassifier(
         n_trees=80, seed=2, n_jobs=8, prune=False, leaf_refine_steps=0, subsample=0.5
     ).fit(frame, y)
-    assert one.to_bytes() == many.to_bytes()
+    assert model_bytes(one) == model_bytes(many)
 
 
 def test_the_shared_draw_moves_every_class_together() -> None:
@@ -112,10 +113,10 @@ def test_mvs_min_rows_floors_the_draw() -> None:
     n_train = 2000
     floored = _fit(frame, y, subsample=0.001, mvs_min_rows=800)
     direct = _fit(frame, y, subsample=0.001, mvs_min_rows=800)
-    assert floored.to_bytes() == direct.to_bytes()
+    assert model_bytes(floored) == model_bytes(direct)
     # min_rows >= n means every row is drawn, which is the k == n short circuit.
     all_rows = _fit(frame, y, subsample=0.1, mvs_min_rows=n_train)
-    assert all_rows.to_bytes() == _fit(frame, y).to_bytes()
+    assert model_bytes(all_rows) == model_bytes(_fit(frame, y))
 
 
 def test_sampled_fit_still_predicts_a_valid_simplex() -> None:
