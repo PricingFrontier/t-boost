@@ -1,27 +1,30 @@
 # t-boost
 
-**An oblivious gradient-boosting machine that is *exactly* decomposable into functional-ANOVA (fANOVA)
-"rating tables" of up to 8th order.**
+**A Tabulating Boosting Machine (TBM): gradient boosting whose fitted model is *exactly* a set of
+rating tables.**
 
-Every tree is a symmetric (oblivious) tree with one shared `(feature, threshold)` test per level
-and a bounded number of distinct raw features; deeper levels may reuse a feature to refine a surface
-rather than add a new one, so the trained ensemble truncates at a fixed interaction order. That
-structure lets the fitted model be rewritten, losslessly, as a set of
-main-effect and interaction tables (with factored box representations for high-order effects) that reproduce the model's predictions with mathematical exactness within floating-point tolerance — a glass-box
-GBM you can read, ship as lookup tables, or audit.
+## Why
 
-- **Rust core** (`t-boost-core`), thin [PyO3](https://pyo3.rs) bindings, and polars-native
-  Python estimators. The core is `#![forbid(unsafe_code)]`, no-panic-gated, and deterministic
-  (bit-identical across thread counts).
-- **polars-native**: `TBoostRegressor` / `TBoostClassifier` take polars DataFrames and LazyFrames
-  directly, with targets, weights and exposure named by column.
-- **Objectives**: `squared_error`, `logistic` (binary), native-softmax **multiclass**, and the
-  log-link `poisson` / `gamma` / `tweedie` families for insurance frequency & severity.
-- **Exact decomposition**: `model.tables(X)` emits the fANOVA rating tables; the reconstruction
-  is verified against the ensemble by lossless invariant checks. Tables are purified against
-  the exposure-weighted marginals by default (`ref_measure="exposure"`); `tables(X, ref_measure="joint")`
-  re-expresses the same model under each pair's joint exposure via regularized pairwise reallocation with explicit ridge regularization and residual diagnostics for correlated factors, and `actual_vs_expected(X, y, exposure=...)`
-  gives the A/E by rating-factor level a reviewer asks for first (explicit exposure/weight arguments are required for reliable row alignment). Neither changes a prediction.
+Gradient-boosted trees are usually more accurate than a GLM, but they are hard to read, review or
+deploy in systems built around rating tables. t-boost aims to get boosting-level accuracy in a
+model that *is* a set of main-effect and interaction tables, with no approximation and no
+surrogate model.
+
+## How it works
+
+- **Constrained trees.** Each tree is symmetric (oblivious): every level applies one shared
+  `(feature, threshold)` split. Each tree may use only a few distinct features, so the whole
+  ensemble has a fixed maximum interaction order (up to 8th order).
+- **Exact decomposition.** Because of that structure, the trained ensemble can be rewritten as a
+  functional-ANOVA (fANOVA) decomposition: one table per main effect and per interaction. The
+  tables reproduce the model's predictions exactly, to floating-point tolerance.
+- **Purification and pruning.** The tables are centred on the training data (exposure-weighted when
+  an exposure is given), so each main effect carries as much of the signal as it can. Tables that
+  contribute little are pruned.
+- **The tables are the model.** A saved model is stored as its rating tables, so what you review
+  is exactly what gets deployed.
+
+It has a Rust core with Python bindings, takes polars DataFrames directly and is deterministic.
 
 ## Install
 
@@ -29,135 +32,69 @@ GBM you can read, ship as lookup tables, or audit.
 uv add t-boost
 ```
 
-Wheels are built for Linux / macOS / Windows as a single abi3 wheel per platform (CPython 3.10–3.13).
-
-### From source
-
-Building from source needs a Rust toolchain (`rustup`); [uv](https://docs.astral.sh/uv/) drives
-the [maturin](https://www.maturin.rs) build:
-
-```bash
-uv sync                          # builds the Rust extension into the project's .venv
-```
+To build from source you need a Rust toolchain; run `uv sync`.
 
 ## Quickstart
-
-polars DataFrames and LazyFrames are the estimators' first-class frame type — no pandas anywhere.
-`y` / `sample_weight` / `exposure` / `groups` may name columns of `X` (which are then excluded
-from the features), String/Categorical/Enum columns are target-statistic encoded automatically,
-and prediction matches feature columns by name, ignoring extras:
 
 ```python
 import polars as pl
 from t_boost import TBoostClassifier, TBoostRegressor
 
-train = pl.read_parquet("policies.parquet")            # or pl.scan_parquet(...) for lazy input
+train = pl.read_parquet("policies.parquet")
 
 # Claim frequency: Poisson with an exposure offset
 freq = TBoostRegressor(objective="poisson").fit(
     train.select(FEATURES + ["ClaimCount", "Exposure"]),
-    "ClaimCount",                                      # y, by column name
-    exposure="Exposure",                               # per-row offset, by column name
+    "ClaimCount",              # target, by column name
+    exposure="Exposure",
 )
-rate = freq.predict(test)                              # extra columns ignored, any column order
+rate = freq.predict(test)
 
-# Classification: binary, or native softmax for K >= 3 classes
+# Classification: binary, or softmax for 3+ classes
 clf = TBoostClassifier().fit(train.select(FEATURES + ["Lapsed"]), "Lapsed")
-proba = clf.predict_proba(test)                        # (n, K), rows sum to 1
+proba = clf.predict_proba(test)
 ```
 
-### The exact decomposition
+Categorical columns are encoded automatically. At prediction time, columns are matched by name.
+
+## Rating tables and explanations
 
 ```python
 import json
-tables = json.loads(freq.tables(train))     # fANOVA rating tables (JSON)
+tables = json.loads(freq.tables(train))                  # the fANOVA rating tables
+
+freq.predict_contributions(test.head(5))                 # per-prediction breakdown by table
+freq.feature_importances_                                # share of variance per feature
+freq.actual_vs_expected(train, "ClaimCount", exposure="Exposure")   # A/E by factor level
 ```
 
-Each fitted model decomposes into main effects and interactions that reproduce the raw
-score with mathematical exactness within floating-point tolerance (for a multiclass model, one table bank per class logit).
-
-### Per-prediction contributions
-
-`predict_contributions` breaks each prediction into one contribution per rating table. The
-record format is the same as rustystats' `GLMModel.predict_contributions`. Because the deployed
-model *is* its tables, the breakdown is exact: `base_value + sum(contributions)` is the raw
-(link-scale) score, and the inverse link of that is the prediction.
-
-```python
-rows = freq.predict_contributions(test.head(5))                  # one dict per row
-rows[0]["contributions"]          # [{"term": "age", "term_type": "main", "contribution": ...},
-                                  #  {"term": "age:region", "term_type": "interaction", ...}, ...]
-freq.predict_contributions(test, exposure="Exposure")            # adds a log(exposure) term
-freq.predict_contributions(test, split_interactions=True)        # exact Shapley value per feature
-freq.predict_contributions(test, return_format="dataframe")      # long polars DataFrame
-freq.feature_importances_                                        # Sobol shares per input feature
-```
-
-`exposure=` adds a `log(exposure)` contribution, so `prediction_value` becomes the expected total
-(`predict(X) * exposure`) rather than the rate per unit exposure. A multiclass model decomposes
-each class logit the same way: each record holds a `classes` list, and each class's
-`prediction_value` is its softmax probability.
-
-Every model is stored as its rating tables. `prune=True` (the default) keeps the tables that earn
-their place. `prune=False` keeps all of them, which is quicker to fit but gives a much larger
-file: tens of MB on wide data, against well under 1 MB for a pruned model.
-
-`tables(X)` exports the tables as stored, centred on the training rows. Passing `sample_weight=`
-or `exposure=` re-centres them on `X`'s rows under that mass instead. That changes how the effect
-is shared between tables, but never a prediction.
+For each prediction, `base_value + sum(contributions)` equals the raw (link-scale) score, so the
+explanation is exact rather than estimated. The output format matches rustystats'
+`GLMModel.predict_contributions`.
 
 ## Saving and loading
 
-A fitted estimator serializes to bytes (compact) or JSON (diffable) and loads back as a fitted
-estimator that predicts identically:
-
 ```python
-from t_boost import TBoostRegressor
-
 with open("freq.tboost", "wb") as f:
     f.write(freq.to_bytes())
 
 with open("freq.tboost", "rb") as f:
-    loaded = TBoostRegressor.from_bytes(f.read())   # TBoostClassifier.from_bytes for classifiers
-
-rate = loaded.predict(test)
-test.select(loaded.required_columns)               # the raw feature columns predict reads
-loaded._exposure_spec                              # "Exposure": the column named at fit, or None
+    loaded = TBoostRegressor.from_bytes(f.read())
 ```
 
-`to_json()` / `from_json()` work the same way. Pickle and joblib work too. The JSON document is
-the envelope: estimator metadata at the top level, and the model document as a JSON string under
-`"model"`. In 0.6.1 and earlier, a numeric regressor's `to_json()` was the bare model document.
-
-| Preserved | Notes |
-|-----------|-------|
-| The model (its rating tables, pruned or full) | Bit-identical predictions after loading |
-| Constructor parameters | `get_params()` matches the fitted estimator |
-| Feature names, categorical layout, `classes_` | Needed to serve by column name |
-| Column specs | `_response_spec`, `_weights_spec`, `_exposure_spec`, `_groups_spec`: the column names given to `fit`, or `None` when passed as arrays |
-
-Fit-time reports (`pruning_report_`, `graduation_report_`, …), training data, and fit-time
-exposure/weights are not saved.
-
-**Version compatibility.** Each blob records the t-boost version that wrote it and a
-`schema_version`. A newer t-boost loads blobs written by older releases. A blob from a newer
-schema than the running t-boost supports is refused with `SerializationError` rather than
-half-read. So is loading a classifier blob with `TBoostRegressor.from_bytes`, or the reverse.
-
-Two kinds of 0.6.x model are refused and must be refit: models with categorical features (0.6.x
-labelled their missing-value level differently, so nulls would score wrongly), and pickles.
-Numeric 0.6.x models saved with `to_bytes` / `to_json` still load.
+`to_json()` / `from_json()` give a diffable format. A loaded model predicts identically to the
+original.
 
 ## Objectives
 
-| Objective | Task | Link |
-|-----------|------|------|
+| Objective | Use | Link |
+|-----------|-----|------|
 | `squared_error` | regression | identity |
 | `logistic` | binary classification | logit |
-| softmax (automatic for `TBoostClassifier` with ≥3 classes) | multiclass | softmax |
-| `poisson` | counts / frequency | log |
-| `gamma` | positive severities | log |
-| `tweedie` | compound Poisson-gamma | log |
+| softmax (automatic for 3+ classes) | multiclass | softmax |
+| `poisson` | claim frequency / counts | log |
+| `gamma` | severity | log |
+| `tweedie` | pure premium | log |
 
 ## License
 
