@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 from t_boost import TBoostRegressor
+from _artifact import model_bytes
 
 
 def _collapse_data(n: int = 2000, seed: int = 0):
@@ -79,7 +80,7 @@ def test_silent_gate_is_bit_identical_to_gate_off():
     assert off.delta_step_gate_ is None
     # Predictions AND the serialized model must match exactly, not approximately.
     np.testing.assert_array_equal(on.predict(X), off.predict(X))
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
 
 
 def test_firing_gate_changes_the_model_and_gate_off_does_not():
@@ -87,7 +88,7 @@ def test_firing_gate_changes_the_model_and_gate_off_does_not():
     on = _fit(X, y, w)
     off = _fit(X, y, w, max_delta_step_gated=False)
     assert on.delta_step_gate_["engaged"] is True
-    assert on.to_bytes() != off.to_bytes()
+    assert model_bytes(on) != model_bytes(off)
 
 
 def test_explicit_max_delta_step_outranks_the_gate():
@@ -95,10 +96,10 @@ def test_explicit_max_delta_step_outranks_the_gate():
     explicit = _fit(X, y, w, max_delta_step=0.7)
     assert explicit.delta_step_gate_ is None, "a caller-named cap is never gated"
     plain = _fit(X, y, w, max_delta_step=0.7, max_delta_step_gated=False)
-    assert explicit.to_bytes() == plain.to_bytes()
+    assert model_bytes(explicit) == model_bytes(plain)
     # ...and it is genuinely the uncapped-by-the-gate fit, not a coincidence.
     gated = _fit(X, y, w)
-    assert explicit.to_bytes() != gated.to_bytes()
+    assert model_bytes(explicit) != model_bytes(gated)
 
 
 @pytest.mark.parametrize("objective", ["gamma", "poisson", "squared_error"])
@@ -108,7 +109,7 @@ def test_other_objectives_ship_no_gate(objective):
     auto = _fit(X, yy, w, objective=objective)
     off = _fit(X, yy, w, objective=objective, max_delta_step_gated=False)
     assert auto.delta_step_gate_ is None
-    assert auto.to_bytes() == off.to_bytes()
+    assert model_bytes(auto) == model_bytes(off)
 
 
 def test_explicit_parameters_arm_the_gate_on_any_objective():
@@ -174,7 +175,7 @@ def test_gate_is_deterministic_across_thread_counts():
     b = _fit(X, y, w, n_jobs=8)
     assert a.delta_step_gate_["engaged_round"] == b.delta_step_gate_["engaged_round"]
     assert a.delta_step_gate_["min_log_rate_ratio"] == b.delta_step_gate_["min_log_rate_ratio"]
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
 
 
 def test_parameter_survives_get_params_and_clone():

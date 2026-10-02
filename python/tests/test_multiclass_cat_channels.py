@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
+from _artifact import model_bytes
 
 pl = pytest.importorskip("polars")
 
@@ -81,7 +82,7 @@ def test_class_freq_on_a_binary_fit_is_satisfied_by_the_default():
     x, y = _frame(k=2)
     base = _clf().fit(x, y)
     asked = _clf(cat_channels=["class_freq"]).fit(x, y)
-    assert base.to_bytes() == asked.to_bytes()
+    assert model_bytes(base) == model_bytes(asked)
 
 
 # --- the default is untouched ---------------------------------------------------------
@@ -89,14 +90,14 @@ def test_class_freq_on_a_binary_fit_is_satisfied_by_the_default():
 
 def test_mean_only_spellings_are_byte_identical_to_the_default():
     x, y = _frame()
-    default = _clf().fit(x, y).to_bytes()
-    assert _clf(cat_channels=["mean"]).fit(x, y).to_bytes() == default
-    assert _clf(cat_channels=[]).fit(x, y).to_bytes() == default
+    default = model_bytes(_clf().fit(x, y))
+    assert model_bytes(_clf(cat_channels=["mean"]).fit(x, y)) == default
+    assert model_bytes(_clf(cat_channels=[]).fit(x, y)) == default
 
 
 def test_class_freq_actually_changes_the_multiclass_fit():
     x, y = _frame()
-    assert _clf().fit(x, y).to_bytes() != _clf(cat_channels=["class_freq"]).fit(x, y).to_bytes()
+    assert model_bytes(_clf().fit(x, y)) != model_bytes(_clf(cat_channels=["class_freq"]).fit(x, y))
 
 
 # --- the axes appear where (and only where) they can help -----------------------------
@@ -168,7 +169,7 @@ def test_mean_and_class_freq_together_also_works():
     x, y = _frame(k=3)
     both = _clf(cat_channels=["mean", "class_freq"]).fit(x, y)
     only = _clf(cat_channels=["class_freq"]).fit(x, y)
-    assert both.to_bytes() != only.to_bytes()
+    assert model_bytes(both) != model_bytes(only)
     assert np.isfinite(both.predict_proba(x)).all()
 
 
@@ -207,9 +208,9 @@ def test_class_freq_min_levels_gates_by_cardinality():
     cardinality the fit falls all the way back to the mean-only default."""
     x, y = _frame(k=3)  # 'hi' has 15 levels, 'lo' has 2
     gated = _clf(cat_channels=["class_freq"], cat_class_freq_min_levels=100).fit(x, y)
-    assert gated.to_bytes() == _clf().fit(x, y).to_bytes()
+    assert model_bytes(gated) == model_bytes(_clf().fit(x, y))
     live = _clf(cat_channels=["class_freq"], cat_class_freq_min_levels=10).fit(x, y)
-    assert live.to_bytes() != gated.to_bytes()
+    assert model_bytes(live) != model_bytes(gated)
 
 
 def test_binary_fit_with_count_and_class_freq_equals_mean_plus_count():
@@ -220,7 +221,7 @@ def test_binary_fit_with_count_and_class_freq_equals_mean_plus_count():
     x, y = _frame(k=2)
     asked = _clf(cat_channels=["count", "class_freq"], cat_count_min_levels=5).fit(x, y)
     equivalent = _clf(cat_channels=["mean", "count"], cat_count_min_levels=5).fit(x, y)
-    assert asked.to_bytes() == equivalent.to_bytes()
+    assert model_bytes(asked) == model_bytes(equivalent)
 
 
 def test_multiclass_feature_below_the_class_gate_keeps_its_mean_channel():
@@ -234,4 +235,4 @@ def test_multiclass_feature_below_the_class_gate_keeps_its_mean_channel():
         cat_class_freq_min_levels=100,
     ).fit(x, y)
     equivalent = _clf(cat_channels=["mean", "count"], cat_count_min_levels=5).fit(x, y)
-    assert gated.to_bytes() == equivalent.to_bytes()
+    assert model_bytes(gated) == model_bytes(equivalent)

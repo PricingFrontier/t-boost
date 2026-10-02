@@ -9,6 +9,7 @@ from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
 from t_boost.sklearn import PrecisionWarning, TBoostClassifier, TBoostRegressor
+from _artifact import assert_exports_close, ensemble_fit, model_bytes
 
 
 def regression_fixture() -> tuple[np.ndarray, np.ndarray]:
@@ -214,8 +215,8 @@ def test_classifier_predict_proba_classes_and_roundtrip() -> None:
 
 def test_python_fit_is_thread_count_deterministic() -> None:
     x, y = regression_fixture()
-    a = small_regressor(n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
-    b = small_regressor(n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
+    a = model_bytes(small_regressor(n_jobs=1).fit(x.astype(np.float32), y))
+    b = model_bytes(small_regressor(n_jobs=2).fit(x.astype(np.float32), y))
     assert a == b
 
 
@@ -776,8 +777,8 @@ def test_classifier_native_categorical_predict_proba() -> None:
 def test_outer_bag_is_thread_count_deterministic() -> None:
     # Bagging folds convex weights into tree alphas — still byte-identical across n_jobs.
     x, y = regression_fixture()
-    a = small_regressor(n_bags=4, n_jobs=1).fit(x.astype(np.float32), y).to_bytes()
-    b = small_regressor(n_bags=4, n_jobs=2).fit(x.astype(np.float32), y).to_bytes()
+    a = model_bytes(small_regressor(n_bags=4, n_jobs=1).fit(x.astype(np.float32), y))
+    b = model_bytes(small_regressor(n_bags=4, n_jobs=2).fit(x.astype(np.float32), y))
     assert a == b
 
 
@@ -882,9 +883,9 @@ def test_tables_all_ones_weight_and_exposure_matches_unweighted_exactly() -> Non
     x, y = regression_fixture()
     est = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(x, y)
     ones = np.ones(x.shape[0], dtype=np.float32)
-    assert est.tables(x) == est.tables(x, sample_weight=ones, exposure=ones)
-    assert est.tables(x) == est.tables(x, sample_weight=ones)
-    assert est.tables(x) == est.tables(x, exposure=ones)
+    assert_exports_close(est.tables(x), est.tables(x, sample_weight=ones, exposure=ones))
+    assert_exports_close(est.tables(x), est.tables(x, sample_weight=ones))
+    assert_exports_close(est.tables(x), est.tables(x, exposure=ones))
 
 
 def test_tables_sample_weight_changes_support_and_is_not_display_only() -> None:
@@ -956,25 +957,39 @@ def test_multiclass_tables_exposure_is_accepted_unlike_fit() -> None:
     assert clf.tables(x) != clf.tables(x, exposure=heavy)
 
 
-def test_pruned_regressor_tables_ignores_weight_and_exposure() -> None:
-    # A pruned (tables-only) model's bank is frozen from fit time; explain-time weight/exposure
-    # has nothing left to recompute and must be silently accepted, not raise or change output --
-    # mirroring the existing `x`/`ref_measure`-ignored behavior on the same frozen path.
+def _supports_scale_values_hold(plain: str, scaled: str, factor: float) -> None:
+    """A uniform call-time mass scales every support by `factor` and leaves every value: the
+    measure is normalized, so only the displayed mass moves."""
+    a, b = json.loads(plain), json.loads(scaled)
+    banks = list(zip(a.values(), b.values())) if "tables" not in a else [(a, b)]
+    for bank_a, bank_b in banks:
+        for ta, tb in zip(bank_a["tables"], bank_b["tables"]):
+            np.testing.assert_allclose(tb["values"], ta["values"], rtol=1e-9, atol=1e-12)
+            np.testing.assert_allclose(tb["support"], np.asarray(ta["support"]) * factor, rtol=1e-6)
+
+
+def test_pruned_regressor_tables_recentre_on_call_time_weight_and_exposure() -> None:
+    # A pruned model's tables are stored, and a call-time weight/exposure re-centres them on the
+    # passed rows. A uniform mass of 7*7 changes only the supports.
     x, y = regression_fixture()
     est = TBoostRegressor(
         n_trees=30, learning_rate=0.3, seed=0, prune=True, prune_n_folds=2
     ).fit(x, y)
     heavy = np.full(x.shape[0], 7.0, dtype=np.float32)
-    assert est.tables(x) == est.tables(x, sample_weight=heavy, exposure=heavy)
+    _supports_scale_values_hold(
+        est.tables(x), est.tables(x, sample_weight=heavy, exposure=heavy), 49.0
+    )
+    skewed = np.where(x[:, 0] <= 2.0, 25.0, 1.0).astype(np.float32)
+    assert est.tables(x) != est.tables(x, sample_weight=skewed)
 
 
-def test_pruned_multiclass_tables_ignores_weight_and_exposure() -> None:
+def test_pruned_multiclass_tables_recentre_on_call_time_weight() -> None:
     x, y = multiclass_fixture()
     # (No `prune_validation_fraction` here: since 2026-09-07 the K>=3 prune selects on fold
     # refits and refuses that legacy single-split knob rather than silently ignoring it.)
     clf = TBoostClassifier(n_trees=40, learning_rate=0.3, seed=0, prune=True).fit(x, y)
     heavy = np.full(x.shape[0], 7.0, dtype=np.float32)
-    assert clf.tables(x) == clf.tables(x, sample_weight=heavy, exposure=heavy)
+    _supports_scale_values_hold(clf.tables(x), clf.tables(x, sample_weight=heavy), 7.0)
 
 
 # --- tables() defaults to the fit-time sample_weight/exposure when the caller passes neither ---
@@ -989,7 +1004,7 @@ def test_tables_defaults_to_fit_time_sample_weight() -> None:
     fit_plain = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(x, y)
     # No args: the weighted fit must report weighted tables automatically (matching an explicit
     # call with the same weight), and must differ from an unweighted fit's plain tables.
-    assert fit_weighted.tables(x) == fit_weighted.tables(x, sample_weight=heavy)
+    assert_exports_close(fit_weighted.tables(x), fit_weighted.tables(x, sample_weight=heavy))
     assert fit_weighted.tables(x) != fit_plain.tables(x)
 
 
@@ -1000,7 +1015,7 @@ def test_tables_defaults_to_fit_time_exposure() -> None:
         x, y, exposure=heavy
     )
     fit_plain = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(x, y)
-    assert fit_weighted.tables(x) == fit_weighted.tables(x, exposure=heavy)
+    assert_exports_close(fit_weighted.tables(x), fit_weighted.tables(x, exposure=heavy))
     assert fit_weighted.tables(x) != fit_plain.tables(x)
 
 
@@ -1028,20 +1043,19 @@ def test_tables_explicit_call_time_weight_overrides_fit_time_weight() -> None:
 
 def test_tables_all_ones_call_time_weight_forces_unweighted_export() -> None:
     # The documented escape hatch: pass an explicit all-ones array to opt back out of the
-    # fit-time weight for one call. Isolated on a single fitted model (see the override test
-    # above for why cross-model comparisons don't work here): an all-ones override must produce
-    # the same export as no weight at all, on that same model.
+    # fit-time weight for one call. The stored tables carry the weighted fit's ledger; the
+    # all-ones override re-centres them on flat row counts instead.
     x, y = regression_fixture()
     heavy = np.where(x[:, 0] <= 2.0, 25.0, 1.0).astype(np.float32)
     est = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(x, y, sample_weight=heavy)
     ones = np.ones(x.shape[0], dtype=np.float32)
-    with_all_ones = est.tables(x, sample_weight=ones)
-    stashed = est._fit_sample_weight_
-    del est._fit_sample_weight_
-    try:
-        assert with_all_ones == est.tables(x)
-    finally:
-        est._fit_sample_weight_ = stashed
+    with_all_ones = json.loads(est.tables(x, sample_weight=ones))
+    stored = json.loads(est.tables(x))
+    for table in with_all_ones["tables"]:
+        assert sum(table["support"]) == pytest.approx(x.shape[0])
+    assert any(
+        sum(t["support"]) != pytest.approx(x.shape[0]) for t in stored["tables"]
+    ), "the stored ledger is the weighted fit's"
 
 
 def test_tables_fit_time_weight_does_not_leak_across_refit_or_set_params() -> None:
@@ -1074,7 +1088,7 @@ def test_multiclass_tables_defaults_to_fit_time_sample_weight() -> None:
         x, y, sample_weight=heavy
     )
     fit_plain = TBoostClassifier(n_trees=40, learning_rate=0.3, seed=0, prune=False).fit(x, y)
-    assert fit_weighted.tables(x) == fit_weighted.tables(x, sample_weight=heavy)
+    assert_exports_close(fit_weighted.tables(x), fit_weighted.tables(x, sample_weight=heavy))
     assert fit_weighted.tables(x) != fit_plain.tables(x)
 
 
@@ -1262,7 +1276,7 @@ def test_early_stopping_adaptive_plumbs_through_and_exposes_tree_count() -> None
     assert clone(est).get_params()["early_stopping_adaptive"] == 1.5
 
     # Fits and exposes the retained (best-validation) tree count, bounded by the n_trees cap.
-    est.fit(x32, y)
+    ensemble_fit(est, x32, y)
     n_kept = est._model.n_trees
     assert isinstance(n_kept, int)
     assert 0 < n_kept <= 200
@@ -1271,7 +1285,7 @@ def test_early_stopping_adaptive_plumbs_through_and_exposes_tree_count() -> None
     # The fixed-patience default (None) shares the same estimator surface / tree-count getter.
     base = small_regressor(validation_fraction=0.2, early_stopping_rounds=50, n_trees=200)
     assert base.get_params()["early_stopping_adaptive"] is None
-    base.fit(x32, y)
+    ensemble_fit(base, x32, y)
     assert base._model.n_trees > 0
 
 
@@ -1294,12 +1308,12 @@ def test_early_stopping_min_delta_round_trips_and_stops_before_cap() -> None:
 
     # A huge tolerance makes early stopping actually terminate before the n_trees cap, and never
     # retains more trees than the legacy 0.0 any-improvement rule under otherwise identical params.
-    big = small_regressor(
+    big = ensemble_fit(small_regressor(
         validation_fraction=0.25, early_stopping_rounds=5, early_stopping_min_delta=0.5, n_trees=300
-    ).fit(x32, y)
-    legacy = small_regressor(
+    ), x32, y)
+    legacy = ensemble_fit(small_regressor(
         validation_fraction=0.25, early_stopping_rounds=5, early_stopping_min_delta=0.0, n_trees=300
-    ).fit(x32, y)
+    ), x32, y)
     assert 0 < big._model.n_trees < 300
     assert big._model.n_trees <= legacy._model.n_trees
 
@@ -1501,10 +1515,10 @@ def test_categorical_model_serialize_round_trip() -> None:
     np.testing.assert_array_equal(r2.predict(x), pred)
     r3 = TBoostRegressor.from_json(r.to_json())
     np.testing.assert_array_equal(r3.predict(x), pred)
-    # A numeric model keeps the raw (non-enveloped) wire format — back-compat, unchanged.
+    # A numeric model is enveloped too (the header carries params and column specs).
     xr, yr = regression_fixture()
     rn = TBoostRegressor(n_trees=20, seed=0).fit(xr.astype(np.float32), yr)
-    assert rn.to_bytes()[:4] != b"TBP1"
+    assert rn.to_bytes()[:4] == b"TBP1"
 
 
 def test_binary_path_unchanged_no_multiclass_container() -> None:

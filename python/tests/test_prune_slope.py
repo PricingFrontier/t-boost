@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from t_boost._t_boost import _TableModel
+from _artifact import model_bytes
 from t_boost.sklearn import (
     _fit_link_slope,
     _fold_slope_into_bank_json,
@@ -260,7 +261,7 @@ def test_healthy_oob_fit_is_byte_identical_to_the_guard_off_build() -> None:
     off = TBoostRegressor(**kw, prune_guard=False).fit(X, y)
     s = on.pruning_report_["slope"]
     assert s["applied"] is False and s["z_b"] < s["min_z"]
-    assert on.to_bytes() == off.to_bytes()
+    assert model_bytes(on) == model_bytes(off)
 
 
 def test_slope_gate_needs_both_a_real_slope_and_real_evidence() -> None:
@@ -333,7 +334,7 @@ def test_slope_untouched_for_a_classifier() -> None:
     assert "slope" not in est.pruning_report_
     off = TBoostClassifier(objective="logistic", n_trees=150, n_bags=2, graduate=False, seed=0, prune=True,
                              prune_guard=False).fit(x, y)
-    assert est.to_bytes() == off.to_bytes()
+    assert model_bytes(est) == model_bytes(off)
 
 
 def test_slope_untouched_on_the_grouped_carve_path() -> None:
@@ -361,7 +362,7 @@ def test_slope_is_deterministic() -> None:
     a = _fit_pruned()
     b = _fit_pruned()
     assert a.pruning_report_["slope"] == b.pruning_report_["slope"]
-    assert a.to_bytes() == b.to_bytes()
+    assert model_bytes(a) == model_bytes(b)
 
 
 @pytest.mark.parametrize("jobs", [1, 4])
@@ -373,7 +374,7 @@ def test_slope_is_byte_identical_across_thread_counts(jobs: int) -> None:
     one = _fit_pruned(n_jobs=1)
     many = _fit_pruned(n_jobs=jobs)
     assert one.pruning_report_["slope"] == many.pruning_report_["slope"]
-    assert one.to_bytes() == many.to_bytes()
+    assert model_bytes(one) == model_bytes(many)
 
 
 def test_slope_survives_a_heavier_prune_with_more_bags() -> None:

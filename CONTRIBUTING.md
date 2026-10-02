@@ -140,6 +140,13 @@ and convert when building the serialized value, using the codebase's saturating 
 `u32::try_from(n).unwrap_or(u32::MAX)`. Enforced by `xtask check-no-usize-serialized` and
 `check-no-hashmap-serialized`.
 
+The Python estimators wrap the native blob in a JSON-headed envelope (`python/t_boost/sklearn.py`,
+`_ENVELOPE_SCHEMA_VERSION`). Bump that version when an older loader would misread a header
+written by the new code. Keep reading every older header, and the raw blobs written before the
+envelope was universal. Tests that check "this parameter does not move the deployed model" compare
+`model_bytes(est)` from `python/tests/_artifact.py`, not `est.to_bytes()`, because the envelope
+records the parameters.
+
 ### Determinism
 
 Output must be bit-identical across thread counts, processes and runs with the same seed.

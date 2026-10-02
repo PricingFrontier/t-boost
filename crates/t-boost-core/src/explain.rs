@@ -5228,15 +5228,93 @@ impl TableBank {
     /// [`PbError::InvalidConfig`] for the v1-unsupported `Joint` measure; plus propagated
     /// grid/purify errors.
     pub fn recompute_under(&self, w: RefMeasure) -> Result<TableBank, PbError> {
+        self.recompute_under_with(w, None)
+    }
+
+    /// The same function re-centred on other rows: every table's `support` refilled from
+    /// `row_cells` (per raw feature, each row's merged cell) and `mass` (per row; `None` counts
+    /// rows), then the bank re-purified under `w` with each axis's empirical marginal taken from
+    /// those rows. The table sum on every cell — so every prediction — is unchanged; only how it
+    /// is shared between tables moves, exactly as when the bank was first purified on the
+    /// training rows.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] if `row_cells`/`mass` disagree with the bank or each other;
+    /// [`PbError::InvalidInput`] on a negative or non-finite mass; propagated purify errors.
+    pub fn recentre_on(
+        &self,
+        row_cells: &[Vec<u32>],
+        mass: Option<&[f32]>,
+        w: RefMeasure,
+    ) -> Result<TableBank, PbError> {
+        let n_raw = self.merged_grids.len();
+        if row_cells.len() != n_raw {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "{} cell columns for a bank of {n_raw} raw feature(s)",
+                    row_cells.len()
+                ),
+            });
+        }
+        let n_rows = row_cells.first().map_or(0, Vec::len);
+        validate_mass(mass, n_rows, "recentre")?;
+        let row_mass =
+            |row: usize| -> f64 { mass.and_then(|m| m.get(row)).map_or(1.0, |&v| f64::from(v)) };
+        let mut marginals = Vec::with_capacity(n_raw);
+        for (cells, grid) in row_cells.iter().zip(&self.merged_grids) {
+            if cells.len() != n_rows {
+                return Err(PbError::ShapeMismatch {
+                    what: "recentre cell columns have different row counts".into(),
+                });
+            }
+            let mut counts = vec![0.0_f64; usize::from(grid.n_bins)];
+            for (row, &cell) in cells.iter().enumerate() {
+                *counts
+                    .get_mut(cell as usize)
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: "recentre cell outside its merged grid".into(),
+                    })? += row_mass(row);
+            }
+            marginals.push(counts);
+        }
+        let mut base = self.clone();
+        for table in &mut base.tables {
+            table.support = Tensor::try_zeros(table.values.shape())?;
+            let mut coord = vec![0usize; table.axes.len()];
+            for row in 0..n_rows {
+                for (slot, axis) in coord.iter_mut().zip(&table.axes) {
+                    let cell = row_cells
+                        .get(axis.raw.0 as usize)
+                        .and_then(|c| c.get(row))
+                        .ok_or_else(|| PbError::Internal {
+                            what: "recentre support lost a raw feature".into(),
+                        })?;
+                    *slot = axis.coord(*cell).ok_or_else(|| PbError::Internal {
+                        what: "recentre cell outside its band map".into(),
+                    })?;
+                }
+                table.support.add(&coord, row_mass(row))?;
+            }
+        }
+        base.recompute_under_with(w, Some(&marginals))
+    }
+
+    /// [`Self::recompute_under`] with each axis's empirical marginal from `marginals` (see
+    /// [`Self::recentre_on`]) instead of the main-effect supports.
+    pub(crate) fn recompute_under_with(
+        &self,
+        w: RefMeasure,
+        marginals: Option<&[Vec<f64>]>,
+    ) -> Result<TableBank, PbError> {
         if self
             .tables
             .iter()
             .any(|t| t.axes.iter().any(|a| a.band_of.is_some()))
         {
-            return crate::banding::repurify_bank_under(self, &w);
+            return crate::banding::repurify_bank_under_with(self, &w, marginals);
         }
         let grids = MergedGrids::from_border_grids(&self.merged_grids);
-        let weights = build_weights_from_support(self, &w)?;
+        let weights = build_weights_from_support_with(self, &w, marginals)?;
         // Seed a RawBank from the current (already-purified) dense tables: together with the
         // factored effects they sum to F_ens, a valid input to purify under the new measure.
         let mut tables: BTreeMap<FeatureSet, RawTable> = BTreeMap::new();
@@ -5656,11 +5734,26 @@ pub fn purify_raw_effects(
 /// change `w` without a serve matrix or the model.
 /// The bank's per-raw-axis measure weights over merged cells (what `purify` uses), rebuilt
 /// from the bank alone — for crate-internal passes (banding) that re-purify a deployed bank.
-pub(crate) fn bank_axis_measure(bank: &TableBank) -> Result<Vec<Vec<f64>>, PbError> {
-    Ok(build_weights_from_support(bank, &bank.w)?.per_axis)
+/// `marginals` (per raw feature, per merged cell), when given, replaces the main-effect supports
+/// as each axis's empirical counts — see [`TableBank::recentre_on`].
+pub(crate) fn bank_axis_measure_with(
+    bank: &TableBank,
+    marginals: Option<&[Vec<f64>]>,
+) -> Result<Vec<Vec<f64>>, PbError> {
+    Ok(build_weights_from_support_with(bank, &bank.w, marginals)?.per_axis)
 }
 
 fn build_weights_from_support(bank: &TableBank, w: &RefMeasure) -> Result<WeightCache, PbError> {
+    build_weights_from_support_with(bank, w, None)
+}
+
+/// [`build_weights_from_support`], with `marginals` (per raw feature, one mass per merged cell)
+/// replacing the main-effect supports as each axis's empirical counts when given.
+fn build_weights_from_support_with(
+    bank: &TableBank,
+    w: &RefMeasure,
+    marginals: Option<&[Vec<f64>]>,
+) -> Result<WeightCache, PbError> {
     let rule = axis_rule(w)?;
 
     let mut per_axis = Vec::with_capacity(bank.merged_grids.len());
@@ -5673,6 +5766,21 @@ fn build_weights_from_support(bank: &TableBank, w: &RefMeasure) -> Result<Weight
         }
         let raw_w = if !rule.needs_counts() {
             rule.raw_weights(&[], 0.0, cells)
+        } else if let Some(marginals) = marginals {
+            let counts = marginals.get(r).ok_or_else(|| PbError::ShapeMismatch {
+                what: format!("no marginal for raw feature {r}"),
+            })?;
+            if counts.len() != cells {
+                return Err(PbError::ShapeMismatch {
+                    what: format!(
+                        "raw feature {r} marginal has {} cells, grid {cells}",
+                        counts.len()
+                    ),
+                });
+            }
+            let n_total: f64 = counts.iter().sum();
+            let inv_n = if n_total > 0.0 { 1.0 / n_total } else { 0.0 };
+            rule.raw_weights(counts, inv_n, cells)
         } else {
             {
                 // The main-effect support tensor for {r} is the per-cell effective

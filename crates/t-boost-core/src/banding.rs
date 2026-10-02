@@ -39,7 +39,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::error::PbError;
-use crate::explain::{bank_axis_measure, AxisId, EffectTable, FeatureSet, TableBank, Tensor};
+use crate::explain::{bank_axis_measure_with, AxisId, EffectTable, FeatureSet, TableBank, Tensor};
 
 /// Cut counts per axis the greedy steps through (`usize::MAX` = full merged resolution).
 const SCHEDULE: [usize; 15] = [
@@ -1708,7 +1708,14 @@ const DISTIL_ROW_CHUNK: usize = 16_384;
 
 /// Normalized per-raw-axis measure of `bank` (what purification weights by).
 fn normalized_measure(bank: &TableBank) -> Result<Vec<Vec<f64>>, PbError> {
-    Ok(bank_axis_measure(bank)?
+    normalized_measure_with(bank, None)
+}
+
+fn normalized_measure_with(
+    bank: &TableBank,
+    marginals: Option<&[Vec<f64>]>,
+) -> Result<Vec<Vec<f64>>, PbError> {
+    Ok(bank_axis_measure_with(bank, marginals)?
         .iter()
         .map(|w| {
             let s: f64 = w.iter().sum();
@@ -1737,6 +1744,16 @@ pub fn repurify_bank_under(
     bank: &TableBank,
     w: &crate::explain::RefMeasure,
 ) -> Result<TableBank, PbError> {
+    repurify_bank_under_with(bank, w, None)
+}
+
+/// [`repurify_bank_under`] with each axis's empirical marginal from `marginals` instead of the
+/// main-effect supports (see [`TableBank::recentre_on`]).
+pub(crate) fn repurify_bank_under_with(
+    bank: &TableBank,
+    w: &crate::explain::RefMeasure,
+    marginals: Option<&[Vec<f64>]>,
+) -> Result<TableBank, PbError> {
     if !bank.factored.is_empty() {
         return Err(PbError::InvalidInput {
             what: "repurify_bank needs an all-dense bank".into(),
@@ -1744,7 +1761,7 @@ pub fn repurify_bank_under(
     }
     let mut probe = bank.clone();
     probe.w = w.clone();
-    let m = normalized_measure(&probe)?;
+    let m = normalized_measure_with(&probe, marginals)?;
     let ncell: Vec<usize> = m.iter().map(Vec::len).collect();
     let mut work: BTreeMap<FeatureSet, Banded> = BTreeMap::new();
     let mut support: BTreeMap<FeatureSet, Banded> = BTreeMap::new();

@@ -17,6 +17,7 @@ import polars as pl
 import pytest
 
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
+from _artifact import model_bytes
 
 
 def _frame(n: int = 1200, seed: int = 5, k: int = 0):
@@ -88,7 +89,7 @@ def test_budget_off_is_bit_identical_and_reports_nothing() -> None:
     default = TBoostRegressor(n_trees=60, seed=3, n_jobs=4, max_depth=6)
     frame, y = _frame()
     default.fit(frame, y)
-    assert off.to_bytes() == default.to_bytes()
+    assert model_bytes(off) == model_bytes(default)
     assert "box_budget" not in off.pruning_report_
 
 
@@ -97,7 +98,7 @@ def test_a_generous_budget_is_a_bit_identical_no_op() -> None:
     n = _boxes(off)
     for budget in (n, n + 1, 10 * n):
         on = _fit(budget)
-        assert on.to_bytes() == off.to_bytes(), budget
+        assert model_bytes(on) == model_bytes(off), budget
         assert on.pruning_report_["box_budget"]["engaged"] is False, budget
         assert on.pruning_report_["box_budget"]["boxes_before"] == n
 
@@ -165,7 +166,7 @@ def test_multiclass_honors_the_budget() -> None:
     assert _boxes(on) <= max(1, n // 4)
     assert on.pruning_report_["box_budget"]["engaged"] is True
     generous = _fit(10 * n, **mc)
-    assert generous.to_bytes() == off.to_bytes()
+    assert model_bytes(generous) == model_bytes(off)
 
 
 def test_budget_without_pruning_raises_rather_than_no_ops() -> None:

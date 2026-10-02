@@ -19,6 +19,7 @@ use crate::engine::{inverse_link, ExactnessMode, Model, ModelSchema};
 use crate::error::PbError;
 use crate::explain::{AxisId, RefMeasure, TableBank, Tensor};
 use crate::loss::Link;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// A tables-only served model: a purified [`TableBank`] plus exactly the metadata a
@@ -317,6 +318,77 @@ impl TableModel {
             crate::scoring::fill_row_cells(x, &maps, row, &mut cells)?;
             out.push(cells);
         }
+        Ok(out)
+    }
+
+    /// This model's bank re-centred on the rows of `x`, weighted by `mass` (per row; `None`
+    /// counts rows), under `w` — see [`TableBank::recentre_on`]. The same function, so the same
+    /// predictions; only how it is shared between tables changes.
+    ///
+    /// # Errors
+    /// Propagates the cell lookup and [`TableBank::recentre_on`].
+    pub fn recentred_bank(
+        &self,
+        x: &BinnedMatrix,
+        mass: Option<&[f32]>,
+        w: RefMeasure,
+    ) -> Result<TableBank, PbError> {
+        self.validate_binned_matrix(x)?;
+        let cells = self.column_cells(x)?;
+        self.bank.recentre_on(&cells, mass, w)
+    }
+
+    /// The raw feature ids of every effect, in the order [`TableModel::effect_contributions`]
+    /// reports them: the dense tables, then the factored effects.
+    #[must_use]
+    pub fn effect_feature_sets(&self) -> Vec<Vec<u32>> {
+        self.bank
+            .tables
+            .iter()
+            .map(|t| &t.u)
+            .chain(self.bank.factored.iter().map(|ft| &ft.u))
+            .map(|u| u.0.iter().map(|f| f.0).collect())
+            .collect()
+    }
+
+    /// Per-row value of every effect `f_u(x_u)`, row-major (`n_rows × n_effects`, effects in
+    /// [`TableModel::effect_feature_sets`] order). `bank.f0` plus a row's values, summed in this
+    /// order, is exactly the `f64` LUT-sum [`TableModel::score_raw`] rounds to `f32`: the same
+    /// cells, tables and summation order as `scoring::score_bank_binned_with_maps`.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] on a width mismatch or an output too large to address;
+    /// propagated cell-map and per-effect evaluation errors.
+    pub fn effect_contributions(&self, x: &BinnedMatrix) -> Result<Vec<f64>, PbError> {
+        self.validate_binned_matrix(x)?;
+        let maps =
+            crate::scoring::build_cell_maps(&self.bank.merged_grids, &self.schema.cat_encoders, x)?;
+        let n_tables = self.bank.tables.len();
+        let n_effects = n_tables + self.bank.factored.len();
+        let n_cells = self.bank.merged_grids.len();
+        let n_rows = x.n_rows as usize;
+        let len = n_rows
+            .checked_mul(n_effects)
+            .ok_or_else(|| PbError::ShapeMismatch {
+                what: format!("{n_rows} rows x {n_effects} effects overflows the output"),
+            })?;
+        let mut out = vec![0.0_f64; len];
+        if n_effects == 0 {
+            return Ok(out);
+        }
+        out.par_chunks_mut(n_effects).enumerate().try_for_each(
+            |(row, dst)| -> Result<(), PbError> {
+                let mut cells = vec![0u32; n_cells];
+                crate::scoring::fill_row_cells(x, &maps, row, &mut cells)?;
+                for (slot, table) in dst.iter_mut().zip(&self.bank.tables) {
+                    *slot = table.eval(&cells)?;
+                }
+                for (slot, effect) in dst.iter_mut().skip(n_tables).zip(&self.bank.factored) {
+                    *slot = effect.eval(&cells)?;
+                }
+                Ok(())
+            },
+        )?;
         Ok(out)
     }
 
@@ -913,6 +985,69 @@ mod tests {
         assert_eq!(tab.len(), 4);
         for (e, t) in ens.iter().zip(&tab) {
             assert!((e - t).abs() < 1e-6, "ensemble {e} vs tables {t}");
+        }
+    }
+
+    /// `f0` plus a row's effect contributions, summed in reported order, is bit-for-bit the
+    /// float64 score `score_raw` rounds to float32 — for ordinary and multi-channel banks.
+    #[test]
+    fn effect_contributions_reproduce_the_served_score_exactly() {
+        for (model, x) in [
+            (fixture_model(), fixture_serve()),
+            (fixture_multichannel_model(), fixture_multichannel_serve()),
+        ] {
+            let tm = TableModel::from_model(&model, &x, RefMeasure::Uniform).unwrap();
+            let sets = tm.effect_feature_sets();
+            assert_eq!(sets.len(), tm.bank.tables.len() + tm.bank.factored.len());
+            let values = tm.effect_contributions(&x.0).unwrap();
+            let raw = tm.score_raw(&x.0, None).unwrap();
+            assert_eq!(values.len(), raw.len() * sets.len());
+            for (row, served) in values.chunks(sets.len()).zip(&raw) {
+                let sum = row.iter().fold(tm.bank.f0, |acc, v| acc + v);
+                assert_eq!(sum as f32, *served);
+            }
+        }
+    }
+
+    /// Re-centring on rows never changes the function: every row scores the same. On the very
+    /// rows the bank was purified on (flat count, same measure) it reproduces the stored ledger;
+    /// a skewed per-row mass moves the supports.
+    #[test]
+    fn recentring_keeps_the_function_and_reproduces_the_stored_ledger() {
+        for (model, x) in [
+            (fixture_model(), fixture_serve()),
+            (fixture_multichannel_model(), fixture_multichannel_serve()),
+        ] {
+            let tm = TableModel::from_model(&model, &x, RefMeasure::Uniform).unwrap();
+            let cells = tm.row_cells(&x.0).unwrap();
+            let same = tm.recentred_bank(&x.0, None, RefMeasure::Uniform).unwrap();
+            for (a, b) in tm.bank.tables.iter().zip(&same.tables) {
+                assert_eq!(a.u, b.u);
+                for (va, vb) in a.values.values().iter().zip(b.values.values().iter()) {
+                    assert!((va - vb).abs() < 1e-12, "{va} vs {vb}");
+                }
+                assert_eq!(a.support, b.support);
+            }
+            let n = x.0.n_rows as usize;
+            let skew: Vec<f32> = (0..n).map(|r| if r % 2 == 0 { 9.0 } else { 1.0 }).collect();
+            let moved = tm
+                .recentred_bank(
+                    &x.0,
+                    Some(&skew),
+                    RefMeasure::ExposureMarginals { floor: 1e-3 },
+                )
+                .unwrap();
+            assert_ne!(moved.tables, tm.bank.tables);
+            for row in &cells {
+                let (a, b) = (tm.bank.score(row).unwrap(), moved.score(row).unwrap());
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "re-centring moved a score: {a} vs {b}"
+                );
+            }
+            assert!(tm
+                .recentred_bank(&x.0, skew.get(1..), RefMeasure::Uniform)
+                .is_err());
         }
     }
 

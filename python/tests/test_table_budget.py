@@ -21,6 +21,7 @@ import polars as pl
 import pytest
 
 from t_boost.sklearn import TBoostClassifier, TBoostRegressor
+from _artifact import model_json
 
 
 def _frame(n: int = 1200, seed: int = 5, k: int = 0):
@@ -124,7 +125,7 @@ def test_budget_and_price_off_are_bit_identical_and_report_nothing(k: int) -> No
         {"prune_table_min_arity": 1},
     ):
         est = _fit(k=k, **kw)
-        assert est.to_json() == baseline.to_json(), f"{kw} moved the artifact"
+        assert model_json(est) == model_json(baseline), f"{kw} moved the artifact"
         assert "table_budget" not in (est.pruning_report_ or {}), kw
 
 
@@ -169,7 +170,7 @@ def test_a_cap_at_or_above_the_banks_own_count_is_a_verbatim_no_op() -> None:
     n = _n_ge3(baseline)
     for cap in (n, n + 1):
         est = _fit(prune_table_budget=cap)
-        assert est.to_json() == baseline.to_json(), cap
+        assert model_json(est) == model_json(baseline), cap
         assert est.pruning_report_["table_budget"]["engaged"] is False, cap
 
 
@@ -201,7 +202,7 @@ def test_the_arity_floor_selects_what_the_cap_counts() -> None:
     baseline = _fit()
     assert max(_arity(baseline)) == 3, "fixture must top out at order 3 for this to mean anything"
     est = _fit(prune_table_budget=1, prune_table_min_arity=4)
-    assert est.to_json() == baseline.to_json()
+    assert model_json(est) == model_json(baseline)
     assert est.pruning_report_["table_budget"]["engaged"] is False
 
 
