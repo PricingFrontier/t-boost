@@ -9,7 +9,10 @@ guarantee that all bugs have been identified.
 
 - **Reviewed revision:** `6588084a35615677b9ca851169050ee4e12ad1f1`.
 - **Reviewed package version:** `0.6.1`.
-- **Status:** all findings are open at the time of writing.
+- **Status:** all findings are open at the time of writing. All 64 were
+  independently re-verified on 2026-10-02 against the same revision; see
+  [Verification pass](#verification-pass) for the outcome, the corrections it
+  produced, and the per-finding verdicts in the index below.
 - **Scope:** Rust training, data preparation, table decomposition and serving,
   serialization, Python bindings and estimators, development tooling, and CI.
 - **Evidence:** runtime reproductions unless stated otherwise. BUG-001 was tested
@@ -31,72 +34,72 @@ Current totals: **3 P1**, **56 P2**, and **5 P3**. Findings identify their affec
 surface explicitly: some occur in ordinary estimator use, some require optional
 configurations or public Rust APIs, and others require malformed input.
 
-| ID | Priority | Finding | Area |
-| --- | --- | --- | --- |
-| [BUG-001](#bug-001) | P1 | MVS importance weights do not match the sampling distribution | Training |
-| [BUG-002](#bug-002) | P1 | Failed refits preserve models with corrupted metadata | Python estimator state |
-| [BUG-003](#bug-003) | P1 | Multiclass categorical encoders see early-stopping holdout labels | Training / binding |
-| [BUG-004](#bug-004) | P2 | Cross-fitted categorical encodings leak targets through their prior | Categorical encoding |
-| [BUG-005](#bug-005) | P2 | Missing-versus-present signals cannot produce a split | Split search |
-| [BUG-006](#bug-006) | P2 | Numeric midpoint rounding merges distinct float32 values | Binning |
-| [BUG-007](#bug-007) | P2 | Multiclass pruning normalizes fold loss twice | Pruning |
-| [BUG-008](#bug-008) | P2 | Binary pruning guard uses a log-link intercept correction | Pruning / Python |
-| [BUG-009](#bug-009) | P2 | Clipped component relativities fail to reconstruct predictions | Rating export |
-| [BUG-010](#bug-010) | P2 | Pre-v7 table JSON fails the version gate | Serialization compatibility |
-| [BUG-011](#bug-011) | P2 | Feature names can change JSON decoder selection | Python serialization |
-| [BUG-012](#bug-012) | P2 | Unbounded factored order panics during model loading | Load validation |
-| [BUG-013](#bug-013) | P2 | Nonfinite factored coefficients pass validation | Load validation |
-| [BUG-014](#bug-014) | P2 | Empty bagged fits panic | Input validation |
-| [BUG-015](#bug-015) | P2 | Merged parameter aliases fail through `set_params` | Estimator parameters |
-| [BUG-016](#bug-016) | P2 | Objective aliases produce wrong explanation and reporting semantics | Python API |
-| [BUG-017](#bug-017) | P2 | Binary A/E reports sum class labels | Reporting |
-| [BUG-018](#bug-018) | P2 | Deployed factored effects are reported as absent | Pruning reports |
-| [BUG-019](#bug-019) | P2 | Fuzz workflow uses the wrong dictionary path | CI |
-| [BUG-020](#bug-020) | P2 | Release Gate can smoke-test a published package instead of its artifact | Release verification |
-| [BUG-021](#bug-021) | P3 | Multiline derives bypass serialized-field gates | Development tooling |
-| [BUG-022](#bug-022) | P2 | Forked workers inherit a serving pool whose threads no longer exist | Process lifecycle |
-| [BUG-023](#bug-023) | P2 | Multiclass prediction ignores the estimator's thread budget | Multiclass serving |
-| [BUG-024](#bug-024) | P2 | Categorical identities change across containers and optional pandas availability | Categorical ingestion |
-| [BUG-025](#bug-025) | P2 | Classifier serialization corrupts large unsigned integer labels | Serialization |
-| [BUG-026](#bug-026) | P2 | Runtime-only classifier accepts NaN and infinite class labels | Optional dependencies |
-| [BUG-027](#bug-027) | P2 | Loaded estimators silently drop the unspecified half of table export mass | Export / serialization |
-| [BUG-028](#bug-028) | P3 | Empty categorical index lists are misclassified as Boolean masks | Input declaration |
-| [BUG-029](#bug-029) | P3 | No-argument set_params discards a fitted model | Estimator state |
-| [BUG-030](#bug-030) | P2 | Re-banding a banded model ignores its existing band maps | Banding |
-| [BUG-031](#bug-031) | P2 | Cached CellMaps omit dependencies from compatibility checking | Core scoring cache |
-| [BUG-032](#bug-032) | P2 | Recentring a banded interaction-only bank loses axis templates for recreated mains | Recentring |
-| [BUG-033](#bug-033) | P2 | Model loading accepts mismatched feature-set/axis identities and misattributes effects | Load validation / explanations |
-| [BUG-034](#bug-034) | P2 | Gamma/Tweedie exposure initialization uses the Poisson optimum | Loss initialization |
-| [BUG-035](#bug-035) | P2 | Periodic ridge refits desynchronize AGBM's score cache from its trees | Training state |
-| [BUG-036](#bug-036) | P2 | Bootstrap copies cross the early-stopping train/validation boundary | Early stopping / bagging |
-| [BUG-037](#bug-037) | P2 | Bagged core fitting panics on a short fixed-holdout mask | Core input validation |
-| [BUG-038](#bug-038) | P2 | Core multiclass fitting silently accepts invalid sample weights | Core input validation |
-| [BUG-039](#bug-039) | P2 | An uninformative weighted feature can abort an otherwise valid fit | Weighted binning |
-| [BUG-040](#bug-040) | P2 | Small updates disappear from training scores but accumulate in deployed tables | Training / prediction precision |
-| [BUG-041](#bug-041) | P2 | Pricing reports label merged-grid A/E aggregates with an interaction's compressed axis | Pricing reports |
-| [BUG-042](#bug-042) | P2 | Multiclass contribution DataFrames crash when one class has only an intercept | Multiclass explanations |
-| [BUG-043](#bug-043) | P2 | Gini awards arbitrary ranking skill to tied scores according to row order | Ranking metrics |
-| [BUG-044](#bug-044) | P2 | Categorical rating exports omit and collide on routing metadata | Categorical rating export |
-| [BUG-045](#bug-045) | P2 | Deviance metrics accept nonfinite inputs and an infinite Tweedie power | Metric validation |
-| [BUG-046](#bug-046) | P2 | A/E reports suppress valid ratios for negative expected totals | Reporting |
-| [BUG-047](#bug-047) | P3 | Empty A/E evaluation batches raise an internal indexing error | Empty evaluation batches |
-| [BUG-048](#bug-048) | P2 | OOB cell correction silently breaks monotonicity in the Rust API | Core monotonicity |
-| [BUG-049](#bug-049) | P2 | Valid weighted fits fail when a bag omits all positive-weight observations | Weighted bagging |
-| [BUG-050](#bug-050) | P2 | The cell-refit guard splits declared groups between fitting and validation | Grouped validation |
-| [BUG-051](#bug-051) | P2 | Table-budget checks do not cover purification and factored shedding | Table memory budgets |
-| [BUG-052](#bug-052) | P2 | Public exactness assertion ignores the mass used to build weighted banks | Weighted certification |
-| [BUG-053](#bug-053) | P2 | Variance certification loses precision after harmless intercept translation | Numerical certification |
-| [BUG-054](#bug-054) | P2 | Incremental Poisson scores lose the distance beyond the exponent clamp | Poisson training cache |
-| [BUG-055](#bug-055) | P2 | Runtime-only score methods silently broadcast or flatten incompatible targets | Optional-dependency scoring |
-| [BUG-056](#bug-056) | P2 | Binary A/E ignores the exposure offset that was used during training | Binary exposure reporting |
-| [BUG-057](#bug-057) | P2 | A literal missing-sentinel category is silently merged with actual missing values | Categorical ingestion |
-| [BUG-058](#bug-058) | P2 | Estimator envelopes accept metadata inconsistent with the native model | Envelope validation |
-| [BUG-059](#bug-059) | P3 | Runtime-only estimator repr fails for valid NumPy-array parameters | Optional-dependency representation |
-| [BUG-060](#bug-060) | P2 | Reconstructed bags reuse the soup intercept, leaking targets into OOB evidence | OOB pruning evidence |
-| [BUG-061](#bug-061) | P2 | A fixed ten-step intercept reanchor can stop far from class balance | Multiclass calibration |
-| [BUG-062](#bug-062) | P2 | Recentring a pruned high-order bank turns recreated categorical effects into numeric exports | Categorical table metadata |
-| [BUG-063](#bug-063) | P2 | Recentring an interaction-only bank reports zero support for recreated main effects | Recentring support |
-| [BUG-064](#bug-064) | P2 | Joint exports normalize component variances as though the effects were independent | Joint-reference importance |
+| ID | Priority | Finding | Area | Verified 2026-10-02 |
+| --- | --- | --- | --- | --- |
+| [BUG-001](#bug-001) | P1 | MVS importance weights do not match the sampling distribution | Training | Reproduced |
+| [BUG-002](#bug-002) | P1 | Failed refits preserve models with corrupted metadata | Python estimator state | Reproduced |
+| [BUG-003](#bug-003) | P1 | Multiclass categorical encoders see early-stopping holdout labels | Training / binding | Reproduced |
+| [BUG-004](#bug-004) | P2 | Cross-fitted categorical encodings leak targets through their prior | Categorical encoding | Reproduced |
+| [BUG-005](#bug-005) | P2 | Missing-versus-present signals cannot produce a split | Split search | Reproduced |
+| [BUG-006](#bug-006) | P2 | Numeric midpoint rounding merges distinct float32 values | Binning | Reproduced |
+| [BUG-007](#bug-007) | P2 | Multiclass pruning normalizes fold loss twice | Pruning | Reproduced |
+| [BUG-008](#bug-008) | P2 | Binary pruning guard uses a log-link intercept correction | Pruning / Python | Reproduced |
+| [BUG-009](#bug-009) | P2 | Clipped component relativities fail to reconstruct predictions | Rating export | Reproduced |
+| [BUG-010](#bug-010) | P2 | Pre-v7 table JSON fails the version gate | Serialization compatibility | Reproduced |
+| [BUG-011](#bug-011) | P2 | Feature names can change JSON decoder selection | Python serialization | Reproduced |
+| [BUG-012](#bug-012) | P2 | Unbounded factored order panics during model loading | Load validation | Reproduced (malformed input) |
+| [BUG-013](#bug-013) | P2 | Nonfinite factored coefficients pass validation | Load validation | Reproduced (malformed input) |
+| [BUG-014](#bug-014) | P2 | Empty bagged fits panic | Input validation | Reproduced (Rust API only) |
+| [BUG-015](#bug-015) | P2 | Merged parameter aliases fail through `set_params` | Estimator parameters | Reproduced |
+| [BUG-016](#bug-016) | P2 | Objective aliases produce wrong explanation and reporting semantics | Python API | Reproduced |
+| [BUG-017](#bug-017) | P2 | Binary A/E reports sum class labels | Reporting | Reproduced |
+| [BUG-018](#bug-018) | P2 | Deployed factored effects are reported as absent | Pruning reports | Reproduced |
+| [BUG-019](#bug-019) | P2 | Fuzz workflow uses the wrong dictionary path | CI | Source-verified (not executed) |
+| [BUG-020](#bug-020) | P2 | Release Gate can smoke-test a published package instead of its artifact | Release verification | Source-verified (not executed) |
+| [BUG-021](#bug-021) | P3 | Multiline derives bypass serialized-field gates | Development tooling | Reproduced |
+| [BUG-022](#bug-022) | P2 | Forked workers inherit a serving pool whose threads no longer exist | Process lifecycle | Reproduced |
+| [BUG-023](#bug-023) | P2 | Multiclass prediction ignores the estimator's thread budget | Multiclass serving | Reproduced |
+| [BUG-024](#bug-024) | P2 | Categorical identities change across containers and optional pandas availability | Categorical ingestion | Reproduced |
+| [BUG-025](#bug-025) | P2 | Classifier serialization corrupts large unsigned integer labels | Serialization | Reproduced |
+| [BUG-026](#bug-026) | P2 | Runtime-only classifier accepts NaN and infinite class labels | Optional dependencies | Reproduced |
+| [BUG-027](#bug-027) | P2 | Loaded estimators silently drop the unspecified half of table export mass | Export / serialization | Reproduced |
+| [BUG-028](#bug-028) | P3 | Empty categorical index lists are misclassified as Boolean masks | Input declaration | Reproduced |
+| [BUG-029](#bug-029) | P3 | No-argument set_params discards a fitted model | Estimator state | Reproduced |
+| [BUG-030](#bug-030) | P2 | Re-banding a banded model ignores its existing band maps | Banding | Reproduced |
+| [BUG-031](#bug-031) | P2 | Cached CellMaps omit dependencies from compatibility checking | Core scoring cache | Reproduced; partial check is documented |
+| [BUG-032](#bug-032) | P2 | Recentring a banded interaction-only bank loses axis templates for recreated mains | Recentring | Reproduced (Rust API only) |
+| [BUG-033](#bug-033) | P2 | Model loading accepts mismatched feature-set/axis identities and misattributes effects | Load validation / explanations | Reproduced (malformed input) |
+| [BUG-034](#bug-034) | P2 | Gamma/Tweedie exposure initialization uses the Poisson optimum | Loss initialization | Reproduced |
+| [BUG-035](#bug-035) | P2 | Periodic ridge refits desynchronize AGBM's score cache from its trees | Training state | Reproduced (Rust API only) |
+| [BUG-036](#bug-036) | P2 | Bootstrap copies cross the early-stopping train/validation boundary | Early stopping / bagging | Reproduced; documented tradeoff |
+| [BUG-037](#bug-037) | P2 | Bagged core fitting panics on a short fixed-holdout mask | Core input validation | Reproduced (Rust API only) |
+| [BUG-038](#bug-038) | P2 | Core multiclass fitting silently accepts invalid sample weights | Core input validation | Reproduced (Rust API only) |
+| [BUG-039](#bug-039) | P2 | An uninformative weighted feature can abort an otherwise valid fit | Weighted binning | Reproduced |
+| [BUG-040](#bug-040) | P2 | Small updates disappear from training scores but accumulate in deployed tables | Training / prediction precision | Reproduced |
+| [BUG-041](#bug-041) | P2 | Pricing reports label merged-grid A/E aggregates with an interaction's compressed axis | Pricing reports | Reproduced |
+| [BUG-042](#bug-042) | P2 | Multiclass contribution DataFrames crash when one class has only an intercept | Multiclass explanations | Reproduced |
+| [BUG-043](#bug-043) | P2 | Gini awards arbitrary ranking skill to tied scores according to row order | Ranking metrics | Reproduced; tie-break is documented |
+| [BUG-044](#bug-044) | P2 | Categorical rating exports omit and collide on routing metadata | Categorical rating export | Reproduced; Repro A as documented |
+| [BUG-045](#bug-045) | P2 | Deviance metrics accept nonfinite inputs and an infinite Tweedie power | Metric validation | Reproduced |
+| [BUG-046](#bug-046) | P2 | A/E reports suppress valid ratios for negative expected totals | Reporting | Reproduced |
+| [BUG-047](#bug-047) | P3 | Empty A/E evaluation batches raise an internal indexing error | Empty evaluation batches | Reproduced |
+| [BUG-048](#bug-048) | P2 | OOB cell correction silently breaks monotonicity in the Rust API | Core monotonicity | Reproduced (Rust API only) |
+| [BUG-049](#bug-049) | P2 | Valid weighted fits fail when a bag omits all positive-weight observations | Weighted bagging | Reproduced |
+| [BUG-050](#bug-050) | P2 | The cell-refit guard splits declared groups between fitting and validation | Grouped validation | Reproduced |
+| [BUG-051](#bug-051) | P2 | Table-budget checks do not cover purification and factored shedding | Table memory budgets | Reproduced (Rust API only) |
+| [BUG-052](#bug-052) | P2 | Public exactness assertion ignores the mass used to build weighted banks | Weighted certification | Reproduced; API gap |
+| [BUG-053](#bug-053) | P2 | Variance certification loses precision after harmless intercept translation | Numerical certification | Reproduced (Rust API only) |
+| [BUG-054](#bug-054) | P2 | Incremental Poisson scores lose the distance beyond the exponent clamp | Poisson training cache | Reproduced |
+| [BUG-055](#bug-055) | P2 | Runtime-only score methods silently broadcast or flatten incompatible targets | Optional-dependency scoring | Reproduced |
+| [BUG-056](#bug-056) | P2 | Binary A/E ignores the exposure offset that was used during training | Binary exposure reporting | Reproduced |
+| [BUG-057](#bug-057) | P2 | A literal missing-sentinel category is silently merged with actual missing values | Categorical ingestion | Reproduced |
+| [BUG-058](#bug-058) | P2 | Estimator envelopes accept metadata inconsistent with the native model | Envelope validation | Reproduced (malformed input) |
+| [BUG-059](#bug-059) | P3 | Runtime-only estimator repr fails for valid NumPy-array parameters | Optional-dependency representation | Reproduced |
+| [BUG-060](#bug-060) | P2 | Reconstructed bags reuse the soup intercept, leaking targets into OOB evidence | OOB pruning evidence | Reproduced |
+| [BUG-061](#bug-061) | P2 | A fixed ten-step intercept reanchor can stop far from class balance | Multiclass calibration | Reproduced |
+| [BUG-062](#bug-062) | P2 | Recentring a pruned high-order bank turns recreated categorical effects into numeric exports | Categorical table metadata | Reproduced (Rust API only) |
+| [BUG-063](#bug-063) | P2 | Recentring an interaction-only bank reports zero support for recreated main effects | Recentring support | Reproduced (Rust API only) |
+| [BUG-064](#bug-064) | P2 | Joint exports normalize component variances as though the effects were independent | Joint-reference importance | Reproduced |
 
 ## Validation baseline from the first pass
 
@@ -172,6 +175,80 @@ are not presented as ordinary writer failures or training benchmarks. No
 production code or permanent tests changed, and the full baseline suites were
 not rerun. Unconfirmed leads were excluded.
 
+<a id="verification-pass"></a>
+## Verification pass (2026-10-02)
+
+An independent pass re-verified every finding against the reviewed revision
+(HEAD `06d2700` differs from it only by this document). Each reproduction was
+re-run — 27 Rust harnesses built as temporary binaries against the release core
+with overflow checks, 44 Python scripts through `uv run --no-sync python` — and
+every cited `file:line` was opened to confirm the stated cause. Docstrings,
+code comments, README and the test suites were then searched for evidence that
+the observed behaviour is deliberate. No production code was changed.
+
+**Outcome.** All 64 findings reproduce. Sixty-one executed and matched the
+quoted numbers to the printed digit (panic sites, overlap-ID lists and the
+10,000-seed MVS sweep included); BUG-019 and BUG-020 were established from the
+primary sources named in their entries. Every cited line is accurate to within
+one line. The pass changed the reading of several entries:
+
+- **BUG-036 is a documented tradeoff, not an undisclosed leak.** The bootstrap
+  train/validation overlap is the stated reason the `bag_subsample` default is
+  `0.8` (`boosters.rs:176-178`; the `bag_subsample` docstring at
+  `sklearn.py:5846-5852` says so and tells the user "Set to `1.0` to restore
+  classic bootstrap bagging"). The entry has been annotated; it is a known
+  limitation and any fix is an enhancement.
+- **BUG-005 named a type that does not exist** (`HistogramMode`); corrected to
+  `Config.hist_precision: HistPrecision::{FullF64, QuantizedI32}`.
+- **BUG-057's control claim is conditional**: the `__t_boost_rare__` guard is
+  active only when `cat_min_data_per_group > 0`.
+- **BUG-007's double division is acknowledged in the code**
+  (`prune.rs:3625-3629`) on the premise that it "cancels in every comparison";
+  the unequal-fold-mass reproduction falsifies that premise. The verdict stands;
+  the entry now cites the comment and its `se_rule` concern.
+- **BUG-019 is currently masked by an earlier failure**: the only recorded run
+  of `fuzz.yml` dies in `cargo install cargo-fuzz --version 0.13.1 --locked`
+  (its locked `rustix 0.36.5` no longer builds on nightly), before the
+  dictionary step is reached.
+- **BUG-020 is live, not hypothetical**: PyPI already serves `0.6.1`, equal to
+  the workspace version, so the smoke step's choice between index and `dist`
+  is already unspecified.
+
+**Reproduced behaviour that matches a documented choice.** These reproduce
+exactly but the behaviour is documented, so each is a policy call rather than
+a plain defect: BUG-031 (`CellMaps` docs make the compatibility check a caller
+obligation), BUG-036 (above), BUG-043 (the index tie-break is documented for
+Rust parity; what is *not* documented is that ties earn ranking skill, and
+`test_sklearn.py:1146` asserts the AUC identity — the verdict leans defect),
+BUG-044 (Reproduction A is exactly what the `tables` docstring describes;
+Reproduction B's literal `<rare>` collision is a real, narrow ambiguity), and
+BUG-052 (the assertion's docstring says it rebuilds weights from row counts;
+there is no weighted counterpart — an API gap).
+
+**Reproduced contract violations reachable only through the Rust API or
+malformed input** (each entry already says so): BUG-014, BUG-032, BUG-035,
+BUG-037, BUG-038, BUG-048, BUG-051, BUG-053, BUG-062, BUG-063 (Rust API);
+BUG-012, BUG-013, BUG-033, BUG-058 (malformed input). BUG-053 trips only at
+the quoted magnitudes (coefficient `1e5` / offset `1e7`; `1e4` / `1e6` pass).
+The remaining 44 findings are reachable from ordinary or opt-in Python use.
+
+**Additional facts recorded in the entries.** BUG-037: an over-long
+`fixed_holdout` with two bags is silently accepted. BUG-012: factored orders
+9–63 load without error. BUG-010: a second version gate also rejects pre-v7
+JSON. BUG-022: a post-fork `n_jobs=None` prediction on a large query also
+hangs. BUG-011: `"t-boost-multiclass-tables"` misroutes too. BUG-016: the
+defect survives bytes serialization. BUG-018: `deployed_census()` counts the
+factored effect that `deployed_supports()` omits, and `test_prune.py:48-53`
+asserts the guarantee being violated. BUG-048: the ridge-refit path does
+preserve monotonicity (`boost.rs:4769`); cell refit is the exception.
+
+**Priority note.** By this document's own P1 definition — silent corruption of
+training or predictions — BUG-024, BUG-034, BUG-040 and BUG-049 are
+candidates: all are reachable from default Python use with ordinary finite
+input (BUG-049 fails on the default `n_bags=8`; BUG-040's error grows with tree
+count), whereas BUG-001 needs `subsample` and BUG-003 an explicit `es_holdout`.
+Priorities were left unchanged pending the maintainer's decision.
+
 ## Reproduction conventions
 
 Run Python examples through `uv run --no-sync python` in an environment prepared
@@ -201,6 +278,11 @@ Rust reproductions used the current release build with overflow checks enabled.
 The fixture helpers named below are
 `t_boost_core::explain::{fixture_model, fixture_serve}`. Proposed regression checks
 are acceptance criteria for future fixes; they have not been added to the suite.
+
+Every reproduction below, plus the controls run during the verification pass, is
+checked in under [repro/](repro/README.md) as runnable scripts
+(`repro/python/bugNNN.py`) and a standalone Rust harness crate
+(`repro/rust/src/bin/bugNNN.rs`). Use those rather than retyping the listings.
 
 <a id="bug-001"></a>
 ## BUG-001 — MVS importance weights do not match the sampling distribution
@@ -440,9 +522,14 @@ x = [NaN repeated 50 times, 1 repeated 50 times]
 y = [0 repeated 50 times, 10 repeated 50 times]
 ```
 
-Both `FullF64` and `QuantizedI32` produce zero trees and predict `5` for every
+Both `Config.hist_precision` settings, `HistPrecision::FullF64` and
+`HistPrecision::QuantizedI32`, produce zero trees and predict `5` for every
 row. Replacing the missing half with finite zero gives approximately `0` and `10`
-for the two groups under the same settings.
+for the two groups under the same settings. (Verification 2026-10-02: an earlier
+revision of this entry named a nonexistent `HistogramMode` type. The grid for the
+missing/finite column has `borders = []`, `n_bins = 2`; the comment at
+`split.rs:2262` treats "fewer than two data bins ⇒ no candidate split" as the
+designed rule, so the fix changes a stated rule rather than an accident.)
 
 **Suggested fix.** Admit pure missing/present split candidates where both sides
 have sufficient support, including the single-finite-bin case. Update both the
@@ -507,6 +594,16 @@ pruning evaluator divides it again by the fold's weight sum before computing the
 mean and standard error across folds. The extra division is not a common scaling
 factor when fold masses differ.
 
+The division is at `prune.rs:2938`, inside the block beginning at the cited
+line. It is acknowledged in the code: the comment at `prune.rs:3625-3629` calls
+it "a long-standing constant rescale that cancels in every comparison it makes"
+and says it was left alone because changing it would move the `se_rule` band.
+The reproduction below falsifies that premise — the rescale is only constant
+when every fold carries the same mass — so a fix must also re-derive the
+`se_rule` band on the corrected scale. (`prune.rs:78` documents the reported
+deviance as "per unit weight"; the scalar path divides once because
+`Loss::deviance` returns a weighted sum.)
+
 **Reproduction.** Build three class models from `[fixture_model(), zero, zero]`,
 where each zero model is the same fixture with its trees removed. Use
 `fixture_serve()`, class labels `a/b/c`, target indices `[1,0,0,0]`,
@@ -536,9 +633,14 @@ a direct weighted cross-entropy calculation.
 **Priority:** P2. **Status:** Open.
 
 **Source:** [_guard_reanchor, sklearn.py:836](../../python/t_boost/sklearn.py#L836).
-Compare the logit branch in
-[engine/boost.rs:5315](../../crates/t-boost-core/src/engine/boost.rs#L5315), reached
-by the native pruning reanchor path.
+Compare the logit bisection at
+[engine/boost.rs:5316-5331](../../crates/t-boost-core/src/engine/boost.rs#L5316),
+reached by the native pruning reanchor path (`prune.rs:1681-1683` and
+`1809-1812` dispatch `Link::Logit` to it; `prune::reanchor_shift` at
+`prune.rs:3216` is the log formula and is only dispatched for `Link::Log`).
+The `_guard_reanchor` docstring (`sklearn.py:817-818`) claims to mirror
+`prune::reanchor_shift` "exactly" — true for the log link, but the native
+deployment path never uses that function for logistic models.
 
 **Trigger and impact.** The binary OOB pruning guard reanchors logistic scores.
 It evaluates predictions calibrated differently from the native deployed model,
@@ -632,6 +734,14 @@ explicitly intends to retain JSON read compatibility.
 `#[serde(default)]`, then `validate_tables_doc` compares the old schema version
 against `required_tables_version`, which unconditionally requires at least v7.
 The existing `migrate` facade handles tree `ModelDoc`, not table documents.
+There is a second, independent gate: `TableModel::validate`
+(`table_model.rs:108-120`) rejects a model-level `schema_version` outside
+`7..=7`, so a document whose envelope stamp is raised to 7 but whose model
+stamp is still 2 is also rejected ("tables model schema_version 2 outside
+7..=7"). Both gates must defer to JSON defaulting. (Verification 2026-10-02:
+stripping `band_of` while leaving both stamps at 7 loads correctly, confirming
+the `#[serde(default)]` path itself works; `serialize.rs:89-90` literally
+promises that "`#[serde(default)]` loads a pre-v7 document".)
 
 **Reproduction.** Serialize a simple unbanded fixture table model to JSON. Set
 its document/model schema versions to `2` and remove `band_of` from its axes,
@@ -684,6 +794,11 @@ TBoostClassifier.from_json(m.to_json())
 
 Observed: `SerializationError: missing field 'classes'` from the multiclass
 decoder. The corresponding binary round-trip succeeds and preserves predictions.
+The quoted substring test is at `sklearn.py:1399` within `_unpack_json`; the
+legacy branch at lines 1402–1405 uses the same pattern. A feature named
+`"t-boost-multiclass-tables"` misroutes the same way; `"t-boost-tables"` is
+inert in this build because every model is a tables model. The regressor
+loader ignores the kind marker and is unaffected.
 
 **Suggested fix.** Parse the discriminator as a structured JSON field. Preserve
 the existing policy of trusting the inner document over stale outer metadata,
@@ -719,7 +834,12 @@ attempt to shift left with overflow
 ```
 
 The panic was caught with `catch_unwind`. The document is intentionally malformed
-and should be rejected before evaluating order-dependent arithmetic.
+and should be rejected before evaluating order-dependent arithmetic. Orders 65
+and 200 panic identically. Orders 9 and 63 — both above `MAX_ORDER = 8`, with
+axis `raw` identities beyond the two-feature model — load *without error*;
+nothing on the load path bounds the order or checks axis identities, so 64 is
+merely the first order that overflows. `FactoredEffect::packed`
+(`explain.rs:2615`) already uses `checked_shl` for the same quantity.
 
 **Suggested fix.** Validate the supported order before shifting or allocating
 order-dependent structures. Also validate feature-set/axis relationships, and
@@ -876,7 +996,14 @@ exposure scaling.
 
 **Cause.** The native parser canonicalizes names and accepts aliases. Python
 reporting branches compare the original literal `self.objective` against only
-canonical lowercase spellings.
+canonical lowercase spellings. Further literal comparisons not cited above sit
+at `sklearn.py:5478` (objective family) and `5555` (classifier predict branch).
+The Python layer does normalize at fit time (`3288`, `3811`, `7871`), so alias
+acceptance is deliberate; the reporting branches simply never see the
+canonical form. The defect survives serialization: `_restore_metadata`
+(`1331-1332`) rewrites the raw objective literal over the canonical value that
+`_attach_model` (`5217`) derived, so a loaded alias-fit model still misreports
+its link. The case variant `"SQUARED_ERROR"` fails in the same way.
 
 **Reproduction.** Using the shared setup, fit
 `TBoostRegressor(objective=name, **OPTIONS)` on `(X, X[:, 0] + 1)` for each of
@@ -958,7 +1085,15 @@ The report omits these effects from `deployed` and can list them under
 **Cause.** `deployed_supports` iterates only `bank.tables`, excluding
 `bank.factored`. Python interprets the result as the full deployed support set.
 Existing test comments acknowledge the dense-only count; they do not make the
-`kept_not_deployed` classification accurate.
+`kept_not_deployed` classification accurate. The binding is internally
+inconsistent: `deployed_census()` (`lib.rs:5622-5624`) explicitly includes
+`factored` and returns `{1: 4, 2: 5, 3: 1}` for the model below, counting the
+effect that `deployed_supports()` omits. The two test files disagree too:
+`test_surface_merges_and_binding_report.py:176-177` records that `deployed`
+"counts DENSE tables only", while `test_prune.py:48-53` asserts that
+"deployed lists what actually survived purification into the bank, and kept \
+deployed is surfaced, never silent" — the guarantee the factored support
+violates.
 
 **Reproduction.** Independent Python fixture:
 
@@ -1023,6 +1158,22 @@ against the [cargo-fuzz 0.13.1 implementation](https://raw.githubusercontent.com
 and [Cargo's working-directory contract](https://doc.rust-lang.org/cargo/commands/cargo-run.html).
 The full workflow was not executed locally because cargo-fuzz was unavailable.
 
+Verification 2026-10-02 traced cargo-fuzz 0.13.1 `src/project.rs` directly:
+`find_package` walks up from the current directory to the first non-fuzz
+`Cargo.toml` (the repository root), `cargo()` builds `cargo run
+--manifest-path <root>/fuzz/Cargo.toml`, `exec_fuzz` appends the target
+arguments verbatim and spawns; no `current_dir` call exists on any `Command`.
+libFuzzer resolves `-dict=` in the target process and exits 1 when the file is
+missing. The workflow pins `cargo install cargo-fuzz --version 0.13.1 --locked`
+and sets no `working-directory`. **The defect is currently latent:** the only
+recorded run of `fuzz.yml` (run `36960895029`, 2026-10-02, 24 s) fails one
+step earlier, inside the install itself — the `--locked` 0.13.1 dependency set
+pins `rustix 0.36.5`, which no longer compiles on current nightly
+(`cannot find attribute rustc_layout_scalar_valid_range_start`). The install
+must be repaired before the dictionary path can be exercised. The local smoke
+commands in `fuzz/README.md` do not pass `-dict`, so nothing exercises the path
+locally either.
+
 **Suggested fix.** Use the repository-relative dictionary path or set a working
 directory and make all associated paths consistent with it.
 
@@ -1057,6 +1208,19 @@ the command and [pip's documented candidate selection](https://pip.pypa.io/en/st
 No publish action or GitHub workflow was run. The finding concerns
 `release-gate.yml`; the main `release.yml` has separate version checks and is not
 the reported unpinned install path.
+
+Verification 2026-10-02: the step at line 212 has no version pin, no
+`--no-index` and no `--only-binary`; the inline heredoc smoke (lines 214–226)
+never asserts `__version__`, `__file__` or the build profile.
+`scripts/package_smoke_check.py`, which asserts all three, is used only by
+`release.yml:286`. `release.yml:278` installs `"t-boost==${VERSION}"` with
+`--only-binary`/`--no-binary` from `$RUNNER_TEMP`, as the entry says. pip's
+documentation states verbatim that "there is no priority in the locations that
+are searched … the 'best' match … (in terms of version number)" is selected.
+**The condition is already live:** the workspace version is `0.6.1` and PyPI
+serves `0.6.1`, so for the current revision the index offers an *equal*
+version and which `0.6.1` the gate installs is unspecified by the quoted rule.
+The entry's "older local version" trigger covers only pre-bump revisions.
 
 **Suggested fix.** Install the exact built wheel path for the current platform,
 then verify the installed package's version and import location. Runtime
@@ -1172,6 +1336,16 @@ Observed: `fork, 2` remained alive after the five-second timeout. Both `fork, 3`
 The different-width control creates a fresh local pool in the child and isolates the
 inherited-cache problem. It is evidence for this serving path, not a claim that every
 post-fork native operation is safe with a different width.
+
+Verification 2026-10-02 reproduced the three results exactly (Python 3.11) and added
+a control: with `n_jobs=None` the forked child returns for a two-row query but **also
+hangs** for a parallelism-sized query (10,000 × 80 rows, 16 trees), so the inherited
+process-global Rayon pool (`cap_global_pool_once`, `lib.rs:7021`) is equally dead; the
+suggested-fix note about the global pool is warranted. Nothing in README, CONTRIBUTING
+or any docstring mentions fork or `multiprocessing` start methods. Forking after
+threads exist is unsupported by Rayon in general (and deprecated by CPython 3.12+),
+so ownership is arguable, but a silent indefinite hang with no documented restriction
+is still a defect in this library's surface.
 
 **Suggested fix.** Give native worker-pool state an explicit process lifecycle. Detect
 inherited state before accessing it and either initialize child-safe state or raise a
@@ -1691,6 +1865,15 @@ change scores. The incoming matrix still matches the receiving model exactly and
 models validate. This affects public Rust callers reusing the explicit cache; the Python
 binding's own per-model cache was not shown to cross models.
 
+Verification 2026-10-02: reproduced verbatim. The `CellMaps` docstring
+(`scoring.rs:1127-1130`) states the maps are "valid only for the model it was built
+from, and the scorer refuses it when the bank's merged grids differ", and
+`score_raw_with` (`420-426`) documents the same limited guarantee — so the partial
+check is a documented caller obligation with a best-effort guard, which makes this a
+policy call. The Python binding builds maps per model object in a `OnceLock`
+(`t-boost-py/src/lib.rs:8829-8858`), so no cross-model reuse exists there. The silent
+wrong answer for a documented-invalid use is still worth closing with a typed error.
+
 Standalone Rust reproduction:
 
 ```rust
@@ -2014,13 +2197,16 @@ control without refits, exposure offsets, and cross-thread determinism.
 <a id="bug-036"></a>
 ## BUG-036 — Bootstrap copies cross the early-stopping train/validation boundary
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Open — **reclassified on verification as a documented
+limitation**, see below.
 
 **Source:** [engine/boost.rs:2897](../../crates/t-boost-core/src/engine/boost.rs#L2897),
 the bag-local fit specification at [line
 2904](../../crates/t-boost-core/src/engine/boost.rs#L2904), and the later carve in
-[fit_single, line 671](../../crates/t-boost-core/src/engine/boost.rs#L671). The
-multiclass path repeats the bootstrap-before-carve sequence around lines 1565–1590.
+[fit_single, lines 657–665](../../crates/t-boost-core/src/engine/boost.rs#L657)
+(`carve_validation_rows_stratified`; line 671 is the intercept-honesty comment that
+refers to it). The multiclass path repeats the bootstrap-before-carve sequence at
+lines 1566–1584, carving positionally at line 2083.
 
 **Trigger and impact.** Configure `n_bags >= 2`, `bag_subsample >= 1.0` (documented
 bootstrap sampling), and an internal `validation_fraction`, without a supplied fixed
@@ -2029,6 +2215,18 @@ stopping. Validation is then partly in-sample, undermining selection of the best
 iteration. This does not require categorical features. The shipped `bag_subsample=.8`
 subagging default avoids duplicate rows, as does an honestly constructed fixed holdout
 sampled only after its boundary is fixed.
+
+**Verification 2026-10-02 — this is documented behaviour.** The overlap reproduces
+exactly, but it is not an undisclosed defect: the leak is the stated reason the
+default is `0.8`. `boosters.rs:176-178` describes subagging as giving "no within-bag
+train/val leak"; the `bag_subsample` docstring (`sklearn.py:5846-5852`) explains that
+"a bootstrap bag duplicates rows, which makes the per-bag early-stopping validation
+carve overlap the bag's own training multiset, a train/validation leak that lets
+validation deviance improve indefinitely and defeats early stopping. Set to `1.0` to
+restore classic bootstrap bagging"; `sklearn.py:1726-1730` says the same internally.
+Users who set `1.0` are told what they get. Treat this entry as a known limitation
+whose remedy (an honest carve before bootstrap) is an enhancement, not a correctness
+fix; it does not belong on the same footing as the other P2 items.
 
 **Cause.** The outer loop first samples original row indices with replacement,
 materializes a matrix containing duplicates, and then asks `fit_single` to carve its
@@ -2096,6 +2294,14 @@ engine/boost.rs:1514:57: index out of bounds: the len is 1 but the index is 1
 short fixed_holdout multiclass bagged panic=true
 ```
 
+Verification 2026-10-02 reproduced both panics and added two controls: with
+`n_bags=1` both paths return `ShapeMismatch "fixed_holdout len 1 != n_rows 200"`
+as expected, and — not previously recorded — a mask that is too **long** (201
+entries for 200 rows) with two bags is silently accepted and returns `Ok` with
+two trees; no error at all. The acceptance checks below already anticipate long
+masks. The no-panic rule is a library-wide contract (`CONTRIBUTING.md:111-118`),
+so the Rust-API-only scope does not make this acceptable behaviour.
+
 **Suggested fix.** Validate fixed-holdout shape once, before entering either parallel
 bag loop, and share the validation with scalar/multiclass single fits. Reject a mask
 that leaves no training rows with a typed error too.
@@ -2135,6 +2341,15 @@ The bagged example uses `bag_subsample=.8`. This is specifically a Rust core val
 omission. Public Python attempts with analogous weights were rejected by binning,
 Newton-leaf checks, or later explanation-mass validation; no end-to-end successful
 Python estimator with these invalid weights was established.
+
+Verification 2026-10-02: all four intercept vectors reproduced exactly; `w[0] = +inf`
+is accepted with the same intercepts as NaN; the scalar `Booster::fit` with
+`SquaredError` rejects all three (`"weight[0] must be finite and >= 0"`), confirming
+the scalar/multiclass asymmetry. The length-only check is at lines 2053–2058 (the
+cited "around line 2050" is a blank line). The binding's `fit_multiclass`
+(`lib.rs:4163`) has no weight-domain check either; Python is shielded only because
+weights pass through `build_grid`'s finite/non-negative check (`grid.rs:46-50`),
+which a pre-binned Rust caller bypasses.
 
 **Suggested fix.** Validate all multiclass weights as finite and nonnegative before
 initialization or resampling; reject nonpositive effective training weight and
@@ -2456,9 +2671,15 @@ fn main() {
 
 **Priority:** P2. **Status:** Open.
 
-**Source:** [data/grid.rs:44](../../crates/t-boost-core/src/data/grid.rs#L44), [grid
-construction branch, line 81](../../crates/t-boost-core/src/data/grid.rs#L81), and
+**Source:** [data/grid.rs:44](../../crates/t-boost-core/src/data/grid.rs#L44), the
+quantile construction branches at [lines
+84–91](../../crates/t-boost-core/src/data/grid.rs#L84) (line 81, cited earlier, is a
+comment inside the midpoint branch at 79–83), and
 [quantile weight check, line 163](../../crates/t-boost-core/src/data/grid.rs#L163).
+The all-missing short-circuit that already returns a degenerate grid is at lines
+62–68. Note that the unit test `all_zero_weight_on_quantile_path_errors`
+(`grid.rs:516-523`) pins the per-column error on exactly this per-column situation,
+so a fix must revisit that test, not just the production branch.
 
 **Trigger and impact.** Supply finite, nonnegative sample weights with positive total
 weight, and a numeric feature whose finite values occur only on zero-weight rows. If
@@ -2774,6 +2995,16 @@ predictive discrimination rather than aggregating equal-score mass before integr
 the Gini curve; it violates the existing AUC identity and permutation invariance. This
 does not demand changing the separately documented equal-count lift-bucket convention.
 
+Verification 2026-10-02: the three constant-score results reproduced exactly. On a
+tied-score fixture (scores rounded to 0.1) the metric is permutation-variant
+(`-0.1152` versus `-0.1098` after a joint row permutation; `2·AUC−1 = -0.1139`), while
+a no-ties control matches `2·AUC−1` to `1e-15`. `metrics.py:1-5` states the contract
+is parity with `xtask`, and `metrics.py:49` documents the index tie-break, which makes
+this a policy call; nothing, however, documents that ties earn ranking skill, and the
+comment at `test_sklearn.py:1146` states the AUC identity for binary targets without a
+no-ties qualification. The Rust implementation (`xtask/src/main.rs:865-897`) was
+confirmed identical by reading.
+
 **Suggested fix.** Preserve deterministic sorting, but integrate one segment per tied
 score, summing its weight and weighted outcomes. Apply matching behavior to Python and
 Rust and define signed-zero equality consistently.
@@ -2867,6 +3098,16 @@ print(m.predict(pl.DataFrame({'c': ['<rare>', 'thin']})))
 A real user level named `<rare>` and the synthetic bucket are indistinguishable in the
 export but mean very different predictions. A consumer converting entries to a
 label-keyed map selects the wrong one.
+
+Verification 2026-10-02: both reproductions matched exactly; the exported axis carries
+only `borders`, `cells`, `levels`, `name` and `raw`. Reproduction A is precisely what
+the `tables` docstring (`sklearn.py:6684-6689`, "one per post-rare-pooling category
+level (the reserved rare bucket shown as `<rare>`)") and `serialize.rs:996-1006`
+describe, so on its own it is a documented limitation rather than a contradicted
+contract. Reproduction B — a genuine level literally named `<rare>` — is addressed by
+no documentation and is the concrete defect. `test_sql_export_contract.py:76-87` keys a
+dictionary by `levels[].label`, exactly the consumer pattern that Reproduction B breaks.
+The constant `RARE_LEVEL_EXPORT_LABEL` is at `serialize.rs:1107` (1106 is its comment).
 
 **Suggested fix.** Export a complete unambiguous categorical routing contract: original
 members, stable bucket identity/type separate from display labels, and unseen/missing
@@ -3034,6 +3275,16 @@ validation rejects this incompatible combination. Python already rejects the sca
 combination at [sklearn.py:3525](../../python/t_boost/sklearn.py#L3525), so this finding
 concerns the public Rust fitting API. Python multiclass fitting rejects monotone
 constraints entirely; that rejection was also verified.
+
+Verification 2026-10-02: all four rows reproduced exactly (40 trees in each fit).
+`cell_refit.rs` contains no reference to monotone constraints; `Model::validate`
+(`engine/mod.rs:962`) has no monotone field and `EnsembleSpec::validate`
+(`boosters.rs:198-230`) checks only `base`/`gamma` finiteness. The strongest evidence
+that the core treats monotonicity as a post-refit invariant is the *ridge* refit path:
+`boost.rs:4769` projects refit leaves back onto the monotone cone and the test
+`monotone_holds_under_ridge_refit` (`boost.rs:12081`) pins it. Cell refit is therefore
+the one leaf-rewriting stage that does not honour the constraint, which argues for the
+"mirror the Python check in core" fix at minimum.
 
 **Reproduction.** The complete Rust harness below uses 4,000 rows: every `(x,z)` pair in
 `0..19 × 0..19` repeated ten times. The response is `2*x + .4*z` for `z<10`, otherwise
@@ -3536,6 +3787,16 @@ gates use the wrong mass or that predictions change.
 the measure kind. The actual bank was purified under different weighted marginals. There
 is no mass parameter or weighted assertion counterpart in the public API.
 
+Verification 2026-10-02: reproduced exactly for all three measures. Two added controls
+isolate the failure to nonuniform mass: `explain_weighted` with unit weights
+`[1, 1, 1, 1]` passes the assertion under every measure, and unweighted `explain` passes
+under every measure. The assertion's own docstring (`explain.rs:4395-4397`) says it
+"rebuilds the reference weights from `x` … and `bank.w`", i.e. the row-count rebuild is
+documented, and `explain_weighted`'s docstring (`4488-4500`) describes the weighted
+measure as "a different valid decomposition" by design. This is therefore an API gap —
+a documented unweighted check with no weighted counterpart — rather than a contradicted
+contract; the entry's own "public diagnostic API failure" framing is accurate.
+
 **Complete reproduction:**
 
 ```rust
@@ -3668,7 +3929,12 @@ absolute tolerance: 0.00000762939453125
 
 The original unshifted model explains successfully. Changing only its tree coefficient
 from `1` to `100000` also makes explanation fail, showing separate sensitivity to scale
-as well as translation.
+as well as translation. (Verification 2026-10-02: both reproduced exactly. A sweep
+shows the gate trips only at these magnitudes — coefficients `10`, `100`, `1000`,
+`10000` and offsets `10` through `1e6` all explain successfully; `var_tol` stays at
+`7.63e-6` throughout because it scales with tree count, not score scale. The
+`ExactTol` doc at `explain.rs:855-857` says a false alarm on this gate "is not
+harmless … refusing to export a rating table that is in fact exact".)
 
 **Scope check.** An ordinary Python `TBoostRegressor.fit` followed by `.tables` did
 **not** raise this gate on the tested large-offset/scaled dataset: the deployed Python
@@ -3954,10 +4220,14 @@ __t_boost_missing__ [5.0, 5.0]
 ordinary-value     [0.39487800, 9.60512161]
 ```
 
-Control: a real `__t_boost_rare__` category is explicitly rejected by the native encoder
-([cat.rs:1539](../../crates/t-boost-core/src/cat.rs#L1539)–[cat.rs:1542](../../crates/t-boost-core/src/cat.rs#L1542)),
-so the reserved rare namespace already has a guard; the Python missing namespace has no
-analogous guard.
+Control: a real `__t_boost_rare__` category is rejected by the native encoder
+([cat.rs:1539](../../crates/t-boost-core/src/cat.rs#L1539)–[cat.rs:1542](../../crates/t-boost-core/src/cat.rs#L1542))
+**only when `cat_min_data_per_group > 0`** (the default). The guard sits after the
+`min_data_per_group <= 0` early return at `cat.rs:1531-1536`, so with
+`cat_min_data_per_group=0` the same label is accepted and fits (verified 2026-10-02:
+`[0.394878, 9.60512161]`). The reserved rare namespace therefore has a partial guard;
+the Python missing namespace has none. A fix should make both reservations
+unconditional.
 
 **Suggested fix.** Encode missing identity separately from user strings
 (tagging/escaping with a reversible representation), or reject a colliding literal
@@ -4131,8 +4401,16 @@ should not mutate parameters or fitted state.
 bag intercepts are averaged in
 [engine/boost.rs:4260](../../crates/t-boost-core/src/engine/boost.rs#L4260) and not
 retained alongside the bag spans. The reconstructed models feed [OOB evidence at
-prune.rs:2223](../../crates/t-boost-core/src/prune.rs#L2223) and [bag-score variance at
-line 2089](../../crates/t-boost-core/src/prune.rs#L2089).
+prune.rs:2221](../../crates/t-boost-core/src/prune.rs#L2221) (the `bag_bank` call; 2223
+is a comment) and [bag-score variance at
+line 2089](../../crates/t-boost-core/src/prune.rs#L2089). `Model` carries only
+`bag_spans`/`bag_in_bag` (`engine/mod.rs:866-886`); no per-bag intercept is retained
+anywhere. The helper's own doc (`prune.rs:1911-1914`) says "the soup's f0" and claims
+only the all-bag mean identity, which contradicts the per-bag `f0_b` promised at
+`prune.rs:2117-2120`. The existing jury test (`prune.rs:4850-4855`) compares against
+`bag_raw_scores_for_rows`, which goes through the same `bag_member_model`, so it is
+circular on the intercept and could not catch this. (Verified 2026-10-02: both runs and
+the `[0.0]` variance reproduced exactly; bag sizes are `[10, 10]`.)
 
 **Trigger and impact.** Outer bags have different fitted intercepts. The pruning code
 reconstructs their tree slices but substitutes the full soup's intercept into every bag.
@@ -4287,7 +4565,14 @@ can evaluate incompletely reanchored candidates too.
 an iterative proportional-fitting update, not the exact joint multinomial Newton step
 claimed by the comments. Concavity does not imply convergence within ten rounds. There
 is no convergence test, adaptive continuation, or diagnostic for the remaining
-class-mass error.
+class-mass error. (Verification 2026-10-02: the comments at `prune.rs:2500-2503` and
+`2586-2588` do claim "each round is the exact Newton step … needs no convergence
+test"; a Newton step would use the full Hessian `Σ w (diag p − p pᵀ)`, and the
+implemented update drops the off-diagonal coupling. The unit test
+`intercept_shifts_reproduce_the_observed_class_mass` (`prune.rs:4512-4515`) is
+annotated "10 fixed IPF rounds, no convergence test — this asserts the budget is
+actually enough"; the fixture below falsifies that assumption. The library and
+reference ten-iteration masses agree to ~1e-6.)
 
 **Reproduction.** The complete Rust harness below constructs a finite, validated
 three-class model and calls the public `prune_multiclass_to_keepset`, retaining its only
