@@ -257,3 +257,29 @@ def test_legacy_ensemble_models_say_why() -> None:
         legacy.predict_contributions(x[:2])
     with pytest.raises(Exception, match="not fitted"):
         TBoostRegressor().predict_contributions(x[:2])
+
+
+def test_extreme_scores_follow_the_native_link_clamp() -> None:
+    """The native log link clamps the raw score to [-30, 30]; contributions must agree with
+    `predict` there instead of failing their own validation."""
+    rng = np.random.default_rng(8)
+    x = rng.normal(size=(600, 2)).astype(np.float32)
+    y = (1e14 * np.exp(0.5 * x[:, 0])).astype(np.float32)  # log mean ~32, past the clamp
+    model = TBoostRegressor(objective="poisson", n_trees=50, n_bags=1, seed=0).fit(x, y)
+    assert np.all(model.predict_raw(x[:5]) > 30.0)
+    exposure = np.full(5, 2.0)
+    for rec, pred in zip(model.predict_contributions(x[:5], exposure=exposure), model.predict(x[:5])):
+        assert rec["prediction_value"] == pytest.approx(pred * 2.0, rel=1e-6)
+
+
+def test_unnamed_model_reads_polars_columns_by_position() -> None:
+    """A model fitted on an array serves a polars frame positionally; contributions must read
+    the same columns rather than look up the placeholder names."""
+    rng = np.random.default_rng(9)
+    x = rng.normal(size=(800, 3)).astype(np.float32)
+    model = TBoostRegressor(n_trees=30, n_bags=1, seed=0).fit(x, x[:, 0] + x[:, 1] * x[:, 2])
+    frame = pl.DataFrame(x[:2], schema=["a", "b", "c"])
+    rec = model.predict_contributions(frame, split_interactions=True)[0]
+    values = {c["term"]: c["feature_value"] for c in rec["contributions"]}
+    assert values == pytest.approx({"f0": float(x[0, 0]), "f1": float(x[0, 1]), "f2": float(x[0, 2])})
+    assert rec["prediction_value"] == pytest.approx(float(model.predict(frame)[0]), rel=1e-6)

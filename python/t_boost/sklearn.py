@@ -1480,22 +1480,34 @@ def _column_as_str_list(x: Any, j: int) -> list[str]:
     return [_cat_level(v) for v in arr[:, j].tolist()]
 
 
-def _input_column_values(x: Any, j: int, name: str) -> list[Any]:
-    """The caller's own values of input column ``j`` (named ``name`` on a frame), as Python
-    scalars: the ``feature_value`` a contribution reports."""
+def _input_column_values(x: Any, j: int, name: str | None) -> list[Any]:
+    """The caller's own values of input column ``j``, as Python scalars: the ``feature_value`` a
+    contribution reports. A polars frame is read by ``name``, or by position when the model was
+    fitted without column names (``name=None``), exactly as ``predict`` reads it."""
     if is_polars_eager(x):
-        return list(x.get_column(name).to_list())
+        column = x.get_column(name) if name is not None else x.to_series(j)
+        return list(column.to_list())
     if hasattr(x, "iloc"):
         return list(x.iloc[:, j].tolist())
     return list(np.asarray(x)[:, j].tolist())
 
 
+# The native inverse link clamps the exponent to [-30, 30] (`engine::inverse_link`, and the
+# softmax's max-shifted logits likewise), so contributions reproduce `predict` at extreme scores.
+_EXP_CLAMP = 30.0
+
+
 def _inverse_link(eta: "np.ndarray", link: str) -> "np.ndarray":
     if link == "log":
-        return np.asarray(np.exp(eta))
+        return np.asarray(np.exp(np.clip(eta, -_EXP_CLAMP, _EXP_CLAMP)))
     if link == "logit":
-        return np.asarray(1.0 / (1.0 + np.exp(-eta)))
+        return np.asarray(1.0 / (1.0 + np.exp(np.clip(-eta, -_EXP_CLAMP, _EXP_CLAMP))))
     return eta
+
+
+def _softmax(etas: "np.ndarray") -> "np.ndarray":
+    shifted = np.exp(np.clip(etas - etas.max(axis=1, keepdims=True), -_EXP_CLAMP, _EXP_CLAMP))
+    return np.asarray(shifted / shifted.sum(axis=1, keepdims=True))
 
 
 def _label_value(label: Any) -> Any:
@@ -5420,7 +5432,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         n_rows = int(x32.shape[0])
         names = self._input_feature_names()
         to_input = self._raw_to_input_column()
-        columns = [_input_column_values(X, j, names[j]) for j in range(len(names))]
+        named = getattr(self, "feature_names_in_", None) is not None
+        columns = [
+            _input_column_values(X, j, names[j] if named else None) for j in range(len(names))
+        ]
 
         log_exposure = None
         exp_list: list[Any] = []
@@ -5450,8 +5465,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         etas = np.column_stack([lad[3] for lad in ladders])
         if multiclass:
-            shifted = np.exp(etas - etas.max(axis=1, keepdims=True))
-            mus = shifted / shifted.sum(axis=1, keepdims=True)
+            mus = _softmax(etas)
+        elif log_exposure is not None:
+            # `predict(X) * exposure`, as documented: the native link clamps the score BEFORE
+            # exposure scales the rate, so apply it to the score without the exposure term.
+            mus = _inverse_link(etas - log_exposure[:, None], link) * np.exp(log_exposure)[:, None]
         else:
             mus = _inverse_link(etas, link)
         if validate:
