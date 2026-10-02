@@ -141,6 +141,20 @@ def _replace_one(text: str, pattern: re.Pattern[str], version: str, where: str) 
     return new
 
 
+def mask_version(filename: str, text: str) -> str:
+    """*text* of the root ``Cargo.toml`` or ``Cargo.lock`` with the release version blanked out.
+
+    Two revisions whose masked texts are equal differ at most by a version bump.
+    """
+    if filename == "Cargo.toml":
+        return _WORKSPACE_VERSION.sub(lambda m: f"{m[1]}*{m[3]}", text, count=1)
+    if filename == "Cargo.lock":
+        for name in _LOCKED_PACKAGES:
+            text = _locked_entry(name).sub(lambda m: f"{m[1]}*{m[3]}", text, count=1)
+        return text
+    raise ValueError(f"no release version is recorded in {filename}")
+
+
 def write_version(root: Path, version: str) -> None:
     """Rewrite every place the release version is recorded to *version*."""
     edits: list[tuple[Path, list[tuple[re.Pattern[str], str]]]] = [

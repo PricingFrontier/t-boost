@@ -144,6 +144,7 @@ fn prune_at(f: &Fixture, lambda_boxes: f64) -> PruneReport {
 /// `PruneConfig` is checked alongside the explicit zero, because "the default is inert" and
 /// "zero is inert" are different statements and both need to hold.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn a_zero_price_selects_exactly_what_the_unpenalized_selector_selected() {
     let f = fixture();
 
@@ -190,6 +191,7 @@ fn a_zero_price_selects_exactly_what_the_unpenalized_selector_selected() {
 /// bank, and the box count is non-increasing along the backward walk (each step drops one
 /// table, and a table's box cost is never negative).
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn the_path_carries_box_counts_for_calibration_even_when_unpriced() {
     let f = fixture();
     let report = prune_at(&f, 0.0);
@@ -236,6 +238,7 @@ fn the_path_carries_box_counts_for_calibration_even_when_unpriced() {
 /// carries `n_boxes`, and why this test derives its top rung from the measured full-bank
 /// deviance instead of hard-coding one.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn raising_the_price_moves_selection_monotonically_toward_a_smaller_bank() {
     let f = fixture();
     let baseline = prune_at(&f, 0.0);
@@ -299,6 +302,7 @@ fn raising_the_price_moves_selection_monotonically_toward_a_smaller_bank() {
 /// them would make the knob a general parsimony dial (the SE rule already is one) rather than
 /// the box-diffusion brake it is meant to be.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn an_overwhelming_price_still_cannot_charge_a_dense_table() {
     let f = fixture();
     let dev = 1.0_f64;
@@ -339,6 +343,7 @@ fn an_overwhelming_price_still_cannot_charge_a_dense_table() {
 /// If `box_cost` were indexed in a different order from `ids`, or decremented for the wrong
 /// support, those two numbers would part company.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn multiclass_box_accounting_matches_the_model_that_ships() {
     // Three classes off one fitted model. The per-class banks are identical, which is exactly
     // what makes the SUMMED cost checkable: a support's cost must be 3x its per-class boxes,

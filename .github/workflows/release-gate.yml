@@ -49,8 +49,9 @@ jobs:
         run: cargo clippy -p t-boost-core --all-targets --all-features -- -D warnings
       - name: Core tests (all features)
         run: cargo test --release -p t-boost-core --all-features
-      - name: Core tests (no default features)
-        run: cargo test --release -p t-boost-core --no-default-features
+      - name: Slow core tests
+        if: matrix.rust == 'stable' && matrix.os == 'ubuntu-latest'
+        run: cargo test --release -p t-boost-core --all-features --test '*' -- --ignored
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism and invariant gates

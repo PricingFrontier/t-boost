@@ -540,6 +540,7 @@ fn a_bagged_lifted_fit_tolerates_bags_of_differing_depth() {
 // ---------------------------------------------------------------------------------
 
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn all_five_i2_gates_pass_at_every_lifted_depth() {
     for max_depth in LEGACY_MAX_DEPTH..=MAX_DEPTH {
         for max_order in 1..=(LEGACY_MAX_ORDER as u8) {
@@ -571,6 +572,7 @@ fn all_five_i2_gates_pass_at_every_lifted_depth() {
 /// decomposes a lifted tree into one rank-1 box per realized region tuple instead, so the
 /// compact factored form is available at every depth.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn a_lifted_order_three_support_stays_factored_and_exact() {
     let (model, x) = fit_at(6, 3, 3000, 60);
     let reuse_bearing = model.trees.iter().any(|(_, t)| {

@@ -59,6 +59,7 @@ jobs:
       actions: read
     outputs:
       version: ${{ steps.version.outputs.version }}
+      model_changed: ${{ steps.model.outputs.model_changed }}
     steps:
       - name: Release from main only
         if: github.ref != 'refs/heads/main'
@@ -91,6 +92,8 @@ jobs:
           echo "main's CI passed for ${GITHUB_SHA}: $url"
 
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the release tags, for the model-change check below
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -130,6 +133,34 @@ jobs:
               exit 1
               ;;
           esac
+
+      - name: Has the model changed since the last release?
+        id: model
+        run: |
+          # No earlier release tag (the first release) leaves the base empty: a model change.
+          last=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD 2>/dev/null || true)
+          echo "Comparing with the last release: ${last:-none}"
+          uv run --no-project python scripts/model_changed.py "$last" --github-output "$GITHUB_OUTPUT"
+
+  # ── Slow core tests, when the model changed since the last release ──────
+  slow-tests:
+    name: Slow core tests (model changed since last release)
+    needs: check
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Skip when the model is unchanged
+        if: needs.check.outputs.model_changed != 'true'
+        run: echo "No model code changed since the last release; the slow tests are not needed."
+      - uses: actions/checkout@v4
+        if: needs.check.outputs.model_changed == 'true'
+      - uses: dtolnay/rust-toolchain@1.96.1
+        if: needs.check.outputs.model_changed == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: needs.check.outputs.model_changed == 'true'
+      - name: Slow core tests
+        if: needs.check.outputs.model_changed == 'true'
+        run: cargo test --release -p t-boost-core --all-features --test '*' -- --ignored
 
   # ── Wheels: one abi3 wheel per platform ──────────────────────────────────
   wheels:
@@ -264,7 +295,7 @@ jobs:
   publish:
     name: Publish to PyPI
     if: ${{ !inputs.dry_run }}
-    needs: [check, dist, smoke]
+    needs: [check, dist, smoke, slow-tests]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment:

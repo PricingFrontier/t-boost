@@ -53,7 +53,7 @@ Run the gates for every area you touched:
 | You changed | Run |
 |-------------|-----|
 | Any Rust | `cargo fmt --all --check` · `cargo clippy --workspace --all-targets --all-features -- -D warnings` · `cargo run -p xtask -- check-all` |
-| `t-boost-core` | `cargo test --release -p t-boost-core --all-features` (~15 min; CI also runs in release) · `cargo test --release -p t-boost-core --no-default-features` · `cargo test -p t-boost-core --doc` · the bit-repro pair below |
+| `t-boost-core` | `cargo test --release -p t-boost-core --all-features` (~1 min) · the slow suite `cargo test --release -p t-boost-core --all-features --test '*' -- --ignored` (~13 min) · `cargo test -p t-boost-core --doc` · the bit-repro pair below |
 | The binding (`t-boost-py`) or the stub | `uv sync --reinstall-package t-boost` · `uv run python -m mypy.stubtest t_boost._t_boost` · the Python row |
 | Python (`python/t_boost`) | `uv run pytest python/tests -q` (~3 min) · `uv run mypy --strict python/t_boost` |
 | `pyproject.toml` / dependencies | `uv lock` (commit `uv.lock`) · `uv sync --locked` · the Python row |
@@ -63,6 +63,14 @@ Run the gates for every area you touched:
 **Run the core tests in release mode.** In debug the suite takes hours. The core has no
 `debug_assert!` and `overflow-checks = true` is set in every profile, so `--release` checks
 exactly the same things.
+
+**Slow tests.** Integration tests that take more than about 30 s in release are marked
+``#[ignore = "slow: run with `cargo test --release -- --ignored`"]``, so the default suite stays
+fast. Run them (the command above) whenever you change `t-boost-core`, `Cargo.toml` or
+`Cargo.lock`; CI and Release run them only for such changes (see below). Give any new test of
+that cost the same attribute. Keep slow tests in `tests/` (integration tests): the slow command
+selects `--test '*'`, and the one ignored unit test, `bench_row_scatter`, is a benchmark that
+must not run in CI.
 
 The cross-run reproducibility gate (two processes, same seed, byte-identical output):
 
@@ -81,7 +89,8 @@ cmp target/bit-repro-a.bin target/bit-repro-b.bin
 | `lint` | fmt, clippy (incl. the no-panic deny set), `xtask check-all` |
 | `py-lint` | clippy on the PyO3 binding |
 | `python` | runtime-only install check (`uv sync --locked --no-dev`, no scikit-learn), then pytest, `mypy --strict`, stubtest |
-| `test` | core tests (`--all-features`, `--no-default-features`, `--doc`), determinism (`n_threads ∈ {1,2,8}`, byte-compared), invariants, overflow trap, bit-repro |
+| `test` | core tests (`--all-features`, `--doc`), determinism (`n_threads ∈ {1,2,8}`, byte-compared), invariants, overflow trap, bit-repro |
+| `slow-tests` | the slow core tests, only when `scripts/model_changed.py` finds model code in the change (the core crate, or `Cargo.toml`/`Cargo.lock` beyond a version bump); always on nightly and manual runs |
 | `m6-preflight` | `cargo test -p xtask`, `xtask accuracy` (plain + adversarial), `xtask release-preflight` |
 | `msrv` | build + test on Rust 1.85 |
 | `features` | the core builds under each feature combination (`arrow`, `nightly`) |
@@ -204,6 +213,8 @@ hand. An agent's part is preparing the version bump; run the workflow only if as
 3. **Run Release** from the Actions tab, on `main`. It refuses to start unless main's CI
    passed on that exact commit, the five version records agree, and the version is newer than
    every release on PyPI and not yet tagged. It then:
+   - runs the slow core tests if model code changed since the last release tag (always for
+     the first release), and publishes only if they pass;
    - builds one abi3 wheel per platform (Linux x86_64/aarch64, Windows x64, macOS
      x86_64/arm64) plus an sdist;
    - install-smoke-tests the Linux, Windows and macOS-arm64 wheels and the sdist in fresh

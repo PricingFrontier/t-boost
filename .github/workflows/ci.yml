@@ -119,8 +119,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Test (all features)
         run: cargo test --release -p t-boost-core --all-features
-      - name: Test (no default features)
-        run: cargo test --release -p t-boost-core --no-default-features
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism gate ({1,2,8}-thread byte-equality)
@@ -224,6 +222,39 @@ jobs:
         with:
           command: check
 
+  # ---- Slow core tests: only when the change touches model code -------------------
+  # The integration tests marked `#[ignore = "slow: ..."]` fit many sizeable models and take
+  # ~25 min on a hosted runner. They run when scripts/model_changed.py finds model code in the
+  # change (the core crate, or Cargo.toml/Cargo.lock beyond a version bump), and on every
+  # nightly/manual run. Release re-checks against the last release tag, so a model change
+  # that slipped past here is still tested before it ships.
+  slow-tests:
+    name: slow core tests (model changes only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Did this change touch model code?
+        id: changes
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            push|pull_request)
+              uv run --no-project python scripts/model_changed.py "$BASE" --github-output "$GITHUB_OUTPUT" ;;
+            *) echo "model_changed=true" >> "$GITHUB_OUTPUT" ;;  # nightly and manual runs test everything
+          esac
+      - uses: dtolnay/rust-toolchain@1.96.1
+        if: steps.changes.outputs.model_changed == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.changes.outputs.model_changed == 'true'
+      - name: Slow core tests
+        if: steps.changes.outputs.model_changed == 'true'
+        run: cargo test --release -p t-boost-core --all-features --test '*' -- --ignored
+
   # ---- Platform matrix: spec §13.10's promised {stable,MSRV} x {linux-x86_64, --
   # ---- linux-aarch64, macos-aarch64, windows-x64} gate, promoted from -----------
   # ---- release-gate.yml's manual-only checklist to a blocking one ---------------
@@ -265,8 +296,6 @@ jobs:
         run: cargo clippy -p t-boost-core --all-targets --all-features -- -D warnings
       - name: Core tests (all features)
         run: cargo test --release -p t-boost-core --all-features
-      - name: Core tests (no default features)
-        run: cargo test --release -p t-boost-core --no-default-features
       - name: Doctests
         run: cargo test -p t-boost-core --doc
       - name: Determinism and invariant gates

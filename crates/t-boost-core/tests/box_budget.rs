@@ -98,6 +98,7 @@ fn full_keepset(model: &Model, serve: &ServeBinnedMatrix) -> Vec<FeatureSet> {
 /// on the serialized document, not on a field-by-field walk, because the document is what
 /// ships.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn a_generous_budget_deploys_the_same_bytes_as_no_budget() {
     let (model, serve, y, w) = fit(6, 4);
     let keep = full_keepset(&model, &serve);
@@ -150,6 +151,7 @@ fn a_generous_budget_deploys_the_same_bytes_as_no_budget() {
 /// A tight budget lands UNDER it, drops only factored mass, and leaves the dense tables alone
 /// — the dense bank is governed by the cell firewall, not by this gate.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn a_tight_budget_lands_under_it_and_spares_the_dense_tables() {
     let (model, serve, y, w) = fit(6, 4);
     let keep = full_keepset(&model, &serve);
@@ -224,6 +226,7 @@ fn a_tight_budget_lands_under_it_and_spares_the_dense_tables() {
 /// decided in one pass: retaining a subset of supports leaves every surviving effect's box
 /// count exactly where it was.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn box_costs_are_a_property_of_the_model_not_of_the_keepset() {
     let (model, serve, _, _) = fit(6, 4);
     let bank = model.explain(&serve, RefMeasure::default()).unwrap();

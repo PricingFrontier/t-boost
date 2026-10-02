@@ -151,6 +151,7 @@ fn distinct_raws(model: &Model, tree: &t_boost_core::ObliviousTree) -> usize {
 /// would only have shown the gates holding on a model that never used the extra order).
 /// Each lift pays for its own rectangle.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn all_five_i2_gates_pass_at_every_lifted_order() {
     for max_depth in LEGACY_MAX_DEPTH..=ORDER_LIFT_MAX_DEPTH {
         for max_order in 1..=ORDER_LIFT_MAX_ORDER.min(max_depth) {
@@ -184,6 +185,7 @@ fn all_five_i2_gates_pass_at_every_lifted_order() {
 /// reached the dense path it would be the product of four global merged extents, which is
 /// the multi-million-cell blow-up the factored form exists to avoid.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn a_four_way_effect_is_factored_and_small() {
     let (model, x) = fit_at(6, 4, 2500, 40);
     let has_order_four = model
@@ -218,6 +220,7 @@ fn a_four_way_effect_is_factored_and_small() {
 /// through its observable consequence: an order-3 support that no tree realized can still
 /// appear as a factored effect, because a 4-way shed created it.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn the_order_four_shed_creates_factored_not_dense_sub_effects() {
     let (model, x) = fit_at(6, 4, 2500, 40);
     let bank = model.explain(&x, RefMeasure::default()).unwrap();
@@ -486,6 +489,7 @@ fn an_order_four_fit_is_byte_identical_across_thread_counts() {
 /// `BTreeSet` order and merges boxes in first-appearance order, so the box sequence (and
 /// every sum built from it) is fixed.
 #[test]
+#[ignore = "slow: run with `cargo test --release -- --ignored`"]
 fn an_order_four_bank_is_byte_identical_across_thread_counts() {
     let (model, x) = fit_at(6, 4, 1500, 25);
     let mut docs: Vec<String> = Vec::new();
