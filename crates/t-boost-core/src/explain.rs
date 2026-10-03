@@ -1271,9 +1271,10 @@ impl MergedGrids {
                 })?;
                 let r = prov.raw.0 as usize;
                 if split.bin_le == 0 {
-                    return Err(PbError::Internal {
-                        what: "split bin_le 0 has no interior border".into(),
-                    });
+                    // Pure missing-vs-present split (BUG-005): it realizes no finite border,
+                    // and merged cell 0 is always the missing cell, so the cell space already
+                    // separates exactly the rows it routes.
+                    continue;
                 }
                 let bidx = usize::from(split.bin_le) - 1;
                 let grid = model.grids.get(a).ok_or_else(|| PbError::Internal {

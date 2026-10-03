@@ -1162,6 +1162,45 @@ mod cat_channels_fit_path_tests {
     use super::*;
     use t_boost_core::explain::RefMeasure;
 
+    /// A `Factored` budget whose per-table ceiling admits the bank's largest dense main/pair
+    /// table but not its order-3 cube, so the triple must go factored. Since BUG-051 the
+    /// ceiling also covers the dense pairs that factored shedding creates, so it cannot sit
+    /// below them; sizing it from the fixture's own tables keeps the test independent of
+    /// exactly how many bins the grid builder realizes.
+    fn budget_forcing_order3_factored(model: &Model, serve: &ServeBinnedMatrix) -> TableBudget {
+        let dense = model.explain(serve, RefMeasure::Uniform).unwrap();
+        let cells = |order: usize| {
+            dense
+                .tables
+                .iter()
+                .filter(|t| t.u.order() == order)
+                .map(|t| t.values.len() as u64)
+                .max()
+                .unwrap_or(0)
+        };
+        // The default budget may already hold an order-3 support factored; its dense size is
+        // still the product of its axes' cells.
+        let cube = dense
+            .factored
+            .iter()
+            .filter(|ft| ft.u.order() == 3)
+            .map(|ft| ft.axes.iter().map(|a| u64::from(a.cells)).product::<u64>())
+            .chain(std::iter::once(cells(3)))
+            .max()
+            .unwrap_or(0);
+        let lower = cells(1).max(cells(2));
+        assert!(
+            cube > lower,
+            "the order-3 cube ({cube}) must outgrow every dense pair ({lower}) or no budget \
+             can force it factored"
+        );
+        TableBudget {
+            max_table_cells: lower,
+            max_bank_cells: 10_000,
+            on_overflow: OverflowPolicy::Factored,
+        }
+    }
+
     /// A `PyBooster` with `cat_channels=["mean","count"]` and a low
     /// `cat_min_data_per_group`/`cat_count_min_levels` so a small synthetic fixture can
     /// exercise real admission without needing thousands of rows. Built via a plain struct
@@ -2873,11 +2912,7 @@ mod cat_channels_fit_path_tests {
         // Deliberately tiny budget: forces the genuine order-3 support over budget without
         // needing thousands of real rows/levels -- explain_with_budget is the exact same
         // pipeline `Model::explain`/`.tables()` use, just with an explicit budget parameter.
-        let tiny_budget = TableBudget {
-            max_table_cells: 50,
-            max_bank_cells: 10_000,
-            on_overflow: OverflowPolicy::Factored,
-        };
+        let tiny_budget = budget_forcing_order3_factored(&model, &serve);
         let bank = model
             .explain_with_budget(&serve, RefMeasure::Uniform, tiny_budget)
             .unwrap();
@@ -3251,11 +3286,7 @@ mod cat_channels_fit_path_tests {
         )
         .unwrap();
         let serve = ServeBinnedMatrix(binned);
-        let tiny_budget = TableBudget {
-            max_table_cells: 50,
-            max_bank_cells: 10_000,
-            on_overflow: OverflowPolicy::Factored,
-        };
+        let tiny_budget = budget_forcing_order3_factored(&model, &serve);
         let bank = model
             .explain_with_budget(&serve, RefMeasure::Uniform, tiny_budget)
             .unwrap();
