@@ -41,12 +41,15 @@ cd specs/roadmap/repro/xtask-fixtures/multi  && ../../../../../target/debug/xtas
 cd specs/roadmap/repro/xtask-fixtures/single && ../../../../../target/debug/xtask check-all; echo exit=$?
 ```
 
-Findings with no script here were established from sources, not executed:
-BUG-019 (cargo-fuzz working directory) and BUG-020 (release-gate install).
+At the original 2026-10-02 verification, two findings were established from
+sources rather than execution: BUG-019 (cargo-fuzz working directory) and
+BUG-020 (release-gate install). The remediation audit also runs the fuzz targets.
 
-## When a fix lands
+## Remediation evidence
 
-Turn the relevant script into a regression test (the entry's **Acceptance
-checks** say what to cover), then delete it from here and record the fix
-revision in `bugs.md`. A harness that still reproduces its finding after the
-fix means the fix is incomplete.
+The scripts are retained as historical reproductions. Current regression tests and
+per-finding remediation evidence are linked from the
+[complete audit](../bugs.md#complete-remediation-audit--2026-10-03).
+The BUG-001 script embeds the old sampler, so its output does not test the current
+implementation. Other scripts may print the original observation without asserting
+the corrected behavior; use the linked regression tests as the completion gates.

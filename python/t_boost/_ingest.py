@@ -27,11 +27,15 @@ except ImportError:
 _CAT_MISSING = "__t_boost_missing__"
 
 
-def _cat_level(v: Any) -> str:
+def _cat_level(v: Any, *, legacy: bool = False) -> str:
     """Stringify a categorical value, mapping any missing marker to the reserved `_CAT_MISSING`."""
     if v is None:
         return _CAT_MISSING
-    if isinstance(v, float) and v != v:  # plain float NaN (np.float64 subclasses float too)
+    if isinstance(v, (np.datetime64, np.timedelta64)) and np.isnat(v):
+        return _CAT_MISSING
+    if not legacy and isinstance(v, np.generic):
+        v = v.item()
+    if isinstance(v, float) and v != v:
         return _CAT_MISSING
     if _pd_isna is not None:
         try:
@@ -39,7 +43,10 @@ def _cat_level(v: Any) -> str:
                 return _CAT_MISSING
         except (TypeError, ValueError):
             pass
-    return str(v)
+    label = str(v)
+    # Reserve the sentinel namespace for internal missingness; escape literal
+    # values in that namespace so they retain their own categorical identity.
+    return _CAT_MISSING + ":" + label if not legacy and label.startswith(_CAT_MISSING) else label
 
 
 def _polars() -> Any:
@@ -124,7 +131,7 @@ _POLARS_QUERY_MIN_ROWS = 16_384
 _POLARS_CODES_MIN_ROWS = 1024
 
 
-def _polars_cat_codes(s: Any, pl: Any) -> tuple[np.ndarray, list[str]]:
+def _polars_cat_codes(s: Any, pl: Any, *, legacy: bool = False) -> tuple[np.ndarray, list[str]]:
     """A polars categorical column as ``(codes, labels)``: row ``r``'s label is
     ``labels[codes[r]]``, exactly the label ``split_polars_columns`` gives it as a string list.
 
@@ -138,18 +145,18 @@ def _polars_cat_codes(s: Any, pl: Any) -> tuple[np.ndarray, list[str]]:
     if isinstance(dt, (pl.Categorical, pl.Enum)):
         s = s.cast(pl.String)
     elif dt != pl.String:
-        return np.arange(n, dtype=np.uint32), [_cat_level(v) for v in s.to_list()]
+        return np.arange(n, dtype=np.uint32), [_cat_level(v, legacy=legacy) for v in s.to_list()]
     if n < _POLARS_CODES_MIN_ROWS:
-        labels = [_CAT_MISSING if v is None else v for v in s.to_list()]
+        labels = [_cat_level(v, legacy=legacy) for v in s.to_list()]
         return np.arange(n, dtype=np.uint32), labels
     uniq = s.drop_nulls().unique()
-    labels = uniq.to_list() + [_CAT_MISSING]
+    labels = [_cat_level(v, legacy=legacy) for v in uniq.to_list()] + [_CAT_MISSING]
     codes = s.cast(pl.Enum(uniq)).to_physical().fill_null(len(labels) - 1)
     return np.ascontiguousarray(codes.to_numpy(), dtype=np.uint32), labels
 
 
 def split_polars_columns(
-    df: Any, cat_idx: list[int], *, coded: bool = False
+    df: Any, cat_idx: list[int], *, coded: bool = False, legacy: bool = False
 ) -> tuple[np.ndarray, Any, bool]:
     """Split an eager polars ``DataFrame`` into the native core's design inputs.
 
@@ -217,16 +224,14 @@ def split_polars_columns(
         # numeric-dtype DECLARED categoricals need the per-value path (float NaN and
         # str() formatting have no polars equivalent).
         levels: list[str]
-        if dt == pl.String:
-            levels = df[name].fill_null(_CAT_MISSING).to_list()
-        elif isinstance(dt, (pl.Categorical, pl.Enum)):
-            levels = df[name].cast(pl.String).fill_null(_CAT_MISSING).to_list()
+        if isinstance(dt, (pl.Categorical, pl.Enum)):
+            levels = [_cat_level(v, legacy=legacy) for v in df[name].cast(pl.String).to_list()]
         else:
-            levels = [_cat_level(v) for v in df[name].to_list()]
+            levels = [_cat_level(v, legacy=legacy) for v in df[name].to_list()]
         return levels
 
     if coded:
-        coded_x = [_polars_cat_codes(df.get_column(names[j]), pl) for j in cat_idx] or None
+        coded_x = [_polars_cat_codes(df.get_column(names[j]), pl, legacy=legacy) for j in cat_idx] or None
         return numeric_x, coded_x, needs_warn
     cat_x = [cat_levels(names[j]) for j in cat_idx] or None
     return numeric_x, cat_x, needs_warn

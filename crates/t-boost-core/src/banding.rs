@@ -221,7 +221,14 @@ impl Inter<'_> {
     /// The table at one merged-cell tuple.
     fn at(&self, cell: &[usize]) -> Result<f64, PbError> {
         match &self.src {
-            Src::Dense(t) => Ok(t.values.at(cell).unwrap_or(0.0)),
+            Src::Dense(t) => {
+                let coord = cell
+                    .iter()
+                    .zip(&t.axes)
+                    .map(|(&c, axis)| axis.coord(c as u32).ok_or_else(|| oob("existing band map")))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok(t.values.at(&coord).unwrap_or(0.0))
+            }
             Src::Boxes(boxes) => {
                 let mut acc = 0.0;
                 for (p, low) in boxes {
@@ -248,18 +255,17 @@ impl Inter<'_> {
         let total: usize = nb.iter().product();
         let mut out = vec![0.0; total];
         match &self.src {
-            Src::Dense(t) => {
-                let vals = t.values.values();
+            Src::Dense(_) => {
                 let k = self.order();
                 let mut coord = vec![0usize; k];
-                for v in vals.iter() {
+                for _ in 0..self.n.iter().product::<usize>() {
                     let mut p = 1.0;
                     let mut flat = 0usize;
                     for (((&c, md), bd), &nbd) in coord.iter().zip(m).zip(band).zip(nb) {
                         p *= ix(md, c, "prior measure")?;
                         flat = flat * nbd + ix(bd, c, "prior band")? as usize;
                     }
-                    *ix_mut(&mut out, flat, "prior block")? += p * v;
+                    *ix_mut(&mut out, flat, "prior block")? += p * self.at(&coord)?;
                     step(&mut coord, &self.n);
                 }
             }
@@ -1766,6 +1772,11 @@ pub(crate) fn repurify_bank_under_with(
     let mut work: BTreeMap<FeatureSet, Banded> = BTreeMap::new();
     let mut support: BTreeMap<FeatureSet, Banded> = BTreeMap::new();
     let mut tpl: BTreeMap<FeatureSet, Vec<AxisId>> = BTreeMap::new();
+    let axis_templates: BTreeMap<crate::data::FeatureId, AxisId> = bank
+        .tables
+        .iter()
+        .flat_map(|t| t.axes.iter().map(|a| (a.raw, a.clone())))
+        .collect();
     for t in &bank.tables {
         let raws: Vec<usize> = t.u.0.iter().map(|f| f.0 as usize).collect();
         let band: Vec<Vec<u32>> = t
@@ -1803,7 +1814,20 @@ pub(crate) fn repurify_bank_under_with(
     out.tables = work
         .into_values()
         .map(|b| {
-            let axes0 = tpl.get(&b.u).cloned().unwrap_or_default();
+            let axes0 = match tpl.get(&b.u) {
+                Some(axes) => axes.clone(),
+                None => {
+                    b.u.0
+                        .iter()
+                        .map(|raw| {
+                            axis_templates
+                                .get(raw)
+                                .cloned()
+                                .ok_or_else(|| oob("recreated effect axis"))
+                        })
+                        .collect::<Result<_, _>>()?
+                }
+            };
             let sup = match support.get(&b.u) {
                 Some(s) => {
                     if s.nb == b.nb && s.band == b.band {
@@ -1814,7 +1838,19 @@ pub(crate) fn repurify_bank_under_with(
                 }
                 None => vec![0.0; b.vals.len()],
             };
-            emit_table(b, &axes0, &ncell, &m, sup)
+            let mut table = emit_table(b, &axes0, &ncell, &m, sup)?;
+            if !support.contains_key(&table.u) {
+                // Different parents may refine a child's band grid. Project onto
+                // the emitted grid, never onto an arbitrary parent's template.
+                if let Some(mass) = crate::explain::support_for_axes(&bank.tables, &table.axes)? {
+                    table.support = mass;
+                } else if marginals.is_none() {
+                    return Err(PbError::InvalidInput {
+                        what: "recreated band support requires aligned rows and mass".into(),
+                    });
+                }
+            }
+            Ok(table)
         })
         .collect::<Result<_, _>>()?;
     Ok(out)

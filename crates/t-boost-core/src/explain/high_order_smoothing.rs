@@ -248,6 +248,7 @@ mod tests {
             merged_grids: vec![],
             w: RefMeasure::Uniform,
             factored: vec![effect],
+            joint_variance: None,
         }
     }
 

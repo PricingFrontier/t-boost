@@ -137,10 +137,10 @@ pub enum NesterovSpec {
     Off,
     /// AGBM-style look-ahead boosting with optional momentum correction.
     ///
-    /// 2026-07-11 (§C3): the lookahead score is maintained incrementally (an O(n) affine blend
-    /// of two maintained score vectors) instead of a full O(n·T) ensemble re-walk every round;
-    /// this reorders AGBM's f32 accumulation and so changes its fitted numbers from the prior
-    /// implementation. Opt-in/experimental booster — no default-path or other-booster impact.
+    /// Lookahead and round-boundary scores are reconstructed from the stored leaves
+    /// and coefficients in f64, then rounded once. This costs O(n·T) per round and
+    /// preserves small updates at large intercepts; fitted numbers can differ from
+    /// the former incremental f32 score-cache implementation.
     Agbm {
         /// Whether to fit the second correction tree per accelerated step.
         momentum_correction: bool,
@@ -357,10 +357,9 @@ impl HpGrid {
 
 /// DART tree-dropout configuration (§09.6).
 ///
-/// 2026-07-11 (§C3): post-round raw is reconstructed incrementally (touching only the dropped
-/// trees plus the new one, O(n·(#dropped+1))) instead of a full O(n·T) ensemble re-walk every
-/// round; this reorders DART's f32 accumulation and so changes its fitted numbers from the
-/// prior implementation. Opt-in/experimental booster — no default-path or other-booster impact.
+/// Dropout and round-boundary scores are reconstructed from retained trees in f64,
+/// then rounded once. This costs O(n·T) per round and preserves small updates at
+/// large intercepts; fitted numbers can differ from the former incremental score cache.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DartSpec {
     /// Probability of dropping a prior tree for the current round.

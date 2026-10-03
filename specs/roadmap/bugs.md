@@ -4,15 +4,16 @@ This document records 64 confirmed findings from four codebase review passes on
 2026-10-02. The second pass added BUG-022 through BUG-038 (17 new findings); the
 third added BUG-039 through BUG-053 (15 new findings). The fourth added BUG-054
 through BUG-064 (11 new findings) and another reproduction for BUG-024.
-It is a backlog for fixes, not a record of completed remediation. This is not a
-guarantee that all bugs have been identified.
+The original findings and reproductions are preserved as historical evidence.
+Current remediation is recorded in the [complete audit](#complete-remediation-audit--2026-10-03).
+This is not a guarantee that all bugs have been identified.
 
-- **Reviewed revision:** `6588084a35615677b9ca851169050ee4e12ad1f1`.
+- **Original reviewed revision:** `6588084a35615677b9ca851169050ee4e12ad1f1`.
 - **Reviewed package version:** `0.6.1`.
-- **Status:** all findings are open at the time of writing. All 64 were
-  independently re-verified on 2026-10-02 against the same revision; see
-  [Verification pass](#verification-pass) for the outcome, the corrections it
-  produced, and the per-finding verdicts in the index below.
+- **Status:** all 64 findings are fixed and verified in the `bug-fixing` working
+  tree as of 2026-10-03. The 2026-10-02
+  [verification pass](#verification-pass) records the original defects; the
+  [2026-10-03 audit](#complete-remediation-audit--2026-10-03) records their fixes.
 - **Scope:** Rust training, data preparation, table decomposition and serving,
   serialization, Python bindings and estimators, development tooling, and CI.
 - **Evidence:** runtime reproductions unless stated otherwise. BUG-001 was tested
@@ -22,6 +23,133 @@ guarantee that all bugs have been identified.
 - **Source references:** line numbers refer to the reviewed revision and may move
   as fixes land. Reproduction inputs and observed outputs are preserved below so
   this document does not depend on temporary review files.
+
+## Follow-up remediation — 2026-10-03
+
+Revision: uncommitted working tree on `bug-fixing`. A review of the initial fixes
+found five remaining issues; the follow-up changes and regression coverage are:
+
+| Finding | Follow-up fix | Regression coverage |
+| --- | --- | --- |
+| BUG-024 compatibility | Preserve legacy categorical stringification when loading schema-v2 estimators, including re-saving; new fits use the corrected encoding. Envelope schema 4 records the encoding version. | Numeric pandas and reserved-string Polars categories; regressor/classifier; bytes, JSON and pickle; multiple prediction batch sizes and refitting. |
+| BUG-040 optional boosters | Keep precise appended scores through ridge refits; reconstruct DART/AGBM scores from retained leaves and coefficients before gradients and validation. | Large-intercept DART/ridge fits with and without validation; per-round gradient scores compared with the retained tree ensemble. |
+| BUG-064 weighted joint export | Reuse retained fit-time weight/exposure for joint exports; loaded weighted estimators require explicit mass. The native export rejects implicit unit mass that changes stored support. | Regressor/classifier with weight or exposure; implicit versus explicit exports, support totals, bytes/JSON reloads. |
+| BUG-063 retained support | Recover missing lower-order support and empirical marginals by summing compatible higher-order support, including banded subsets; request aligned rows/mass when stored support cannot recover them. | Pair-only weighted banks compared with explicit recentering; serialization round trip; banded recreated-main support totals. |
+| BUG-004 categorical performance | Maintain category moments in a deterministic index instead of unconditionally rescanning every category for every ordered/LOO row; Auto smoothing prunes credible-tail queries. | Indexed versus rescanned priors across updates/exclusions; a 32,768-level query checks pruning; existing leakage regressions. |
+
+Training numerics and newly written estimator envelopes deliberately change.
+DART/AGBM now pay an O(rows × trees) reconstruction cost per round to preserve
+the actual retained score. Plain boosting keeps its incremental f64 accumulator.
+The local 32,000-level LOO benchmark fell from approximately 2.66 s to 0.14 s;
+these are illustrative local timings, not a CI timing threshold.
+
+Verification: 640 Python tests, 607 standard Rust tests, and all 14 slow Rust
+integration tests passed. Formatting,
+Clippy (all targets/features, warnings denied), `xtask check-all`, documentation
+tests, strict mypy, native stubtest, and the two-process byte-reproducibility check
+passed. The historical index and reproductions remain the record of the original
+64 findings.
+
+## Complete remediation audit — 2026-10-03
+
+Scope: all 64 entries, reviewed against their original causes, reproduction inputs,
+and acceptance checks in the uncommitted `bug-fixing` working tree. Regression
+coverage calls the current production implementation; the historical BUG-001
+script contains an extracted old sampler and is not a closure test.
+
+This pass found and fixed three remaining gaps: legacy envelopes still lost large
+unsigned class labels (BUG-025); sparse-weight bags could leave a zero-mass
+training or validation partition (BUG-049); and the pinned cargo-fuzz installer
+needed the stable toolchain (BUG-019). Running the repaired fuzz command also
+found malformed binary string and feature-set lengths that attempted multi-gigabyte
+allocations. Binary decoders now use an input-size-dependent budget, and feature
+sets decode through a visitor that caps its initial reservation. Both inputs have
+regressions. Wire encoding is unchanged by these decoder protections.
+
+Several regression checks now assert results that the original harnesses only
+printed: successful missing-value fitting, actual adjacent-float predictions,
+independent multiclass pruning loss, malformed high-order rejection, cache
+compatibility, table-budget error variants, and reconstructed-bag variance.
+Categorical exports are additionally scored from export metadata alone.
+
+Final validation: **669 Python tests, 610 standard Rust core tests, all 14 slow
+Rust integration tests, one Rust doc test, and all 10 xtask tests passed**.
+Formatting, Clippy with warnings denied, `xtask check-all`, strict mypy, native
+stubtest, two-process byte-reproducibility, actionlint, and both nightly fuzz
+smoke runs passed. Python tests used a rebuilt native extension containing the
+final fixes. The deserialization smoke loaded all three dictionary entries and
+ran 272,803 inputs; the binning smoke ran 153,410 inputs.
+
+BUG-020 is verified by source assertions and workflow lint. GitHub Actions and the
+remote platform matrix have not been executed by this audit. Training numerics
+and new estimator envelope bytes deliberately change as described above.
+
+| Finding | Verdict | Verification evidence |
+| --- | --- | --- |
+| [BUG-001](#bug-001) | Fixed | [Scalar and multiclass MVS estimates match population totals across seeds.](../../crates/t-boost-core/src/engine/boost.rs) |
+| [BUG-002](#bug-002) | Fixed | [Failed classifier/regressor refits preserve complete state and column alignment.](../../python/tests/test_bug_regressions.py) |
+| [BUG-003](#bug-003) | Fixed | [Multiclass categorical encoders exclude holdout labels across channels and bags.](../../python/tests/test_bug_regressions.py) |
+| [BUG-004](#bug-004) | Fixed | [Own-target invariance for K-fold, LOO and ordered smoothing; indexed-prior equivalence.](../../crates/t-boost-core/tests/roadmap/bug004.rs) |
+| [BUG-005](#bug-005) | Fixed | [Missing-versus-present data fits successfully and learns the split.](../../crates/t-boost-core/tests/roadmap/bug005.rs) |
+| [BUG-006](#bug-006) | Fixed | [Adjacent float32 values stay separated and produce distinct predictions.](../../crates/t-boost-core/tests/roadmap/bug006.rs) |
+| [BUG-007](#bug-007) | Fixed | [Multiclass pruning loss agrees with independently computed cross-entropy.](../../crates/t-boost-core/tests/roadmap/bug007.rs) |
+| [BUG-008](#bug-008) | Fixed | [Binary pruning intercept satisfies weighted response balance.](../../python/tests/test_bug_regressions.py) |
+| [BUG-009](#bug-009) | Fixed | [Extreme component exports reconstruct predictions without hidden clipping.](../../crates/t-boost-core/tests/roadmap/bug009.rs) |
+| [BUG-010](#bug-010) | Fixed | [Legacy scalar/multiclass table JSON retains predictions; future versions fail.](../../crates/t-boost-core/tests/roadmap/bug010.rs) |
+| [BUG-011](#bug-011) | Fixed | [JSON dispatch follows the discriminator despite misleading feature names.](../../python/tests/test_bug_regressions.py) |
+| [BUG-012](#bug-012) | Fixed | [Malformed factored orders return errors without panicking.](../../crates/t-boost-core/tests/roadmap/bug012.rs) |
+| [BUG-013](#bug-013) | Fixed | [Nonfinite factored coefficients are rejected.](../../crates/t-boost-core/tests/roadmap/bug013.rs) |
+| [BUG-014](#bug-014) | Fixed | [Empty scalar and multiclass bagged fits return typed errors.](../../crates/t-boost-core/tests/roadmap/input_validation.rs) |
+| [BUG-015](#bug-015) | Fixed | [Merged aliases resolve through set_params.](../../python/tests/test_bug_regressions.py) |
+| [BUG-016](#bug-016) | Fixed | [Objective aliases retain correct link and exposure reporting semantics.](../../python/tests/test_bug_regressions.py) |
+| [BUG-017](#bug-017) | Fixed | [Binary A/E aggregates encoded positive labels.](../../python/tests/test_bug_regressions.py) |
+| [BUG-018](#bug-018) | Fixed | [Pruning reports retain deployed factored effects.](../../python/tests/test_bug_regressions.py) |
+| [BUG-019](#bug-019) | Fixed | [Dictionary path resolves; stable cargo-fuzz installation and nightly smoke run.](../../python/tests/test_workflow_regressions.py) |
+| [BUG-020](#bug-020) | Fixed | [Release smoke explicitly installs the locally built wheel; workflow lint.](../../python/tests/test_workflow_regressions.py) |
+| [BUG-021](#bug-021) | Fixed | [Single-line and multiline derives enforce serialized-field gates.](../../xtask/src/main.rs) |
+| [BUG-022](#bug-022) | Fixed | [Serving completes in forked children after parent pool initialization.](../../python/tests/test_bug_regressions.py) |
+| [BUG-023](#bug-023) | Fixed | [All multiclass serving paths use the requested pool and validate its width.](../../python/tests/test_bug_regressions.py) |
+| [BUG-024](#bug-024) | Fixed | [Category identity survives containers, batch sizes, optional pandas and legacy reloads.](../../python/tests/test_bug_regressions.py) |
+| [BUG-025](#bug-025) | Fixed | [Large unsigned labels survive binary/multiclass bytes, JSON, pickle and legacy envelopes.](../../python/tests/test_bug_regressions.py) |
+| [BUG-026](#bug-026) | Fixed | [Runtime-only classification rejects NaN/infinite labels.](../../python/tests/test_bug_regressions.py) |
+| [BUG-027](#bug-027) | Fixed | [Loaded partial-mass exports require the missing weight/exposure information.](../../python/tests/test_bug_regressions.py) |
+| [BUG-028](#bug-028) | Fixed | [Empty categorical-index lists mean no categorical columns.](../../python/tests/test_bug_regressions.py) |
+| [BUG-029](#bug-029) | Fixed | [No-argument set_params preserves the fitted model.](../../python/tests/test_bug_regressions.py) |
+| [BUG-030](#bug-030) | Fixed | [Repeated banding respects the existing band maps and predictions.](../../python/tests/test_bug_regressions.py) |
+| [BUG-031](#bug-031) | Fixed | [Stale CellMaps reject changed dependencies; valid cached and uncached results agree.](../../crates/t-boost-core/tests/roadmap/bug031.rs) |
+| [BUG-032](#bug-032) | Fixed | [Banded interaction recentering preserves templates for recreated main effects.](../../crates/t-boost-core/tests/roadmap/bug032.rs) |
+| [BUG-033](#bug-033) | Fixed | [Loading rejects mismatched feature-set/axis identities.](../../crates/t-boost-core/tests/roadmap/bug033.rs) |
+| [BUG-034](#bug-034) | Fixed | [Gamma/Tweedie exposure intercepts satisfy their objective gradients.](../../python/tests/test_bug_regressions.py) |
+| [BUG-035](#bug-035) | Fixed | [AGBM plus periodic ridge refits preserves retained-ensemble scores.](../../crates/t-boost-core/tests/roadmap/bug035.rs) |
+| [BUG-036](#bug-036) | Fixed | [Bootstrap copies remain on one side of validation; both bags are checked.](../../crates/t-boost-core/tests/roadmap/bug036.rs) |
+| [BUG-037](#bug-037) | Fixed | [Short/long fixed-holdout masks return errors before indexing.](../../crates/t-boost-core/tests/roadmap/input_validation.rs) |
+| [BUG-038](#bug-038) | Fixed | [Scalar/multiclass fitting rejects invalid weights.](../../crates/t-boost-core/tests/roadmap/input_validation.rs) |
+| [BUG-039](#bug-039) | Fixed | [Zero-weight uninformative features do not abort valid fits.](../../python/tests/test_bug_regressions.py) |
+| [BUG-040](#bug-040) | Fixed | [Large-intercept training retains small updates in plain, DART, AGBM and ridge paths.](../../crates/t-boost-core/tests/roadmap/bug040.rs) |
+| [BUG-041](#bug-041) | Fixed | [Pricing labels match the merged grid used for A/E aggregation.](../../python/tests/test_bug_regressions.py) |
+| [BUG-042](#bug-042) | Fixed | [Multiclass contribution frames support intercept-only classes.](../../python/tests/test_bug_regressions.py) |
+| [BUG-043](#bug-043) | Fixed | [Gini ties are neutral and invariant to row permutations.](../../python/tests/test_bug_regressions.py) |
+| [BUG-044](#bug-044) | Fixed | [Export-only category routing reproduces native scores for rare, unseen and missing levels.](../../python/tests/test_bug_regressions.py) |
+| [BUG-045](#bug-045) | Fixed | [Deviance metrics reject nonfinite data, weights and Tweedie power.](../../python/tests/test_bug_regressions.py) |
+| [BUG-046](#bug-046) | Fixed | [Negative expected totals produce valid A/E ratios.](../../python/tests/test_bug_regressions.py) |
+| [BUG-047](#bug-047) | Fixed | [Empty A/E batches return empty aggregates.](../../python/tests/test_bug_regressions.py) |
+| [BUG-048](#bug-048) | Fixed | [OOB cell correction preserves monotonicity or returns a configuration error.](../../crates/t-boost-core/tests/roadmap/bug048.rs) |
+| [BUG-049](#bug-049) | Fixed | [Sparse-weight bags fit across seeds, bootstrap/subsampling and validation; explicit holdouts stay honest.](../../python/tests/test_bug_regressions.py) |
+| [BUG-050](#bug-050) | Fixed | [Cell-refit guard partitions preserve declared groups.](../../crates/t-boost-core/tests/roadmap/bug050.rs) |
+| [BUG-051](#bug-051) | Fixed | [Purification, sparse promotion and factored shedding respect the table budget.](../../crates/t-boost-core/tests/roadmap/bug051.rs) |
+| [BUG-052](#bug-052) | Fixed | [Exactness checks use the weighted bank's reference mass.](../../crates/t-boost-core/tests/roadmap/bug052.rs) |
+| [BUG-053](#bug-053) | Fixed | [Variance certification remains stable under large intercept translation.](../../crates/t-boost-core/tests/roadmap/bug053.rs) |
+| [BUG-054](#bug-054) | Fixed | [Incremental Poisson updates retain raw scores beyond the exponent clamp.](../../python/tests/test_bug_regressions.py) |
+| [BUG-055](#bug-055) | Fixed | [Runtime-only score rejects incompatible target shapes and handles singleton input.](../../python/tests/test_bug_regressions.py) |
+| [BUG-056](#bug-056) | Fixed | [Binary A/E includes the training logit exposure offset.](../../python/tests/test_bug_regressions.py) |
+| [BUG-057](#bug-057) | Fixed | [Literal missing-sentinel categories remain distinct or are explicitly rejected.](../../python/tests/test_bug_regressions.py) |
+| [BUG-058](#bug-058) | Fixed | [Envelope metadata inconsistent with native model state is rejected.](../../python/tests/test_bug_regressions.py) |
+| [BUG-059](#bug-059) | Fixed | [Runtime-only repr supports NumPy-valued parameters.](../../python/tests/test_bug_regressions.py) |
+| [BUG-060](#bug-060) | Fixed | [Reconstructed bags use their own intercepts; OOB variance changes as expected.](../../crates/t-boost-core/tests/roadmap/bug060.rs) |
+| [BUG-061](#bug-061) | Fixed | [Extreme binary intercept reanchoring reaches weighted class balance.](../../crates/t-boost-core/tests/roadmap/bug061.rs) |
+| [BUG-062](#bug-062) | Fixed | [Recreated high-order categorical effects retain categorical export identity.](../../crates/t-boost-core/tests/roadmap/bug062.rs) |
+| [BUG-063](#bug-063) | Fixed | [Recreated main effects recover weighted support, including banded/higher-order sources.](../../crates/t-boost-core/tests/roadmap/bug063.rs) |
+| [BUG-064](#bug-064) | Fixed | [Joint variance shares use total model variance and preserve or require fit-time mass.](../../crates/t-boost-core/tests/roadmap/bug064.rs) |
 
 ## Priorities and index
 
@@ -287,7 +415,7 @@ checked in under [repro/](repro/README.md) as runnable scripts
 <a id="bug-001"></a>
 ## BUG-001 — MVS importance weights do not match the sampling distribution
 
-**Priority:** P1. **Status:** Open.
+**Priority:** P1. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:5404](../../crates/t-boost-core/src/engine/boost.rs#L5404);
 the multiclass implementation repeats the calculation around
@@ -348,7 +476,7 @@ justified tolerance. Preserve byte determinism across thread counts.
 <a id="bug-002"></a>
 ## BUG-002 — Failed refits preserve models with corrupted metadata
 
-**Priority:** P1. **Status:** Open.
+**Priority:** P1. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [_clear_stale_fit_state, sklearn.py:2237](../../python/t_boost/sklearn.py#L2237)
 and [classifier fit, line 7898](../../python/t_boost/sklearn.py#L7898).
@@ -399,7 +527,7 @@ name alignment, fitted-state detection, and serialization after each failure.
 <a id="bug-003"></a>
 ## BUG-003 — Multiclass categorical encoders see early-stopping holdout labels
 
-**Priority:** P1. **Status:** Open.
+**Priority:** P1. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [fit_multiclass_owned_bagged, lib.rs:7583](../../crates/t-boost-py/src/lib.rs#L7583).
 The holdout-aware binning API is documented in
@@ -457,7 +585,7 @@ are legitimately allowed to affect that decision.
 <a id="bug-004"></a>
 ## BUG-004 — Cross-fitted categorical encodings leak targets through their prior
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [cat.rs:1036](../../crates/t-boost-core/src/cat.rs#L1036),
 [global smoothing resolution, line 1045](../../crates/t-boost-core/src/cat.rs#L1045),
@@ -498,7 +626,7 @@ exposure. Preserve intended serve-map fitting on the full permitted training set
 <a id="bug-005"></a>
 ## BUG-005 — Missing-versus-present signals cannot produce a split
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [split.rs:2266](../../crates/t-boost-core/src/engine/split.rs#L2266),
 [shared scanner, line 1077](../../crates/t-boost-core/src/engine/split.rs#L1077),
@@ -542,7 +670,7 @@ and prediction/decomposition agreement for the new split representation.
 <a id="bug-006"></a>
 ## BUG-006 — Numeric midpoint rounding merges distinct float32 values
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [data/grid.rs:138](../../crates/t-boost-core/src/data/grid.rs#L138).
 The corresponding numeric refill logic should be audited with the same rule.
@@ -581,7 +709,7 @@ construction and refill paths. Assert separation and strict border ordering.
 <a id="bug-007"></a>
 ## BUG-007 — Multiclass pruning normalizes fold loss twice
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [prune.rs:2933](../../crates/t-boost-core/src/prune.rs#L2933).
 
@@ -630,7 +758,7 @@ a direct weighted cross-entropy calculation.
 <a id="bug-008"></a>
 ## BUG-008 — Binary pruning guard uses a log-link intercept correction
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [_guard_reanchor, sklearn.py:836](../../python/t_boost/sklearn.py#L836).
 Compare the logit bisection at
@@ -679,7 +807,7 @@ the disabled-reanchor path unchanged. Add an artifact-versus-guard comparison.
 <a id="bug-009"></a>
 ## BUG-009 — Clipped component relativities fail to reconstruct predictions
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [serialize.rs:1351](../../crates/t-boost-core/src/serialize.rs#L1351).
 `RatingTable::relativities` is documented as `exp(value)` around line 1046.
@@ -719,7 +847,7 @@ export-based scoring with the deployed model within its documented tolerance.
 <a id="bug-010"></a>
 ## BUG-010 — Pre-v7 table JSON fails the version gate
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [decode_tables_json, serialize.rs:708](../../crates/t-boost-core/src/serialize.rs#L708)
 and [multiclass table JSON decoding, line 874](../../crates/t-boost-core/src/serialize.rs#L874).
@@ -766,7 +894,7 @@ reject future versions, mislabeled newer features, and unsupported old binaries.
 <a id="bug-011"></a>
 ## BUG-011 — Feature names can change JSON decoder selection
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [_unpack_json, sklearn.py:1397](../../python/t_boost/sklearn.py#L1397).
 Related loader branches also detect table formats by searching the payload text.
@@ -811,7 +939,7 @@ raw JSON and estimator envelopes, including stale outer kind metadata.
 <a id="bug-012"></a>
 ## BUG-012 — Unbounded factored order panics during model loading
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [FactoredEffect::validate_shape, explain.rs:2682](../../crates/t-boost-core/src/explain.rs#L2682).
 
@@ -852,7 +980,7 @@ binary loaders and add the malformed cases to the deserialization fuzz corpus.
 <a id="bug-013"></a>
 ## BUG-013 — Nonfinite factored coefficients pass validation
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [table_model.rs:240](../../crates/t-boost-core/src/table_model.rs#L240)
 and [FactoredEffect::validate_shape, explain.rs:2671](../../crates/t-boost-core/src/explain.rs#L2671).
@@ -898,7 +1026,7 @@ predictions and round-trip behavior. Add binary corruption seeds to fuzzing.
 <a id="bug-014"></a>
 ## BUG-014 — Empty bagged fits panic
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [scalar outer bags, boost.rs:2790](../../crates/t-boost-core/src/engine/boost.rs#L2790)
 and [multiclass bags, line 1494](../../crates/t-boost-core/src/engine/boost.rs#L1494).
@@ -939,7 +1067,7 @@ typed errors rather than panics while preserving valid singleton behavior.
 <a id="bug-015"></a>
 ## BUG-015 — Merged parameter aliases fail through `set_params`
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [set_params, sklearn.py:2201](../../python/t_boost/sklearn.py#L2201);
 constructor-only alias resolution is immediately above it, around lines 2165–2199.
@@ -982,7 +1110,7 @@ configuration, and model equivalence for equivalent spellings.
 <a id="bug-016"></a>
 ## BUG-016 — Objective aliases produce wrong explanation and reporting semantics
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [link property, sklearn.py:5312](../../python/t_boost/sklearn.py#L5312)
 and [_expected_response, line 6418](../../python/t_boost/sklearn.py#L6418).
@@ -1034,7 +1162,7 @@ other Python objective-dependent branches for the same literal-comparison issue.
 <a id="bug-017"></a>
 ## BUG-017 — Binary A/E reports sum class labels
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [actual_vs_expected, sklearn.py:3158](../../python/t_boost/sklearn.py#L3158)
 and [actual aggregation, line 3184](../../python/t_boost/sklearn.py#L3184).
@@ -1073,7 +1201,7 @@ and the dependent `pricing_report` path.
 <a id="bug-018"></a>
 ## BUG-018 — Deployed factored effects are reported as absent
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [_TableModel.deployed_supports, lib.rs:5632](../../crates/t-boost-py/src/lib.rs#L5632)
 and [report reconciliation, sklearn.py:4579](../../python/t_boost/sklearn.py#L4579).
@@ -1133,7 +1261,7 @@ support can still appear in `kept_not_deployed` and that count APIs stay consist
 <a id="bug-019"></a>
 ## BUG-019 — Fuzz workflow uses the wrong dictionary path
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [.github/workflows/fuzz.yml:30](../../.github/workflows/fuzz.yml#L30).
 The dictionary is [fuzz/fuzz_targets/fuzz_deserialize.dict](../../fuzz/fuzz_targets/fuzz_deserialize.dict).
@@ -1185,7 +1313,7 @@ build/run steps if useful for diagnosing future path drift.
 <a id="bug-020"></a>
 ## BUG-020 — Release Gate can smoke-test a published package instead of its artifact
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [.github/workflows/release-gate.yml:212](../../.github/workflows/release-gate.yml#L212).
 
@@ -1234,7 +1362,7 @@ when no suitable built wheel exists. Check platform-specific wheel selection.
 <a id="bug-021"></a>
 ## BUG-021 — Multiline derives bypass serialized-field gates
 
-**Priority:** P3. **Status:** Open.
+**Priority:** P3. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [xtask/src/main.rs:1170](../../xtask/src/main.rs#L1170).
 
@@ -1281,7 +1409,7 @@ test-module exclusions must continue to work.
 <a id="bug-022"></a>
 ## BUG-022 — Forked workers inherit a serving pool whose threads no longer exist
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [run_on_pool, lib.rs:7037](../../crates/t-boost-py/src/lib.rs#L7037) and
 [serve_pool, line 7054](../../crates/t-boost-py/src/lib.rs#L7054).
@@ -1360,7 +1488,7 @@ indefinitely. Unsupported combinations must fail promptly and clearly.
 <a id="bug-023"></a>
 ## BUG-023 — Multiclass prediction ignores the estimator's thread budget
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [predict_proba, sklearn.py:8214](../../python/t_boost/sklearn.py#L8214),
 [decision_function, line 8245](../../python/t_boost/sklearn.py#L8245), and [multiclass
@@ -1428,7 +1556,7 @@ supported thread counts.
 <a id="bug-024"></a>
 ## BUG-024 — Categorical identities change across containers and optional pandas availability
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/_ingest.py:30](../../python/t_boost/_ingest.py#L30);
 [python/t_boost/sklearn.py:1480](../../python/t_boost/sklearn.py#L1480);
@@ -1559,7 +1687,7 @@ Every row in every batch is the same original float32 category 0.2. Bulk scoring
 <a id="bug-025"></a>
 ## BUG-025 — Classifier serialization corrupts large unsigned integer labels
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/sklearn.py:1260](../../python/t_boost/sklearn.py#L1260);
 [python/t_boost/sklearn.py:1348](../../python/t_boost/sklearn.py#L1348).
@@ -1608,7 +1736,7 @@ numeric/string/bool labels and older envelopes.
 <a id="bug-026"></a>
 ## BUG-026 — Runtime-only classifier accepts NaN and infinite class labels
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/_compat.py:104](../../python/t_boost/_compat.py#L104);
 [python/t_boost/sklearn.py:7887](../../python/t_boost/sklearn.py#L7887).
@@ -1659,7 +1787,7 @@ supported.
 <a id="bug-027"></a>
 ## BUG-027 — Loaded estimators silently drop the unspecified half of table export mass
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/sklearn.py:3004](../../python/t_boost/sklearn.py#L3004);
 [python/t_boost/sklearn.py:1230](../../python/t_boost/sklearn.py#L1230);
@@ -1716,7 +1844,7 @@ reuse of misaligned masses.
 <a id="bug-028"></a>
 ## BUG-028 — Empty categorical index lists are misclassified as Boolean masks
 
-**Priority:** P3. **Status:** Open.
+**Priority:** P3. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/sklearn.py:2909](../../python/t_boost/sklearn.py#L2909).
 
@@ -1748,7 +1876,7 @@ Reject nonempty incorrectly sized masks.
 <a id="bug-029"></a>
 ## BUG-029 — No-argument set_params discards a fitted model
 
-**Priority:** P3. **Status:** Open.
+**Priority:** P3. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/sklearn.py:2201](../../python/t_boost/sklearn.py#L2201).
 
@@ -1784,7 +1912,7 @@ installed and blocked. Confirm actual updates still invalidate state as intended
 <a id="bug-030"></a>
 ## BUG-030 — Re-banding a banded model ignores its existing band maps
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [crates/t-boost-core/src/banding.rs:224](../../crates/t-boost-core/src/banding.rs#L224);
@@ -1851,7 +1979,7 @@ oracle.
 <a id="bug-031"></a>
 ## BUG-031 — Cached CellMaps omit dependencies from compatibility checking
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [crates/t-boost-core/src/table_model.rs:445](../../crates/t-boost-core/src/table_model.rs#L445);
@@ -1929,7 +2057,7 @@ that share the complete mapping inputs.
 <a id="bug-032"></a>
 ## BUG-032 — Recentring a banded interaction-only bank loses axis templates for recreated mains
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [crates/t-boost-core/src/banding.rs:1795](../../crates/t-boost-core/src/banding.rs#L1795);
@@ -1986,7 +2114,7 @@ higher-order banded effect as well.
 <a id="bug-033"></a>
 ## BUG-033 — Model loading accepts mismatched feature-set/axis identities and misattributes effects
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [crates/t-boost-core/src/table_model.rs:199](../../crates/t-boost-core/src/table_model.rs#L199);
@@ -2065,7 +2193,7 @@ claim that ordinary fits create inconsistent metadata themselves.
 <a id="bug-034"></a>
 ## BUG-034 — Gamma/Tweedie exposure initialization uses the Poisson optimum
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [loss.rs:373](../../crates/t-boost-core/src/loss.rs#L373), especially the
 accumulation at lines 392–393; [Gamma::init_score, line
@@ -2138,7 +2266,7 @@ problem.
 <a id="bug-035"></a>
 ## BUG-035 — Periodic ridge refits desynchronize AGBM's score cache from its trees
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:895](../../crates/t-boost-core/src/engine/boost.rs#L895),
 [previous-score capture at line
@@ -2197,8 +2325,9 @@ control without refits, exposure offsets, and cross-thread determinism.
 <a id="bug-036"></a>
 ## BUG-036 — Bootstrap copies cross the early-stopping train/validation boundary
 
-**Priority:** P2. **Status:** Open — **reclassified on verification as a documented
-limitation**, see below.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
+The original verification reclassified this as a documented limitation; the
+remediation now keeps bootstrap copies together across the validation boundary.
 
 **Source:** [engine/boost.rs:2897](../../crates/t-boost-core/src/engine/boost.rs#L2897),
 the bag-local fit specification at [line
@@ -2267,7 +2396,7 @@ pre-specified holdouts, group sampling, and the unchanged subagging control.
 <a id="bug-037"></a>
 ## BUG-037 — Bagged core fitting panics on a short fixed-holdout mask
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:2829](../../crates/t-boost-core/src/engine/boost.rs#L2829),
 [multiclass line 1514](../../crates/t-boost-core/src/engine/boost.rs#L1514); the scalar
@@ -2313,7 +2442,7 @@ retain their documented behavior; all-true masks should fail cleanly.
 <a id="bug-038"></a>
 ## BUG-038 — Core multiclass fitting silently accepts invalid sample weights
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:2418](../../crates/t-boost-core/src/engine/boost.rs#L2418)
 (`multiclass_init`), [line 2496](../../crates/t-boost-core/src/engine/boost.rs#L2496)
@@ -2669,7 +2798,7 @@ fn main() {
 <a id="bug-039"></a>
 ## BUG-039 — An uninformative weighted feature can abort an otherwise valid fit
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [data/grid.rs:44](../../crates/t-boost-core/src/data/grid.rs#L44), the
 quantile construction branches at [lines
@@ -2750,7 +2879,7 @@ error.
 <a id="bug-040"></a>
 ## BUG-040 — Small updates disappear from training scores but accumulate in deployed tables
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:696](../../crates/t-boost-core/src/engine/boost.rs#L696)
 initializes the raw training scores as `f32`;
@@ -2833,7 +2962,7 @@ should not repeatedly accumulate a correction that was lost only in the training
 <a id="bug-041"></a>
 ## BUG-041 — Pricing reports label merged-grid A/E aggregates with an interaction's compressed axis
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [sklearn.py:3219](../../python/t_boost/sklearn.py#L3219) overwrites the axis
 per feature; [line 3223](../../python/t_boost/sklearn.py#L3223) attaches it to the A/E
@@ -2899,7 +3028,7 @@ inputs, and loaded models. Unused/no-table features need an explicit axis contra
 <a id="bug-042"></a>
 ## BUG-042 — Multiclass contribution DataFrames crash when one class has only an intercept
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [sklearn.py:5491](../../python/t_boost/sklearn.py#L5491) constructs
 per-class frames; [line 5494](../../python/t_boost/sklearn.py#L5494) makes empty class
@@ -2954,7 +3083,7 @@ models.
 <a id="bug-043"></a>
 ## BUG-043 — Gini awards arbitrary ranking skill to tied scores according to row order
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [metrics.py:48](../../python/t_boost/metrics.py#L48) breaks sort ties by
 input index; [line 81](../../python/t_boost/metrics.py#L81) integrates individual rows
@@ -3017,7 +3146,7 @@ Retain perfect/reversed controls and explicit nonfinite-input policy.
 <a id="bug-044"></a>
 ## BUG-044 — Categorical rating exports omit and collide on routing metadata
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [serialize.rs:1004](../../crates/t-boost-core/src/serialize.rs#L1004)
 defines exported levels with only `label` and `cell`; [line
@@ -3124,7 +3253,7 @@ native `cell_indices`, so it cannot catch this information loss.
 <a id="bug-045"></a>
 ## BUG-045 — Deviance metrics accept nonfinite inputs and an infinite Tweedie power
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [metrics.py:164](../../python/t_boost/metrics.py#L164) converts inputs and
 checks lengths/power intervals without checking finiteness; [line
@@ -3170,7 +3299,7 @@ solely from an invalid power.
 <a id="bug-046"></a>
 ## BUG-046 — A/E reports suppress valid ratios for negative expected totals
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [sklearn.py:3189](../../python/t_boost/sklearn.py#L3189) tests `expected >
 0`; the [public docstring at line 3132](../../python/t_boost/sklearn.py#L3132) defines
@@ -3216,7 +3345,7 @@ conversion only for truly undefined ratios.
 <a id="bug-047"></a>
 ## BUG-047 — Empty A/E evaluation batches raise an internal indexing error
 
-**Priority:** P3. **Status:** Open.
+**Priority:** P3. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [binding lib.rs:5914](../../crates/t-boost-py/src/lib.rs#L5914) documents
 `(n_rows,n_raw_features)` but calls `PyArray::from_vec2` on an empty vector.
@@ -3255,7 +3384,7 @@ zero-row batch as a zero-feature model.
 <a id="bug-048"></a>
 ## BUG-048 — OOB cell correction silently breaks monotonicity in the Rust API
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:3091](../../crates/t-boost-core/src/engine/boost.rs#L3091)
 (`attach_cell_correction`), [attachment at line
@@ -3374,7 +3503,7 @@ fn main() {
 <a id="bug-049"></a>
 ## BUG-049 — Valid weighted fits fail when a bag omits all positive-weight observations
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:2887](../../crates/t-boost-core/src/engine/boost.rs#L2887)
 (subagging draw), [row subset and fit at line
@@ -3439,7 +3568,7 @@ No missing-value/binning changes are needed to expose or repair this defect.
 <a id="bug-050"></a>
 ## BUG-050 — The cell-refit guard splits declared groups between fitting and validation
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [engine/boost.rs:3148](../../crates/t-boost-core/src/engine/boost.rs#L3148)
 (row-hash holdout), [correction fit weights at line
@@ -3625,7 +3754,7 @@ fn main() {
 <a id="bug-051"></a>
 ## BUG-051 — Table-budget checks do not cover purification and factored shedding
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:1705](../../crates/t-boost-core/src/explain.rs#L1705) skips raw
 allocation for factored supports; [line
@@ -3768,7 +3897,7 @@ memory.
 <a id="bug-052"></a>
 ## BUG-052 — Public exactness assertion ignores the mass used to build weighted banks
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:4408](../../crates/t-boost-core/src/explain.rs#L4408) calls
 `build_weights(..., None)` unconditionally. [Weighted construction at line
@@ -3842,7 +3971,7 @@ the appropriate invariant.
 <a id="bug-053"></a>
 ## BUG-053 — Variance certification loses precision after harmless intercept translation
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:4285](../../crates/t-boost-core/src/explain.rs#L4285) computes
 exhaustive variance as `E[F²] - E[F]²`; [line
@@ -3955,7 +4084,7 @@ a table or variance field to verify the gate still rejects actual discrepancies.
 <a id="bug-054"></a>
 ## BUG-054 — Incremental Poisson scores lose the distance beyond the exponent clamp
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [loss.rs:1257](../../crates/t-boost-core/src/loss.rs#L1257) seeds and
 refreshes the inverse-link cache from `clamp_exp(raw)`;
@@ -4039,7 +4168,7 @@ existing ordinary-range drift tests.
 <a id="bug-055"></a>
 ## BUG-055 — Runtime-only score methods silently broadcast or flatten incompatible targets
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [python/t_boost/_compat.py:85](../../python/t_boost/_compat.py#L85)
 implements the fallback regression score; [line 97](../../python/t_boost/_compat.py#L97)
@@ -4114,7 +4243,7 @@ than return a plausible score.
 <a id="bug-056"></a>
 ## BUG-056 — Binary A/E ignores the exposure offset that was used during training
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [sklearn.py:7803](../../python/t_boost/sklearn.py#L7803)–[sklearn.py:7806](../../python/t_boost/sklearn.py#L7806)
@@ -4181,7 +4310,7 @@ comparison to the actual training loss's response transformation. Include
 <a id="bug-057"></a>
 ## BUG-057 — A literal missing-sentinel category is silently merged with actual missing values
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [_ingest.py:27](../../python/t_boost/_ingest.py#L27) sets `_CAT_MISSING =
 '__t_boost_missing__'`;
@@ -4244,7 +4373,7 @@ silently conflated.
 <a id="bug-058"></a>
 ## BUG-058 — Estimator envelopes accept metadata inconsistent with the native model
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [sklearn.py:1282](../../python/t_boost/sklearn.py#L1282) (`_check_envelope`
 checks version and estimator class only);
@@ -4351,7 +4480,7 @@ waiting for prediction to crash or silently misroute.
 <a id="bug-059"></a>
 ## BUG-059 — Runtime-only estimator repr fails for valid NumPy-array parameters
 
-**Priority:** P3. **Status:** Open.
+**Priority:** P3. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:**
 [_compat.py:74](../../python/t_boost/_compat.py#L74)–[_compat.py:82](../../python/t_boost/_compat.py#L82),
@@ -4394,7 +4523,7 @@ should not mutate parameters or fitted state.
 <a id="bug-060"></a>
 ## BUG-060 — Reconstructed bags reuse the soup intercept, leaking targets into OOB evidence
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [prune.rs:1927](../../crates/t-boost-core/src/prune.rs#L1927), especially
 `f0: model.f0` at [line 1949](../../crates/t-boost-core/src/prune.rs#L1949). Original
@@ -4545,7 +4674,7 @@ fn main() {
 <a id="bug-061"></a>
 ## BUG-061 — A fixed ten-step intercept reanchor can stop far from class balance
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [prune.rs:2511](../../crates/t-boost-core/src/prune.rs#L2511), especially
 the unconditional ten-iteration limit at [line
@@ -4707,7 +4836,7 @@ fn main() {
 <a id="bug-062"></a>
 ## BUG-062 — Recentring a pruned high-order bank turns recreated categorical effects into numeric exports
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:5359](../../crates/t-boost-core/src/explain.rs#L5359) copies
 stored factored axes only when the exact child support exists; otherwise it calls
@@ -4883,7 +5012,7 @@ controls. Cover both explicit-mass recentering and reference-measure changes.
 <a id="bug-063"></a>
 ## BUG-063 — Recentring an interaction-only bank reports zero support for recreated main effects
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:5281](../../crates/t-boost-core/src/explain.rs#L5281) fills
 support only for tables present before repurification. [Line
@@ -5030,7 +5159,7 @@ effects/variances within rounding. Include full-bank controls and roundtrips.
 <a id="bug-064"></a>
 ## BUG-064 — Joint exports normalize component variances as though the effects were independent
 
-**Priority:** P2. **Status:** Open.
+**Priority:** P2. **Status:** Fixed — see the [remediation audit](#complete-remediation-audit--2026-10-03).
 
 **Source:** [explain.rs:5189](../../crates/t-boost-core/src/explain.rs#L5189) documents
 `S_u = variance(f_u)/variance(F)` but divides by the sum of component variances.

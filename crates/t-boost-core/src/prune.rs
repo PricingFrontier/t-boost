@@ -349,6 +349,7 @@ pub fn retain_tables(bank: &TableBank, keep: &[FeatureSet]) -> TableBank {
         tables: bank.tables.iter().filter(|t| kept(&t.u)).cloned().collect(),
         merged_grids: bank.merged_grids.clone(),
         w: bank.w.clone(),
+        joint_variance: None,
         factored: bank
             .factored
             .iter()
@@ -1910,7 +1911,8 @@ pub fn bag_banks_for_keepset(
 
 /// The `bag`-th member's standalone-scale [`Model`] view: its own slice of the soup's `trees`
 /// with every alpha multiplied by `n_bags` (undoing the soup's `1/n_bags` member weight), the
-/// soup's `f0`, and the soup's shared grids/schema. The soup's own weighted mean over bags of
+/// member's original `f0`, and the soup's shared grids/schema. Legacy models without
+/// runtime member intercepts fall back to the soup's `f0`. The weighted mean over bags of
 /// this view reproduces the soup itself.
 ///
 /// `share_correction` decides what happens to a §G1 cell correction. It is a SOUP-level object
@@ -1946,7 +1948,12 @@ fn bag_member_model(
         .map(|(alpha, tree)| ((f64::from(*alpha) * n_bags) as f32, tree.clone()))
         .collect();
     Ok(Model {
-        f0: model.f0,
+        f0: model
+            .bag_intercepts
+            .as_ref()
+            .and_then(|values| values.get(bag))
+            .copied()
+            .unwrap_or(model.f0),
         trees,
         grids: model.grids.clone(),
         provenance: model.provenance.clone(),
@@ -1960,6 +1967,7 @@ fn bag_member_model(
             None
         },
         bag_spans: None,
+        bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
     })
@@ -2497,10 +2505,9 @@ fn rebalance_kept_cells(
 /// weighted predicted class mass reproduce the observed one, `Σ_i w_i·softmax(raw_i + delta)_k
 /// = Σ_i w_i·1[y_i = k]`.
 ///
-/// This is the K-class analogue of the single-output log-link `f0` re-anchor, solved by a fixed
-/// 10-round IPF: each round is the exact Newton step for the intercept-only multinomial and the
-/// log-likelihood is concave in the intercepts, so the iteration is deterministic and needs no
-/// convergence test. Degenerate inputs (zero total mass, or a class with no observed mass) get
+/// This is the K-class analogue of the single-output log-link `f0` re-anchor, solved by damped
+/// Newton updates until every class's mass residual meets the convergence tolerance.
+/// Degenerate inputs (zero total mass, or a class with no observed mass) get
 /// an all-zero shift rather than a `ln(0)`.
 ///
 /// `raw` is `[class][row]` on the link scale; `labels`/`w` are per row. `what` names the caller
@@ -2530,32 +2537,108 @@ fn multiclass_intercept_shifts(
     let total_mass: f64 = class_mass.iter().sum();
     let mut delta = vec![0.0_f64; n_classes];
     if total_mass > 0.0 && class_mass.iter().all(|&m| m > 0.0) {
-        for _ in 0..10 {
-            // Σw·p̂_k under the current intercept shifts (fixed row order ⇒ deterministic).
-            let mut pred_mass = vec![0.0_f64; n_classes];
+        // Fix the last class's shift at zero to remove softmax's common-shift gauge.
+        // A damped Newton solve avoids IPF's arbitrarily slow convergence near separation.
+        let dimension = n_classes.saturating_sub(1);
+        let moments = |shift: &[f64]| {
+            let mut predicted = vec![0.0; n_classes];
+            let mut hessian = vec![vec![0.0; dimension]; dimension];
             for i in 0..n {
-                let mut mx = f64::NEG_INFINITY;
-                for k in 0..n_classes {
-                    mx = mx.max(raw[k][i] + delta[k]);
-                }
-                let mut z = 0.0_f64;
-                let mut e = vec![0.0_f64; n_classes];
-                for k in 0..n_classes {
-                    let v = (raw[k][i] + delta[k] - mx).exp();
-                    e[k] = v;
-                    z += v;
+                let mx = (0..n_classes)
+                    .map(|k| raw[k][i] + shift[k])
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut probabilities: Vec<f64> = (0..n_classes)
+                    .map(|k| (raw[k][i] + shift[k] - mx).exp())
+                    .collect();
+                let z: f64 = probabilities.iter().sum();
+                for probability in &mut probabilities {
+                    *probability /= z;
                 }
                 let wi = f64::from(w[i]);
                 for k in 0..n_classes {
-                    pred_mass[k] += wi * e[k] / z;
+                    predicted[k] += wi * probabilities[k];
+                }
+                for k in 0..dimension {
+                    for j in 0..dimension {
+                        hessian[k][j] +=
+                            wi * probabilities[k] * (f64::from(k == j) - probabilities[j]);
+                    }
                 }
             }
-            for k in 0..n_classes {
-                if pred_mass[k] > 0.0 {
-                    delta[k] += (class_mass[k] / pred_mass[k]).ln();
+            (predicted, hessian)
+        };
+        let error = |predicted: &[f64]| {
+            predicted
+                .iter()
+                .zip(&class_mass)
+                .map(|(p, y)| ((p - y) / total_mass).powi(2))
+                .sum::<f64>()
+        };
+        for _ in 0..4096 {
+            let (pred_mass, mut hessian) = moments(&delta);
+            if pred_mass
+                .iter()
+                .zip(&class_mass)
+                .all(|(p, y)| (p - y).abs() <= 1e-10 * total_mass)
+            {
+                return Ok(delta);
+            }
+            // Ridge stabilizes nearly singular Hessians, without changing the optimum.
+            for k in 0..dimension {
+                hessian[k][k] += 1e-12 * total_mass;
+            }
+            let mut lower = vec![vec![0.0; dimension]; dimension];
+            for k in 0..dimension {
+                for j in 0..=k {
+                    let cross: f64 = (0..j).map(|r| lower[k][r] * lower[j][r]).sum();
+                    lower[k][j] = if k == j {
+                        (hessian[k][j] - cross).max(1e-15 * total_mass).sqrt()
+                    } else {
+                        (hessian[k][j] - cross) / lower[j][j]
+                    };
+                }
+            }
+            let mut step = vec![0.0; dimension];
+            for k in 0..dimension {
+                let cross: f64 = (0..k).map(|r| lower[k][r] * step[r]).sum();
+                step[k] = (class_mass[k] - pred_mass[k] - cross) / lower[k][k];
+            }
+            for k in (0..dimension).rev() {
+                let cross: f64 = ((k + 1)..dimension).map(|r| lower[r][k] * step[r]).sum();
+                step[k] = (step[k] - cross) / lower[k][k];
+            }
+            let largest = step.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            let mut scale = if largest > 20.0 { 20.0 / largest } else { 1.0 };
+            let current_error = error(&pred_mass);
+            let mut accepted = false;
+            for _ in 0..32 {
+                let mut proposal = delta.clone();
+                for k in 0..dimension {
+                    proposal[k] += scale * step[k];
+                }
+                if error(&moments(&proposal).0) < current_error {
+                    delta = proposal;
+                    accepted = true;
+                    break;
+                }
+                scale *= 0.5;
+            }
+            if !accepted {
+                // IPF is also a descent method and supplies a conservative fallback.
+                for k in 0..n_classes {
+                    if pred_mass[k] > 0.0 {
+                        delta[k] += (class_mass[k] / pred_mass[k]).ln();
+                    }
+                }
+                let gauge = delta.last().copied().unwrap_or(0.0);
+                for value in &mut delta {
+                    *value -= gauge;
                 }
             }
         }
+        return Err(PbError::InvalidInput {
+            what: format!("{what}: multiclass intercept reanchor did not converge"),
+        });
     }
     Ok(delta)
 }
@@ -2583,8 +2666,8 @@ fn multiclass_intercept_shifts(
 /// drifts (the deployed universe — especially a bagged soup's — is wider than the selection
 /// fit's, making the drift material at larger K). The multinomial analog of the binary
 /// log-link `f0` re-anchor is an intercept-only IPF: `f0_k += ln(Σw·1[y=k] / Σw·p̂_k)`,
-/// iterated a fixed 10 rounds (deterministic; each round is the exact Newton step for the
-/// intercept-only multinomial, and the log-lik is concave in the intercepts).
+/// iterated until weighted class masses agree to a deterministic relative tolerance.
+/// The updates are proportional fitting; nonconvergence returns a typed error.
 ///
 /// # Errors
 /// Propagates bank construction/scoring/validation failures. [`PbError::ShapeMismatch`] if
@@ -2930,12 +3013,9 @@ pub fn prune_multiclass_to_tables(
                     &fold_ws[fi],
                     &rowset,
                 )?;
-                let sw = fold_ws[fi]
-                    .iter()
-                    .map(|&x| f64::from(x))
-                    .sum::<f64>()
-                    .max(1.0);
-                Ok(dev / sw)
+                // The native multiclass deviance is already a weighted mean.
+                // Each fold contributes one mean to the equal-fold SE estimate.
+                Ok(dev)
             })
             .collect::<Result<Vec<_>, _>>()?;
         let (mean, se) = mean_and_se(&per_fold);
@@ -3623,10 +3703,7 @@ impl MulticlassGuardReport {
 /// Weighted mean multinomial deviance (`-Σ w·ln p_y / Σ w`) over `raw` (`[class][row]`).
 ///
 /// NOTE the divisor: [`crate::engine::boost::multiclass_deviance_for_rows`] ALREADY returns the
-/// per-unit-weight mean, so nothing is divided again here. (`prune_multiclass_to_tables` does
-/// divide again — a long-standing constant rescale that cancels in every comparison it makes,
-/// left alone because changing it would move `se_rule`'s band and every selection with it. The
-/// guard reports its deviances raw, so a reader can compare them to a log-loss.)
+/// per-unit-weight mean, so nothing is divided again here or in pruning's fold evaluator.
 fn multiclass_mean_deviance(raw: &[Vec<f64>], labels: &[u32], w: &[f32]) -> Result<f64, PbError> {
     let cols: Vec<Vec<f32>> = raw
         .iter()
@@ -4635,6 +4712,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: Some(vec![(0, 1), (1, 2)]),
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };

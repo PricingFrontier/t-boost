@@ -366,12 +366,13 @@ fn require_equal_len(
     Ok(())
 }
 
-/// The exposure-weighted log-link intercept (§05.5): `f0 = log(Σ w y / Σ w e)` with
+/// The GLM log-link intercept: `f0 = log(Σ w y e^(1-p) / Σ w e^(2-p))` with
 /// `e = exp(offset)` (or `e = 1` when there is no offset), the ratio floored to
 /// [`EPS_INIT`]. `validate_y` enforces the per-row domain (Poisson/Tweedie `y ≥ 0`,
 /// Gamma `y > 0`). Rejects all-zero weights and non-positive exposure (`Σ w e ≤ 0`).
 fn log_link_init(
     obj: &str,
+    power: f64,
     y: &[f32],
     weight: &[f32],
     offset: Option<&[f32]>,
@@ -389,8 +390,8 @@ fn log_link_init(
                 require_finite(obj, "offset", i, oi)?;
                 validate_y(i, yi)?;
                 let w = f64::from(wi);
-                sum_wy += w * f64::from(yi);
-                sum_we += w * f64::from(clamp_exp(oi)); // e_i = exp(offset_i) > 0
+                sum_wy += w * f64::from(yi) * ((1.0 - power) * f64::from(oi)).exp();
+                sum_we += w * ((2.0 - power) * f64::from(oi)).exp();
             }
         }
         None => {
@@ -404,7 +405,7 @@ fn log_link_init(
             }
         }
     }
-    if sum_we <= 0.0 {
+    if !sum_wy.is_finite() || !sum_we.is_finite() || sum_we <= 0.0 {
         return Err(invalid_input(format!(
             "{obj} init_score: non-positive Σ w·e (all-zero weights or non-positive exposure)"
         )));
@@ -1297,7 +1298,7 @@ impl Loss for Poisson {
         weight: &[f32],
         offset: Option<&[f32]>,
     ) -> Result<f64, PbError> {
-        log_link_init("poisson", y, weight, offset, |i, yi| {
+        log_link_init("poisson", 1.0, y, weight, offset, |i, yi| {
             if yi < 0.0 {
                 Err(invalid_input(format!(
                     "poisson: y[{i}] must be >= 0, got {yi}"
@@ -1444,7 +1445,7 @@ impl Loss for Gamma {
         weight: &[f32],
         offset: Option<&[f32]>,
     ) -> Result<f64, PbError> {
-        log_link_init("gamma", y, weight, offset, |i, yi| {
+        log_link_init("gamma", 2.0, y, weight, offset, |i, yi| {
             if yi <= 0.0 {
                 Err(invalid_input(format!(
                     "gamma: y[{i}] must be > 0, got {yi}"
@@ -1585,15 +1586,22 @@ impl Loss for Tweedie {
         weight: &[f32],
         offset: Option<&[f32]>,
     ) -> Result<f64, PbError> {
-        log_link_init("tweedie", y, weight, offset, |i, yi| {
-            if yi < 0.0 {
-                Err(invalid_input(format!(
-                    "tweedie: y[{i}] must be >= 0, got {yi}"
-                )))
-            } else {
-                Ok(())
-            }
-        })
+        log_link_init(
+            "tweedie",
+            f64::from(self.rho),
+            y,
+            weight,
+            offset,
+            |i, yi| {
+                if yi < 0.0 {
+                    Err(invalid_input(format!(
+                        "tweedie: y[{i}] must be >= 0, got {yi}"
+                    )))
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
 
     fn link(&self) -> Link {
