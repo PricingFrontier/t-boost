@@ -41,7 +41,7 @@ pub struct PackedTree {
 }
 
 impl PackedTree {
-    fn score_row(&self, row: &[u8]) -> Result<f32, PbError> {
+    fn score_row(&self, row: &[u8]) -> Result<f64, PbError> {
         let mut idx = 0usize;
         for level in 0..usize::from(self.depth) {
             let axis = *self.feat.get(level).ok_or_else(|| PbError::Internal {
@@ -63,7 +63,7 @@ impl PackedTree {
             .ok_or_else(|| PbError::Internal {
                 what: format!("packed leaf index {idx} escaped 0..{}", self.leaf.len()),
             })?;
-        Ok(self.alpha * leaf)
+        Ok(f64::from(self.alpha) * f64::from(leaf))
     }
 }
 
@@ -129,7 +129,7 @@ pub struct ArenaTree {
 }
 
 impl ArenaTree {
-    fn score_row(&self, row: &[u8], arena: &[f32]) -> Result<f32, PbError> {
+    fn score_row(&self, row: &[u8], arena: &[f32]) -> Result<f64, PbError> {
         let mut idx = 0usize;
         for level in 0..usize::from(self.depth) {
             let axis = *self.feat.get(level).ok_or_else(|| PbError::Internal {
@@ -154,7 +154,7 @@ impl ArenaTree {
                     arena.len()
                 ),
             })?;
-        Ok(self.alpha * leaf)
+        Ok(f64::from(self.alpha) * f64::from(leaf))
     }
 }
 
@@ -174,7 +174,7 @@ pub struct WideTree {
 }
 
 impl WideTree {
-    fn score_row(&self, row: &[u8]) -> Result<f32, PbError> {
+    fn score_row(&self, row: &[u8]) -> Result<f64, PbError> {
         let mut idx = 0usize;
         for level in 0..usize::from(self.depth) {
             let axis = *self.feat.get(level).ok_or_else(|| PbError::Internal {
@@ -196,7 +196,7 @@ impl WideTree {
             .ok_or_else(|| PbError::Internal {
                 what: "wide leaf index escaped the tree's leaf table".into(),
             })?;
-        Ok(self.alpha * leaf)
+        Ok(f64::from(self.alpha) * f64::from(leaf))
     }
 }
 
@@ -416,7 +416,7 @@ impl ScoringBank {
     /// # Errors
     /// [`PbError::ShapeMismatch`] if the row lacks a referenced axis.
     pub fn score_row(&self, row: &[u8], offset: f32) -> Result<f32, PbError> {
-        let mut acc = offset;
+        let mut acc = f64::from(offset);
         match self {
             ScoringBank::Packed { trees, .. } => {
                 for tree in trees {
@@ -436,8 +436,8 @@ impl ScoringBank {
                 }
             }
         }
-        acc += self.correction_delta(row)? as f32;
-        Ok(acc)
+        acc += self.correction_delta(row)?;
+        Ok(acc as f32)
     }
 
     /// The cell-basis correction's additive contribution for one already-binned row
@@ -1131,6 +1131,9 @@ fn rows_per_task(bank: &TableBank) -> usize {
 pub struct CellMaps {
     pub(crate) maps: Vec<RawCellMap>,
     pub(crate) merged_grids: Vec<BorderGrid>,
+    pub(crate) grids: Vec<BorderGrid>,
+    pub(crate) provenance: Vec<crate::data::AxisProvenance>,
+    pub(crate) cat_encoders: crate::cat::CatEncoderStore,
 }
 
 impl CellMaps {
@@ -1147,6 +1150,9 @@ impl CellMaps {
         Ok(Self {
             maps: build_cell_maps_for(&bank.merged_grids, cat_encoders, grids, provenance)?,
             merged_grids: bank.merged_grids.clone(),
+            grids: grids.to_vec(),
+            provenance: provenance.to_vec(),
+            cat_encoders: cat_encoders.clone(),
         })
     }
 }

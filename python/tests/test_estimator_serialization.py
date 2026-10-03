@@ -268,7 +268,7 @@ def test_header_records_version_estimator_and_params() -> None:
     x, y = _small_regression_fixture()
     reg = _small_regressor(n_trees=12).fit(x, y)
     header = _header(reg.to_bytes())
-    assert header["schema_version"] == 2
+    assert header["schema_version"] == 4
     assert header["t_boost_version"] == t_boost.__version__
     assert header["estimator"] == "TBoostRegressor"
     assert header["params"]["n_trees"] == 12
@@ -370,12 +370,13 @@ def test_newer_schema_is_refused() -> None:
     reg = _small_regressor().fit(x, y)
     blob = reg.to_bytes()
     header = _header(blob)
-    header["schema_version"] = 3
-    with pytest.raises(SerializationError, match="schema_version 3"):
+    future_version = header["schema_version"] + 1
+    header["schema_version"] = future_version
+    with pytest.raises(SerializationError, match=f"schema_version {future_version}"):
         TBoostRegressor.from_bytes(_with_header(blob, header))
     doc = json.loads(reg.to_json())
-    doc["schema_version"] = 3
-    with pytest.raises(SerializationError, match="schema_version 3"):
+    doc["schema_version"] = future_version
+    with pytest.raises(SerializationError, match=f"schema_version {future_version}"):
         TBoostRegressor.from_json(json.dumps(doc))
 
 

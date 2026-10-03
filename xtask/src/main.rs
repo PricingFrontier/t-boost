@@ -883,15 +883,23 @@ fn concentration_gini(y: &[f32], score: &[f32], weight: &[f32]) -> f64 {
     let mut cum_w = 0.0_f64;
     let mut cum_y = 0.0_f64;
     let mut area = 0.0_f64;
-    for idx in order {
-        let w = f64::from(weight[idx].max(0.0));
-        cum_w += w;
-        cum_y += f64::from(y[idx].max(0.0)) * w;
+    let mut start = 0;
+    while start < order.len() {
+        let mut end = start + 1;
+        while end < order.len() && score[order[end]] == score[order[start]] {
+            end += 1;
+        }
+        for &idx in &order[start..end] {
+            let w = f64::from(weight[idx].max(0.0));
+            cum_w += w;
+            cum_y += f64::from(y[idx].max(0.0)) * w;
+        }
         let x = cum_w / total_w;
         let yy = cum_y / total_yw;
         area += (x - prev_x) * (yy + prev_y) * 0.5;
         prev_x = x;
         prev_y = yy;
+        start = end;
     }
     finite_or_zero(2.0 * area - 1.0)
 }
@@ -1167,11 +1175,28 @@ fn serialized_field_gate(
             let code = strip_line_comment(line);
             let trimmed = code.trim_start();
 
-            if trimmed.starts_with("#[")
-                && (code.contains("Serialize") || code.contains("Deserialize"))
-            {
-                serialized_pending = true;
-                i += 1;
+            if trimmed.starts_with("#[") {
+                // Attributes may span several lines after rustfmt. Consume the
+                // whole bracketed attribute before testing its derive tokens.
+                let mut attribute = String::new();
+                let mut depth = 0usize;
+                while let Some(line) = file.lines.get(i) {
+                    let part = strip_line_comment(line);
+                    depth = depth
+                        .saturating_add(part.matches('[').count())
+                        .saturating_sub(part.matches(']').count());
+                    attribute.push_str(&part);
+                    attribute.push('\n');
+                    i += 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                if contains_token(&attribute, "Serialize")
+                    || contains_token(&attribute, "Deserialize")
+                {
+                    serialized_pending = true;
+                }
                 continue;
             }
 
@@ -1456,6 +1481,19 @@ mod accuracy_tests {
         }];
         assert!(check_no_hashmap_serialized(&non_serialized).is_empty());
         assert!(check_no_usize_serialized(&non_serialized).is_empty());
+    }
+
+    #[test]
+    fn bug021_multiline_derives_enforce_serialized_field_gates() {
+        let dirty = [SourceFile {
+            path: PathBuf::from("crates/example/src/lib.rs"),
+            lines: "#[derive(\n    Serialize,\n    Deserialize,\n)]\npub struct Bad {\n    pub n: usize,\n    pub map: HashMap<u32, u32>,\n}"
+                .lines()
+                .map(str::to_owned)
+                .collect(),
+        }];
+        assert_eq!(check_no_usize_serialized(&dirty).len(), 1);
+        assert_eq!(check_no_hashmap_serialized(&dirty).len(), 1);
     }
 
     #[test]

@@ -182,8 +182,8 @@ def test_numeric_nulls_become_nan_missing_bin() -> None:
     assert np.array_equal(preds, by_numpy.predict(x_obj))
 
 
-def test_categorical_nulls_collapse_to_reserved_missing_level() -> None:
-    from t_boost.sklearn import _CAT_MISSING
+def test_categorical_nulls_are_distinct_from_literal_reserved_marker() -> None:
+    from t_boost._ingest import _CAT_MISSING, _cat_level
 
     df = frame_fixture()
     holed = df.with_columns(
@@ -197,7 +197,10 @@ def test_categorical_nulls_collapse_to_reserved_missing_level() -> None:
         holed.with_columns(pl.col("region").fill_null(_CAT_MISSING))
     )
     x_serve = holed.drop(["claims", "expo"])
-    assert np.array_equal(by_null.predict(x_serve), by_marker.predict(x_serve))
+    assert _cat_level(None) == _CAT_MISSING
+    assert _cat_level(_CAT_MISSING) != _CAT_MISSING
+    assert np.isfinite(by_null.predict(x_serve)).all()
+    assert np.isfinite(by_marker.predict(x_serve)).all()
 
 
 def test_categorical_and_enum_nulls_collapse_to_missing_level() -> None:

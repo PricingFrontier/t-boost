@@ -281,15 +281,52 @@ pub fn encode_doc(doc: &ModelDoc) -> Result<Vec<u8>, PbError> {
     bincode::serde::encode_to_vec(doc, bincode::config::standard()).map_err(serialization_error)
 }
 
+// Bincode allocates String storage from the encoded length before checking the slice.
+// Bound its decoding budget by the supplied document size, rounded up to a const-generic
+// tier. Integer varints are charged at their decoded width (up to 16 bytes per input byte),
+// so the multiplier preserves valid documents without imposing a model-size ceiling.
+fn decode_binary<T: serde::de::DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    let budget = bytes.len().saturating_mul(16);
+    macro_rules! tier {
+        ($limit:expr) => {
+            if budget <= $limit {
+                return bincode::serde::decode_from_slice(
+                    bytes,
+                    bincode::config::standard().with_limit::<$limit>(),
+                );
+            }
+        };
+    }
+    tier!({ 1 << 16 });
+    tier!({ 1 << 20 });
+    tier!({ 1 << 24 });
+    tier!({ 1 << 28 });
+    #[cfg(target_pointer_width = "64")]
+    {
+        tier!({ 1 << 32 });
+        tier!({ 1 << 36 });
+        tier!({ 1 << 40 });
+        tier!({ 1 << 44 });
+        tier!({ 1 << 48 });
+        tier!({ 1 << 52 });
+        tier!({ 1 << 56 });
+        tier!({ 1 << 60 });
+    }
+    bincode::serde::decode_from_slice(
+        bytes,
+        bincode::config::standard().with_limit::<{ usize::MAX }>(),
+    )
+}
+
 /// Decode a [`ModelDoc`] from the fast binary format, rejecting a newer
 /// `format_version` (spec §02.8 version gate).
 ///
 /// # Errors
 /// [`PbError::Serialization`] if decoding fails or the framing version is unknown.
 pub fn decode_doc(bytes: &[u8]) -> Result<ModelDoc, PbError> {
-    let (doc, len): (ModelDoc, usize) =
-        bincode::serde::decode_from_slice(bytes, bincode::config::standard())
-            .map_err(serialization_error)?;
+    let (doc, len): (ModelDoc, usize) = decode_binary(bytes).map_err(serialization_error)?;
     if len != bytes.len() {
         return Err(PbError::Serialization(format!(
             "trailing bytes after ModelDoc: decoded {len}, input {}",
@@ -545,9 +582,7 @@ pub fn decode_multiclass(bytes: &[u8]) -> Result<MultiClassModel, PbError> {
     let body = bytes.strip_prefix(MULTICLASS_MAGIC).ok_or_else(|| {
         PbError::Serialization("not a t-boost multiclass model (missing magic prefix)".into())
     })?;
-    let (doc, len): (MultiClassDoc, usize) =
-        bincode::serde::decode_from_slice(body, bincode::config::standard())
-            .map_err(serialization_error)?;
+    let (doc, len): (MultiClassDoc, usize) = decode_binary(body).map_err(serialization_error)?;
     if len != body.len() {
         return Err(PbError::Serialization(format!(
             "trailing bytes after MultiClassDoc: decoded {len}, body {}",
@@ -672,9 +707,7 @@ pub fn decode_tables(bytes: &[u8]) -> Result<TableModel, PbError> {
     let body = bytes.strip_prefix(TABLES_MAGIC).ok_or_else(|| {
         PbError::Serialization("not a t-boost tables-only model (missing magic prefix)".into())
     })?;
-    let (doc, len): (TablesDoc, usize) =
-        bincode::serde::decode_from_slice(body, bincode::config::standard())
-            .map_err(serialization_error)?;
+    let (doc, len): (TablesDoc, usize) = decode_binary(body).map_err(serialization_error)?;
     if len != body.len() {
         return Err(PbError::Serialization(format!(
             "trailing bytes after TablesDoc: decoded {len}, body {}",
@@ -706,9 +739,41 @@ pub fn encode_tables_json(model: &TableModel) -> Result<String, PbError> {
 /// [`PbError::Serialization`] if decoding fails or a version/kind is unsupported; plus model
 /// validation errors.
 pub fn decode_tables_json(s: &str) -> Result<TableModel, PbError> {
-    let doc: TablesDoc = serde_json::from_str(s).map_err(serialization_error)?;
+    let mut doc: TablesDoc = serde_json::from_str(s).map_err(serialization_error)?;
+    check_schema_version(
+        doc.schema_version,
+        json_tables_version(&doc.model.bank),
+        "tables JSON",
+    )?;
+    migrate_json_table_model(&mut doc.model)?;
+    doc.schema_version = required_tables_version(&doc.model.bank);
     validate_tables_doc(&doc)?;
     Ok(doc.model)
+}
+
+fn json_tables_version(bank: &crate::explain::TableBank) -> u32 {
+    let banded = bank
+        .tables
+        .iter()
+        .flat_map(|t| &t.axes)
+        .chain(bank.factored.iter().flat_map(|f| &f.axes))
+        .any(|axis| axis.band_of.is_some());
+    if banded {
+        SCHEMA_VERSION_BANDED_TABLES
+    } else {
+        content_tables_version(bank)
+    }
+}
+
+fn migrate_json_table_model(model: &mut TableModel) -> Result<(), PbError> {
+    check_schema_version(
+        model.schema_version,
+        json_tables_version(&model.bank),
+        "tables JSON model",
+    )?;
+    // JSON defaults add v7's optional axis field; binary documents keep their strict gate.
+    model.schema_version = required_tables_version(&model.bank);
+    Ok(())
 }
 
 impl TableModel {
@@ -839,8 +904,7 @@ pub fn decode_multiclass_tables(bytes: &[u8]) -> Result<MultiClassTableModel, Pb
         )
     })?;
     let (doc, len): (MultiClassTablesDoc, usize) =
-        bincode::serde::decode_from_slice(body, bincode::config::standard())
-            .map_err(serialization_error)?;
+        decode_binary(body).map_err(serialization_error)?;
     if len != body.len() {
         return Err(PbError::Serialization(format!(
             "trailing bytes after MultiClassTablesDoc: decoded {len}, body {}",
@@ -872,7 +936,32 @@ pub fn encode_multiclass_tables_json(model: &MultiClassTableModel) -> Result<Str
 /// # Errors
 /// [`PbError::Serialization`] if decoding fails or a version/kind is unsupported; plus validation.
 pub fn decode_multiclass_tables_json(s: &str) -> Result<MultiClassTableModel, PbError> {
-    let doc: MultiClassTablesDoc = serde_json::from_str(s).map_err(serialization_error)?;
+    let mut doc: MultiClassTablesDoc = serde_json::from_str(s).map_err(serialization_error)?;
+    let required = doc
+        .model
+        .classes
+        .iter()
+        .map(|class| json_tables_version(&class.bank))
+        .max()
+        .unwrap_or(SCHEMA_VERSION_UNLIFTED);
+    check_schema_version(doc.schema_version, required, "multiclass tables JSON")?;
+    check_schema_version(
+        doc.model.schema_version,
+        required,
+        "multiclass tables JSON model",
+    )?;
+    for class in &mut doc.model.classes {
+        migrate_json_table_model(class)?;
+    }
+    let migrated = doc
+        .model
+        .classes
+        .iter()
+        .map(|class| class.schema_version)
+        .max()
+        .unwrap_or(SCHEMA_VERSION_UNLIFTED);
+    doc.schema_version = migrated;
+    doc.model.schema_version = migrated;
     validate_multiclass_tables_doc(&doc)?;
     Ok(doc.model)
 }
@@ -1008,6 +1097,12 @@ pub struct CatLevelExport {
     /// The axis cell this level lands in (indexes the same cell space as `AxisExport::cells`
     /// / the table's `values`/`relativities`/`support`).
     pub cell: u32,
+    /// Original canonical labels routed to this level, including pooled members.
+    #[serde(default)]
+    pub members: Vec<String>,
+    /// Whether this entry is an internal pooled bucket rather than a literal label.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 /// One exported rating-table axis.
@@ -1028,6 +1123,9 @@ pub struct AxisExport {
     /// existed) loading.
     #[serde(default)]
     pub levels: Option<Vec<CatLevelExport>>,
+    /// Cell used for categorical labels absent from the frozen member mapping.
+    #[serde(default)]
+    pub default_cell: Option<u32>,
 }
 
 /// One exported purified rating table.
@@ -1159,8 +1257,19 @@ fn cat_level_export(
             let cell = bin_value(level.encoding, &grid)?;
             let cell = axis_band(axis, u32::from(cell))?;
             out.push(CatLevelExport {
-                label: cat_level_display_label(&level.label),
+                label: if level.label == RARE_LEVEL_LABEL
+                    && enc
+                        .levels
+                        .iter()
+                        .any(|l| l.label == RARE_LEVEL_EXPORT_LABEL)
+                {
+                    RARE_LEVEL_LABEL.to_owned()
+                } else {
+                    cat_level_display_label(&level.label)
+                },
                 cell,
+                members: level.members.clone(),
+                synthetic: level.label == RARE_LEVEL_LABEL,
             });
         }
         Ok(Some(out))
@@ -1199,14 +1308,94 @@ fn cat_level_export(
                 .level_cells
                 .iter()
                 .map(|(label, cell)| {
+                    let canonical =
+                        channels_for_export_level(provenance, axis.raw, cat_encoders, label)?;
                     Ok(CatLevelExport {
-                        label: cat_level_display_label(label),
+                        label: if label == RARE_LEVEL_LABEL
+                            && joint
+                                .level_cells
+                                .iter()
+                                .any(|(label, _)| label == RARE_LEVEL_EXPORT_LABEL)
+                        {
+                            RARE_LEVEL_LABEL.to_owned()
+                        } else {
+                            cat_level_display_label(label)
+                        },
                         cell: axis_band(axis, *cell)?,
+                        members: canonical.members.clone(),
+                        synthetic: label == RARE_LEVEL_LABEL,
                     })
                 })
                 .collect::<Result<Vec<_>, PbError>>()?,
         ))
     }
+}
+
+fn channels_for_export_level<'a>(
+    provenance: &[AxisProvenance],
+    raw: FeatureId,
+    encoders: &'a CatEncoderStore,
+    label: &str,
+) -> Result<&'a crate::cat::CatLevel, PbError> {
+    let channels = channel_axes_for_raw(provenance, raw);
+    let channel = channels.first().ok_or_else(|| PbError::Internal {
+        what: "categorical export has no channel".into(),
+    })?;
+    encoders
+        .get(channel.id, raw)?
+        .levels
+        .iter()
+        .find(|level| level.label == label)
+        .ok_or_else(|| PbError::Internal {
+            what: "categorical export lost a level".into(),
+        })
+}
+
+fn cat_default_cell_export(
+    axis: &AxisId,
+    provenance: &[AxisProvenance],
+    encoders: &CatEncoderStore,
+) -> Result<Option<u32>, PbError> {
+    let channels = channel_axes_for_raw(provenance, axis.raw);
+    if channels.is_empty() {
+        return Ok(None);
+    }
+    if channels.len() == 1 {
+        let channel = channels.first().ok_or_else(|| PbError::Internal {
+            what: "categorical export lost its channel".into(),
+        })?;
+        let encoder = encoders.get(channel.id, axis.raw)?;
+        let grid = BorderGrid {
+            borders: axis.borders.clone(),
+            n_bins: u16::try_from(axis.merged_cells()).map_err(|_| PbError::Internal {
+                what: "categorical export grid exceeded u16".into(),
+            })?,
+            missing_bin: 0,
+        };
+        return axis_band(axis, u32::from(bin_value(encoder.base, &grid)?)).map(Some);
+    }
+    let mut grids = Vec::new();
+    let mut bins = Vec::with_capacity(channels.len());
+    for channel in &channels {
+        let encoder = encoders.get(channel.id, axis.raw)?;
+        let grid = encoder.border_grid()?;
+        bins.push(bin_value(encoder.base, &grid)?);
+        if grids.len() <= channel.model_axis {
+            grids.resize(
+                channel.model_axis + 1,
+                BorderGrid {
+                    borders: Vec::new(),
+                    n_bins: 1,
+                    missing_bin: 0,
+                },
+            );
+        }
+        if let Some(slot) = grids.get_mut(channel.model_axis) {
+            *slot = grid;
+        }
+    }
+    let joint = JointCatAxis::build(axis.raw, channels, &grids, encoders)?;
+    axis_band(axis, joint.cell_for_channel_bins(&bins)?).map(Some)
 }
 
 /// A merged-grid cell's exported cell on `axis`: its band when the table is banded.
@@ -1229,12 +1418,16 @@ impl TableBank {
     /// (`model.schema.cat_encoders`/`TableModel.schema.cat_encoders`) sources every categorical
     /// axis's per-level label -> cell mapping (Piece B, [`AxisExport::levels`]); ignored for a
     /// purely numeric model, so an empty [`CatEncoderStore`] is always a safe argument then.
+    /// Log-link relativities are exact component exponentials. To match serving, apply
+    /// the response clamp to the combined log score (including `f0` and factored effects),
+    /// after summing all components: `exp(clamp(total, -30, 30))`.
     ///
     /// # Errors
     /// [`PbError::ExactnessFirewall`] if `mode` is approximate; [`PbError::ShapeMismatch`]
     /// if schema/table metadata is inconsistent; [`PbError::Internal`] if a reference
     /// coordinate escapes a tensor or a categorical axis's rebuilt cell space disagrees with
     /// the exported table's own (see [`cat_level_export`]).
+    /// [`PbError::InvalidInput`] if a component exponential overflows or underflows.
     pub fn to_rating_export(
         &self,
         link: Link,
@@ -1246,6 +1439,11 @@ impl TableBank {
     ) -> Result<RatingExport, PbError> {
         if let ExactnessMode::Approximate { reason } = mode {
             return Err(PbError::ExactnessFirewall(reason.clone()));
+        }
+        if self.w == crate::explain::RefMeasure::Joint && self.joint_variance.is_none() {
+            return Err(PbError::InvalidInput {
+                what: "joint variance shares require aligned rows: call measure_joint_variance before export".into(),
+            });
         }
         // Validate rating-basis references up front: rebasing only shifts a DENSE table <-> f0,
         // so every reference must name a realized dense support. Referencing a factored
@@ -1337,6 +1535,7 @@ impl TableBank {
                     borders: axis.band_borders().unwrap_or_else(|| axis.borders.clone()),
                     cells: axis.cells,
                     levels,
+                    default_cell: cat_default_cell_export(axis, provenance, cat_encoders)?,
                 });
             }
             // The rating export's whole contract is "the number deployed is the number
@@ -1348,8 +1547,16 @@ impl TableBank {
                 Some(
                     values_vec
                         .iter()
-                        .map(|v| v.clamp(-30.0, 30.0).exp())
-                        .collect(),
+                        .map(|v| {
+                            let factor = v.exp();
+                            if !factor.is_finite() || factor <= 0.0 {
+                                return Err(PbError::InvalidInput {
+                                    what: "rating relativity cannot represent exp(component); use raw values".into(),
+                                });
+                            }
+                            Ok(factor)
+                        })
+                        .collect::<Result<Vec<_>, PbError>>()?,
                 )
             } else {
                 None
@@ -1414,6 +1621,11 @@ impl TableBank {
                 sobol: *sobol.get(&ft.u).unwrap_or(&0.0),
             });
         }
+        if link == Link::Log && (!f0.exp().is_finite() || f0.exp() <= 0.0) {
+            return Err(PbError::InvalidInput {
+                what: "rating intercept exponential cannot be represented; use raw values".into(),
+            });
+        }
         Ok(RatingExport {
             format_version: FORMAT_VERSION,
             // The stamp is what the CONTENT requires, not a constant. This used to be a
@@ -1445,6 +1657,31 @@ mod tests {
         clippy::panic
     )]
     use super::*;
+    #[test]
+    fn binary_huge_feature_set_lengths_fail_without_trusting_size_hints() {
+        let bytes = [
+            84, 66, 77, 84, 0, 0, 0, 93, 255, 252, 84, 66, 255, 84, 66, 84, 77, 252, 64, 0, 255,
+            103, 0, 0, 0, 131, 0, 1,
+        ];
+        assert!(super::decode_multiclass_tables(&bytes).is_err());
+    }
+
+    #[test]
+    fn binary_huge_string_lengths_fail_without_allocating_the_claimed_size() {
+        // Fuzz finding: a 14-byte tables envelope claimed a 4.28 GB kind string.
+        let body = [252, 10, 91, 48, 255, 0, 0, 0, 43, 0];
+        assert!(super::decode_doc(&body).is_err());
+        for magic in [
+            super::MULTICLASS_MAGIC,
+            super::TABLES_MAGIC,
+            super::MULTICLASS_TABLES_MAGIC,
+        ] {
+            let bytes = [magic, body.as_slice()].concat();
+            assert!(super::decode_multiclass(&bytes).is_err());
+            assert!(super::decode_tables(&bytes).is_err());
+            assert!(super::decode_multiclass_tables(&bytes).is_err());
+        }
+    }
 
     /// A bank purified under the exposure measure carries a bincode discriminant no pre-v6
     /// reader knows, so it is stamped v6 whatever its arity; the legacy measure stays at
@@ -1640,6 +1877,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -1763,6 +2001,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -1939,6 +2178,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -2087,6 +2327,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };

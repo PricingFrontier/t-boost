@@ -14,9 +14,25 @@ With sklearn installed, everything here IS sklearn — bit-identical estimator b
 from __future__ import annotations
 
 import inspect
+import warnings
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+
+
+def _score_inputs(y: Any, pred: np.ndarray, sample_weight: Any) -> tuple[np.ndarray, Any]:
+    target = np.asarray(y)
+    if target.ndim == 2 and target.shape[1] == 1:
+        target = target[:, 0]
+    if target.ndim != 1 or target.shape != pred.shape or target.size == 0:
+        raise ValueError("y must be a vector aligned to X")
+    if target.dtype.kind in "fc" and not np.all(np.isfinite(target)):
+        raise ValueError("y must be finite")
+    weight = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+    if weight is not None and (weight.shape != target.shape or not np.all(np.isfinite(weight))
+                               or np.any(weight < 0) or weight.sum() <= 0):
+        raise ValueError("sample_weight must be a finite non-negative vector aligned to X")
+    return target, weight
 
 if TYPE_CHECKING:
     # mypy always analyzes against the real sklearn names (Any under the
@@ -77,16 +93,19 @@ else:
                 for name in self._get_param_names():
                     default = sig.parameters[name].default
                     value = getattr(self, name)
-                    if value is not default and value != default:
+                    if value is not default and not np.array_equal(value, default):
                         diffs.append(f"{name}={value!r}")
                 return f"{type(self).__name__}({', '.join(diffs)})"
 
         class RegressorMixin:
             def score(self, X, y, sample_weight=None):
                 """Weighted R^2, matching sklearn's ``r2_score`` conventions."""
-                pred = np.asarray(self.predict(X), dtype=np.float64).ravel()
-                y = np.asarray(y, dtype=np.float64).ravel()
-                w = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+                pred = np.asarray(self.predict(X), dtype=np.float64)
+                y, w = _score_inputs(y, pred, sample_weight)
+                y = y.astype(np.float64)
+                if len(y) < 2:
+                    warnings.warn("R^2 score is not well-defined with less than two samples.", RuntimeWarning)
+                    return float("nan")
                 ss_res = float(np.average((y - pred) ** 2, weights=w))
                 ss_tot = float(np.average((y - np.average(y, weights=w)) ** 2, weights=w))
                 if ss_tot == 0.0:
@@ -97,8 +116,8 @@ else:
             def score(self, X, y, sample_weight=None):
                 """Weighted accuracy, matching sklearn's ``accuracy_score`` conventions."""
                 pred = np.asarray(self.predict(X))
-                hits = (pred == np.asarray(y).ravel()).astype(np.float64)
-                w = None if sample_weight is None else np.asarray(sample_weight, dtype=np.float64)
+                y, w = _score_inputs(y, pred, sample_weight)
+                hits = (pred == y).astype(np.float64)
                 return float(np.average(hits, weights=w))
 
         def type_of_target(y, input_name="y"):

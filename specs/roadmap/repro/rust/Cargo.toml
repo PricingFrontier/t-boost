@@ -1,0 +1,21 @@
+# Standalone harness crate for the reproductions in ../../bugs.md (not a workspace
+# member: the empty [workspace] table makes it its own root, so the repository
+# gates never build it). Build with `cargo run --release --bin bugNNN` from here.
+[package]
+name = "bug-repro"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+t-boost-core = { path = "../../../../crates/t-boost-core", features = ["arrow", "nightly"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+bincode = { version = "2", features = ["serde"] }
+rayon = "1"
+
+# Match the workspace profile: the reproductions rely on overflow checks (BUG-012).
+[profile.release]
+overflow-checks = true
+
+[workspace]

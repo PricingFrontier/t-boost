@@ -476,6 +476,7 @@ pub fn rejoint(bank: &TableBank, opts: &JointOptions) -> Result<TableBank, PbErr
         merged_grids: bank.merged_grids.clone(),
         w: RefMeasure::Joint,
         factored: bank.factored.clone(),
+        joint_variance: None,
     })
 }
 
