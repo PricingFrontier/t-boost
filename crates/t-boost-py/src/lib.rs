@@ -29,8 +29,8 @@ use t_boost_core::cat::{
 use t_boost_core::constraints::{CredibilityFloor, InteractionPolicy, MonoSign, MonotoneMap};
 use t_boost_core::data::{
     bin, bin_columns, bin_serve_columns, bin_serve_columns_coded, bin_serve_columns_with,
-    bin_train_columns, bin_train_columns_with_holdout, AxisKind, AxisProvenance, BinConfig,
-    BinnedMatrix, CatServeMaps, CategoricalColumn, FeatureId, NumericColumn, ServeBinnedMatrix,
+    bin_train_columns_with_holdout, AxisKind, AxisProvenance, BinConfig, BinnedMatrix,
+    CatServeMaps, CategoricalColumn, FeatureId, NumericColumn, ServeBinnedMatrix,
     ServeCategoricalCodes, ServeCategoricalColumn,
 };
 use t_boost_core::engine::{
@@ -4876,14 +4876,19 @@ impl PyModel {
             } else {
                 (w, false)
             };
-            let mut bank = match combined_weight {
-                Some(mass) => model.explain_with_budget_weighted(&serve, w, budget, &mass)?,
+            let mut bank = match &combined_weight {
+                Some(mass) => model.explain_with_budget_weighted(&serve, w, budget, mass)?,
                 None => model.explain_with_budget(&serve, w, budget)?,
             };
             if joint {
                 bank = t_boost_core::joint::rejoint(
                     &bank,
                     &t_boost_core::joint::JointOptions::default(),
+                )?;
+                bank.measure_joint_variance(
+                    &model.schema.cat_encoders,
+                    &serve.0,
+                    combined_weight.as_deref(),
                 )?;
             }
             let export = bank.to_rating_export(
@@ -5634,8 +5639,12 @@ impl PyTableModel {
             .bank
             .tables
             .iter()
-            .filter(|t| t.u.order() > 0)
-            .map(|t| feature_set_ids(&t.u))
+            .map(|t| &t.u)
+            .chain(self.model.bank.factored.iter().map(|t| &t.u))
+            .filter(|u| u.order() > 0)
+            .map(feature_set_ids)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -5921,6 +5930,13 @@ impl PyTableModel {
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        if x.shape().first() == Some(&0) {
+            return Ok(PyArray2::<u32>::zeros(
+                py,
+                [0, self.model.bank.merged_grids.len()],
+                false,
+            ));
+        }
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let rows = py
@@ -6066,8 +6082,8 @@ impl PyTableModel {
             .transpose()
             .map_err(py_err)?;
         let mass = combined_explain_weight(weight, exposure)?;
-        let binned = match (&mass, x) {
-            (Some(_), Some(x)) => Some(
+        let binned = match x {
+            Some(x) => Some(
                 serve_binned_for_tables(m, raw_columns_from_array(x)?, cat_x, None)
                     .map_err(py_err)?,
             ),
@@ -6194,45 +6210,51 @@ impl PyMultiClassModel {
             .map_or_else(Vec::new, |m| m.schema.feature_names.clone())
     }
 
-    #[pyo3(signature = (x, cat_x=None))]
+    #[pyo3(signature = (x, cat_x=None, n_jobs=None))]
     fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
+        n_jobs: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let (flat, k) = py
             .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let proba = model.predict_proba(&binned)?;
-                Ok::<(Vec<f32>, usize), PbError>((proba, model.n_classes()))
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass model has no classes".into(),
+                    })?;
+                    let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
+                    let proba = model.predict_proba(&binned)?;
+                    Ok::<(Vec<f32>, usize), PbError>((proba, model.n_classes()))
+                })
             })
             .map_err(py_err)?;
         multiclass_array2(py, flat, k)
     }
 
-    #[pyo3(signature = (x, cat_x=None))]
+    #[pyo3(signature = (x, cat_x=None, n_jobs=None))]
     fn predict_raw<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
+        n_jobs: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let model = Arc::clone(&self.model);
         let (flat, k) = py
             .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let raw = model.predict_raw(&binned)?;
-                Ok::<(Vec<f32>, usize), PbError>((raw, model.n_classes()))
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass model has no classes".into(),
+                    })?;
+                    let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
+                    let raw = model.predict_raw(&binned)?;
+                    Ok::<(Vec<f32>, usize), PbError>((raw, model.n_classes()))
+                })
             })
             .map_err(py_err)?;
         multiclass_array2(py, flat, k)
@@ -6525,6 +6547,11 @@ impl PyMultiClassModel {
                         &bank,
                         &t_boost_core::joint::JointOptions::default(),
                     )?;
+                    bank.measure_joint_variance(
+                        &m.schema.cat_encoders,
+                        &serve.0,
+                        combined_weight.as_deref(),
+                    )?;
                 }
                 let export = bank.to_rating_export(
                     m.link,
@@ -6696,13 +6723,14 @@ impl PyMultiClassTableModel {
             .map_or_else(Vec::new, |m| m.schema.feature_names.clone())
     }
 
-    #[pyo3(signature = (x, cat_x=None, cat_codes=None))]
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
     fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
         cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let cats = serve_cats(cat_x, cat_codes)?;
@@ -6710,25 +6738,28 @@ impl PyMultiClassTableModel {
         let serve = Arc::clone(&self.serve);
         let (flat, k) = py
             .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass tables model has no classes".into(),
-                })?;
-                let ts = multiclass_table_serve(&model, &serve)?;
-                let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
-                let proba = model.predict_proba_with(&binned, Some(&ts.cells))?;
-                Ok::<(Vec<f32>, usize), PbError>((proba, model.n_classes()))
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass tables model has no classes".into(),
+                    })?;
+                    let ts = multiclass_table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
+                    let proba = model.predict_proba_with(&binned, Some(&ts.cells))?;
+                    Ok::<(Vec<f32>, usize), PbError>((proba, model.n_classes()))
+                })
             })
             .map_err(py_err)?;
         multiclass_array2(py, flat, k)
     }
 
-    #[pyo3(signature = (x, cat_x=None, cat_codes=None))]
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
     fn predict_raw<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
         cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
     ) -> PyResult<Bound<'py, PyArray2<f32>>> {
         let columns = raw_columns_from_array(x)?;
         let cats = serve_cats(cat_x, cat_codes)?;
@@ -6736,13 +6767,15 @@ impl PyMultiClassTableModel {
         let serve = Arc::clone(&self.serve);
         let (flat, k) = py
             .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass tables model has no classes".into(),
-                })?;
-                let ts = multiclass_table_serve(&model, &serve)?;
-                let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
-                let raw = model.predict_raw_with(&binned, Some(&ts.cells))?;
-                Ok::<(Vec<f32>, usize), PbError>((raw, model.n_classes()))
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass tables model has no classes".into(),
+                    })?;
+                    let ts = multiclass_table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
+                    let raw = model.predict_raw_with(&binned, Some(&ts.cells))?;
+                    Ok::<(Vec<f32>, usize), PbError>((raw, model.n_classes()))
+                })
             })
             .map_err(py_err)?;
         multiclass_array2(py, flat, k)
@@ -6840,8 +6873,8 @@ impl PyMultiClassTableModel {
             .transpose()
             .map_err(py_err)?;
         let mass = combined_explain_weight(weight, exposure)?;
-        let binned = match (&mass, x, m.classes.first()) {
-            (Some(_), Some(x), Some(first)) => Some(
+        let binned = match (x, m.classes.first()) {
+            (Some(x), Some(first)) => Some(
                 serve_binned_for_tables(first, raw_columns_from_array(x)?, cat_x, None)
                     .map_err(py_err)?,
             ),
@@ -7019,6 +7052,7 @@ fn gather_bool(src: &[bool], idx: &[usize]) -> Result<Vec<bool>, PbError> {
 /// a `Once`, and if the global pool was already built `build_global` returns `Err`, which we
 /// intentionally ignore (leave whatever exists in place).
 fn cap_global_pool_once(n_jobs: Option<usize>) {
+    let _ = worker_process_id();
     use std::sync::Once;
     static GLOBAL_POOL_CAP: Once = Once::new();
     if let Some(nj) = n_jobs {
@@ -7039,11 +7073,23 @@ fn run_on_pool<R: Send>(
     op: impl FnOnce() -> Result<R, PbError> + Send,
 ) -> Result<R, PbError> {
     require_nonzero_n_jobs(n_jobs)?;
+    // A fork inherits both Rayon workers and mutex bookkeeping, without their
+    // threads. Refuse before touching either the local cache or global pool.
+    if worker_process_id() != std::process::id() {
+        return Err(PbError::InvalidInput {
+            what: "native worker state was inherited through fork; use multiprocessing's spawn or forkserver start method".into(),
+        });
+    }
     cap_global_pool_once(n_jobs);
     match n_jobs {
         Some(nj) => serve_pool(nj)?.install(op),
         None => op(),
     }
+}
+
+fn worker_process_id() -> u32 {
+    static PID: OnceLock<u32> = OnceLock::new();
+    *PID.get_or_init(std::process::id)
 }
 
 /// The scoped pool [`run_on_pool`] installs for an explicit `n_jobs`, built once per width and
@@ -7456,6 +7502,51 @@ fn fit_multiclass_owned_bagged(
                 .into(),
         });
     }
+    let honest_holdout = if es_holdout.is_some() {
+        es_holdout
+    } else if cat_x.is_some() && state.config.validation_fraction.is_some() {
+        let labels = y
+            .iter()
+            .map(|&value| {
+                if !value.is_finite()
+                    || value < 0.0
+                    || value.fract() != 0.0
+                    || value as usize >= n_classes
+                {
+                    return Err(PbError::InvalidInput {
+                        what: "invalid multiclass target index".into(),
+                    });
+                }
+                Ok(value as u32)
+            })
+            .collect::<Result<Vec<_>, PbError>>()?;
+        t_boost_core::engine::boost::holdout_mask(
+            u32::try_from(y.len()).map_err(|_| PbError::InvalidInput {
+                what: "more than u32::MAX rows is out of scope for v1".into(),
+            })?,
+            state.config.validation_fraction,
+            state.seed,
+            Some(&labels),
+        )?
+    } else {
+        None
+    };
+    let admission_weight = match (&honest_holdout, &weight) {
+        (Some(mask), Some(w)) => {
+            if w.len() != mask.len() {
+                return Err(PbError::ShapeMismatch {
+                    what: "weight and holdout lengths differ".into(),
+                });
+            }
+            Some(
+                w.iter()
+                    .zip(mask)
+                    .filter_map(|(&w, &held)| (!held).then_some(w))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        _ => None,
+    };
     // See `fit_model_ambient`'s identical comment: `Some(n)` iff `cat_x` was present, `n[j]` =
     // raw categorical feature `j`'s axis count, needed to expand a caller-supplied
     // `feature_names` once any feature's count channel is admitted. Threaded out through the
@@ -7477,7 +7568,7 @@ fn fit_multiclass_owned_bagged(
             // the default row-level carve leaks near-duplicate rows into validation and defeats
             // early stopping — measured running to the 4000-tree cap on grouped multiclass).
             // None keeps the engine's own row-level carve, byte-identical to before this arg.
-            fixed_holdout: es_holdout.as_deref(),
+            fixed_holdout: honest_holdout.as_deref(),
             bag_groups: bag_groups.as_deref(),
             seed: state.seed,
         };
@@ -7536,9 +7627,16 @@ fn fit_multiclass_owned_bagged(
                         // IS the softmax path the ordinal label-mean defect lives on). No
                         // exposure on the multiclass path (matches this function's
                         // `FitSpec { exposure: None, .. }` a few lines up).
+                        let permitted_levels = honest_holdout.as_ref().map(|mask| {
+                            levels
+                                .iter()
+                                .zip(mask)
+                                .filter_map(|(level, &held)| (!held).then_some(level.clone()))
+                                .collect::<Vec<_>>()
+                        });
                         let ids = categorical_channel_ids(
-                            levels,
-                            weight.as_deref(),
+                            permitted_levels.as_deref().unwrap_or(levels),
+                            admission_weight.as_deref().or(weight.as_deref()),
                             None,
                             state.cat_channels,
                             &state.cat_config,
@@ -7580,7 +7678,7 @@ fn fit_multiclass_owned_bagged(
                     .into_iter()
                     .flat_map(|(_, cols)| cols)
                     .collect::<Vec<_>>();
-                let fitted = bin_train_columns(
+                let fitted = bin_train_columns_with_holdout(
                     &numeric,
                     &categorical,
                     &y,
@@ -7588,6 +7686,7 @@ fn fit_multiclass_owned_bagged(
                     None,
                     &state.bin_config,
                     state.seed,
+                    honest_holdout.as_deref(),
                 )?;
                 let model = Booster::with_config(state.config.clone()).fit_multiclass_train(
                     &fitted.train,
@@ -8455,6 +8554,35 @@ fn export_bank<'a>(
     let rejoint = |bank: &t_boost_core::explain::TableBank| {
         t_boost_core::joint::rejoint(bank, &t_boost_core::joint::JointOptions::default())
     };
+    if requested == Some(&RefMeasure::Joint)
+        || (requested.is_none() && tm.bank.w == RefMeasure::Joint)
+    {
+        let binned = binned.ok_or_else(|| PbError::InvalidInput {
+            what: "a joint export requires aligned rows".into(),
+        })?;
+        let base = tm.recentred_bank(
+            binned,
+            mass,
+            RefMeasure::ExposureMarginals {
+                floor: measure_floor,
+            },
+        )?;
+        if mass.is_none()
+            && tm.bank.tables.iter().any(|table| {
+                base.tables
+                    .iter()
+                    .find(|t| t.u == table.u)
+                    .is_none_or(|t| t.support != table.support)
+            })
+        {
+            return Err(PbError::InvalidInput {
+                what: "joint export rows do not reproduce stored support; supply explicit weight/exposure (or unit weights for a new unweighted reference)".into(),
+            });
+        }
+        let mut bank = rejoint(&base)?;
+        bank.measure_joint_variance(&tm.schema.cat_encoders, binned, mass)?;
+        return Ok(Cow::Owned(bank));
+    }
     if let Some(mass) = mass {
         let binned = binned.ok_or_else(|| PbError::InvalidInput {
             what: "a call-time weight or exposure needs the rows it weights".into(),

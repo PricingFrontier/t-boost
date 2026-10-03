@@ -51,6 +51,7 @@ use crate::serialize::SCHEMA_VERSION_UNLIFTED;
 use rand::RngCore;
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 fn invalid_config(what: &'static str) -> PbError {
     PbError::InvalidConfig { what: what.into() }
@@ -65,6 +66,19 @@ const REFIT_MAX_BACKTRACKS: usize = 32;
 const REFIT_CHOLESKY_JITTERS: [f64; 4] = [0.0, 1.0e-12, 1.0e-10, 1.0e-8];
 
 fn validate_fit_spec(config: &Config, spec: &FitSpec<'_>) -> Result<(), PbError> {
+    if !spec.monotone.is_empty()
+        && matches!(
+            config.boosters.ensemble,
+            EnsembleSpec::OuterBag {
+                cell_refit: Some(_),
+                ..
+            }
+        )
+    {
+        return Err(PbError::InvalidConfig {
+            what: "cell_refit is incompatible with monotone constraints".into(),
+        });
+    }
     let max_order = usize::from(spec.interaction.max_order);
     if !(1..=crate::engine::MAX_ORDER).contains(&max_order) {
         return Err(PbError::InvalidConfig {
@@ -654,7 +668,7 @@ fn fit_single(
     // contract, or a caller-supplied group-honest carve) never reach this — they take the
     // `Some(mask)` arm below.
     let strata: Option<Vec<u32>> = es_strata_for_loss(spec.loss.objective_tag().loss, y);
-    let (train_rows, validation_rows) = match spec.fixed_holdout {
+    let (mut train_rows, mut validation_rows) = match spec.fixed_holdout {
         Some(mask) => split_rows_by_mask(x.n_rows, mask)?,
         None => carve_validation_rows_stratified(
             x.n_rows,
@@ -663,6 +677,12 @@ fn fit_single(
             strata.as_deref(),
         )?,
     };
+    ensure_validation_mass(
+        &mut train_rows,
+        &mut validation_rows,
+        weight,
+        spec.fixed_holdout.is_some(),
+    )?;
     // §H6: `RefitProblem::train_rows` wants `usize` (to reuse `deviance_for_rows`); computed
     // once here since it does not change across rounds.
     let train_rows_usize: Vec<usize> = train_rows.iter().map(|&r| r as usize).collect();
@@ -672,7 +692,7 @@ fn fit_single(
     // mean is taken over TRAIN rows only — the full-array mean leaked the holdout's target
     // level into every early-stopping evaluation through f0. Without a carve, train_rows is
     // every row and the full-slice call below is byte-identical to the previous behavior.
-    let f0 = if validation_rows.is_some() {
+    let f0 = if train_rows.len() != n {
         let gather = |src: &[f32]| -> Result<Vec<f32>, PbError> {
             train_rows
                 .iter()
@@ -754,22 +774,23 @@ fn fit_single(
     // independent call (see `fit_outer_bag`), so this never crosses a bag/thread boundary.
     let mut realized_extent = RealizedExtent::new(n_features);
 
+    let precise_append = matches!(config.boosters.nesterov, NesterovSpec::Off)
+        && config
+            .boosters
+            .dart
+            .as_ref()
+            .is_none_or(|dart| dart.drop_rate == 0.0);
+    let mut precise_raw: Vec<f64> = if precise_append {
+        (0..n)
+            .map(|row| base_raw(offset.as_deref(), f0_f32, row))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
     let mut trees: Vec<(f32, ObliviousTree)> = Vec::new();
     let mut gh = GradHess::default();
     let mut last_refit_tree_count = 0usize;
     let mut prev_alphas: Vec<f32> = Vec::new();
-    // §C3: `raw_prev` one round-boundary behind `raw`, mirrored in lockstep with `prev_alphas` (see the
-    // `agbm_lookahead_raw` call and the capture at the `prev_alphas = current_alphas` site) so the
-    // AGBM lookahead can be reconstructed as an O(n) blend of `raw`/`raw_prev` instead of an O(n·T)
-    // `raw_from_tree_alphas` walk. Seeded to `raw`'s round-0 value (the `combine_alphas` identity
-    // when `previous` is empty — no trees yet) so round 0's blend reduces to `fit_raw == raw`
-    // exactly, matching the old code with zero trees. Only maintained when AGBM is actually
-    // configured for this fit; never read otherwise.
-    let mut raw_prev: Vec<f32> = if matches!(config.boosters.nesterov, NesterovSpec::Agbm { .. }) {
-        raw.clone()
-    } else {
-        Vec::new()
-    };
     let mut interaction_gain_reference: Option<f64> = None;
     // Reusable gather scratch for the early-stopping deviance: the round loop below re-evaluates
     // deviance_for_rows_scratch every round against this SAME validation_rows, so hoisting the
@@ -895,12 +916,12 @@ fn fit_single(
         let mut fit_raw = raw.clone();
         if let Some((beta, _)) = agbm {
             let lookahead_alphas = combine_alphas(&current_alphas, &prev_alphas, beta)?;
-            // `set_tree_alphas` still runs: the mutated alphas are the model's real, persisted
-            // per-tree state (read by next round's `current_alphas`, by `encode_model`, and by the
-            // `BestSnapshot::Alphas` truncation restore) — only the O(n·T) raw RE-WALK below it is
-            // being replaced.
+            // Persist the mixed coefficients for the next round, serialization,
+            // and early-stopping snapshots.
             set_tree_alphas(&mut trees, &lookahead_alphas)?;
-            fit_raw = agbm_lookahead_raw(&raw, &raw_prev, beta)?;
+            // Mixing rounded score caches loses small updates at large intercepts.
+            // Reconstruct the lookahead from the actual leaves and mixed alphas.
+            fit_raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
         }
         let dart_cfg = config
             .boosters
@@ -913,7 +934,8 @@ fn fit_single(
             Vec::new()
         };
         if dart_drops.iter().any(|dropped| *dropped) {
-            fit_raw = raw_minus_dropped(&raw, x, &trees, &dart_drops)?;
+            fit_raw =
+                raw_from_tree_alphas_kept(f0_f32, offset.as_deref(), x, &trees, Some(&dart_drops))?;
         }
         // Bound the incremental cache's drift: re-derive `mu = exp(F)` from a fresh pass every
         // `INCREMENTAL_MU_REFRESH_ROUNDS`. `fit_raw == raw` on this gated path (no AGBM/DART), and
@@ -1003,27 +1025,15 @@ fn fit_single(
                 })?;
                 if let Some(dart) = dart_cfg {
                     let new_alpha = apply_dart_normalization(&mut trees, &dart_drops, dart)?;
-                    // §C3: incremental reconstruction (touches only the dropped trees + the new
-                    // one) instead of a full O(n·T) `raw_from_tree_alphas` re-walk — see
-                    // `raw_plus_dart_round`'s doc. Must run before `trees.push` below: it needs
-                    // `trees` as the pre-push (dropped-trees-only) set and `&tree` separately.
+                    // Supply the intermediate score to an optional leaf refit.
+                    // The round boundary below reconstructs the retained ensemble
+                    // in f64 before validation or the next gradient.
                     raw = raw_plus_dart_round(fit_raw, x, &trees, &dart_drops, &tree, new_alpha)?;
                     realized_extent.record_tree(&tree.splits, x)?;
                     trees.push((new_alpha, tree));
                 } else {
                     prev_alphas = current_alphas;
-                    // §C3: capture the pre-round `raw` (this round's incoming value — untouched
-                    // since the `raw.clone()` at the top of the round, so still holds it here) as
-                    // `raw_prev` for the NEXT round's AGBM lookahead blend. Gated on AGBM being
-                    // configured (raw_prev is never read otherwise) and mirrors `prev_alphas`'s
-                    // update site exactly, so the two stay in lockstep — including in the
-                    // (pre-existing, out-of-scope) AGBM+DART-combined case where this branch is
-                    // never taken and both stay frozen at their round-0 values.
-                    if agbm.is_some() {
-                        raw_prev = std::mem::replace(&mut raw, fit_raw);
-                    } else {
-                        raw = fit_raw;
-                    }
+                    raw = fit_raw;
                     // `raw` spans ALL rows (incl. any validation rows); grow's `leaf_of_row` covers
                     // every one of them only when grow saw the full set, so reuse it for the
                     // tree-walk-free update just then. Otherwise update_raw re-walks (unchanged).
@@ -1061,6 +1071,19 @@ fn fit_single(
                         rounds_since_mu_refresh += 1;
                     }
                     realized_extent.record_tree(&tree.splits, x)?;
+                    if precise_append {
+                        let columns = tree_split_columns(&tree, &x.data)?;
+                        for (row, (precise, value)) in
+                            precise_raw.iter_mut().zip(&mut raw).enumerate()
+                        {
+                            *precise +=
+                                f64::from(tree_value_for_row_with_columns(&tree, &columns, row)?);
+                            *value = *precise as f32;
+                        }
+                        if use_inc_mu && raw.iter().any(|value| value.abs() >= 30.0) {
+                            spec.loss.refresh_mu(&raw, &mut mu)?;
+                        }
+                    }
                     trees.push((1.0, tree));
                 }
                 update_interaction_gain_reference(
@@ -1084,6 +1107,18 @@ fn fit_single(
                         &mut trees,
                         &mut raw,
                     )?;
+                    if precise_append {
+                        precise_raw = raw64_from_tree_alphas_kept(
+                            f0_f32,
+                            offset.as_deref(),
+                            x,
+                            &trees,
+                            None,
+                        )?;
+                        for (value, precise) in raw.iter_mut().zip(&precise_raw) {
+                            *value = *precise as f32;
+                        }
+                    }
                     last_refit_tree_count = trees.len();
                 }
                 if matches!(
@@ -1092,6 +1127,7 @@ fn fit_single(
                         momentum_correction: true
                     }
                 ) {
+                    raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
                     spec.loss.grad_hess(y, &raw, weight, &mut gh)?;
                     let (correction_rows, correction_reweight) =
                         sample_rows(&config.sampling, &gh, spec.seed, t, &train_rows)?;
@@ -1192,6 +1228,12 @@ fn fit_single(
                             last_refit_tree_count = trees.len();
                         }
                     }
+                }
+                if !precise_append {
+                    // DART/AGBM mutate coefficients and ridge can mutate leaves.
+                    // The next gradient and this round's validation must see the
+                    // same accumulated score as the retained ensemble.
+                    raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
                 }
                 if let Some(val_rows) = validation_rows.as_deref() {
                     let deviance = prof::timed("earlystop_eval", || {
@@ -1358,6 +1400,7 @@ fn fit_single(
         schema_version: SCHEMA_VERSION_UNLIFTED,
         correction: None,
         bag_spans: None,
+        bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: gate_state.report(),
     };
@@ -1404,6 +1447,7 @@ pub(crate) fn fit_multiclass(
     spec: &FitSpec,
     cat_encoders: &CatEncoderStore,
 ) -> Result<MultiClassModel, PbError> {
+    validate_ensemble_fit_inputs(config, x, y, spec)?;
     match &config.boosters.ensemble {
         EnsembleSpec::Off => {
             fit_multiclass_single(config, x, y, n_classes, class_labels, spec, cat_encoders)
@@ -1508,7 +1552,7 @@ fn fit_multiclass_bagged(
             // Mirrors fit_outer_bag's two arms: a caller-fixed holdout is SHARED (bags train on
             // subagged train-proper rows + the appended holdout, masked so the fit early-stops
             // on it); otherwise each bag's own (stratified) carve runs inside the single fit.
-            let (rows, bag_mask): (Vec<u32>, Option<Vec<bool>>) = match spec.fixed_holdout {
+            let (mut rows, mut bag_mask): (Vec<u32>, Option<Vec<bool>>) = match spec.fixed_holdout {
                 Some(mask) => {
                     let train_idx: Vec<u32> =
                         (0..n_rows as u32).filter(|&r| !mask[r as usize]).collect();
@@ -1568,6 +1612,16 @@ fn fit_multiclass_bagged(
                     (rows, None)
                 }
             };
+            if bag_mask.is_none() && !subsample {
+                bag_mask = bootstrap_holdout_mask(
+                    &rows,
+                    config.validation_fraction,
+                    spec.seed,
+                    bag_round,
+                    Some(strata.as_slice()),
+                )?;
+            }
+            ensure_bag_training_mass(&mut rows, &mut bag_mask, spec)?;
             let data = row_subset(x, y, spec.weight, None, &rows)?;
             let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
             let bag_spec = FitSpec {
@@ -1675,6 +1729,7 @@ fn fit_multiclass_bagged(
             x,
             &strata,
             spec.weight,
+            spec.bag_groups,
             n_classes,
             &bag_in_bag,
             &oob_cols,
@@ -1733,6 +1788,7 @@ fn attach_multiclass_cell_correction(
     x: &BinnedMatrix,
     labels: &[u32],
     weight: Option<&[f32]>,
+    bag_groups: Option<&[u32]>,
     n_classes: usize,
     bag_in_bag: &[Vec<bool>],
     oob_cols: &[&Vec<Vec<f32>>],
@@ -1796,7 +1852,13 @@ fn attach_multiclass_cell_correction(
     multiclass_softmax(&oob_raw, n_classes, n_rows, &mut probs)?;
     // The SAME deterministic ~15% slice the scalar path holds out, so a K=2-vs-K>=3 comparison
     // of the guard is like for like.
-    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
+    let is_holdout = |r: usize| {
+        let identity = bag_groups
+            .and_then(|groups| groups.get(r))
+            .copied()
+            .map_or(r as u64, u64::from);
+        (identity.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38
+    };
 
     // (1) K decoupled diagonal-Hessian solves. Class k's working residual is the softmax
     // Newton residual z = -g/h with g = w(p_k - 1[y=k]) and h = w·p_k(1-p_k) — the K-class
@@ -2075,7 +2137,7 @@ fn fit_multiclass_single(
         what: "more than u32::MAX features".into(),
     })?)
         .collect();
-    let (train_rows, validation_rows) = match spec.fixed_holdout {
+    let (mut train_rows, mut validation_rows) = match spec.fixed_holdout {
         Some(mask) => split_rows_by_mask(x.n_rows, mask)?,
         // ES-stratify: rank the internal early-stopping holdout WITHIN each class (the
         // class labels ARE the strata), mirroring fit_single's Logistic rule — a rare
@@ -2087,13 +2149,19 @@ fn fit_multiclass_single(
             Some(&labels),
         )?,
     };
+    ensure_validation_mass(
+        &mut train_rows,
+        &mut validation_rows,
+        weight,
+        spec.fixed_holdout.is_some(),
+    )?;
     let max_delta_step = config.max_delta_step.map(f64::from);
 
     // Per-class init `f0_k = ln(prior_k)`; K raw columns seeded to `f0_k`.
     // Intercept honesty (mirrors fit_single): with a validation carve the class priors are
     // computed over TRAIN rows only, so the holdout's class mix never leaks into the
     // early-stopping baseline through f0. Without a carve this is byte-identical.
-    let f0 = if validation_rows.is_some() {
+    let f0 = if train_rows.len() != n {
         let (train_labels, train_weight): (Vec<u32>, Vec<f32>) = train_rows
             .iter()
             .map(|&r| -> Result<(u32, f32), PbError> {
@@ -2393,6 +2461,7 @@ fn fit_multiclass_single(
             schema_version: SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -2729,6 +2798,16 @@ fn validate_ensemble_fit_inputs(
     validate_fit_spec(config, spec)?;
     validate_binned_matrix(x)?;
     let n = x.n_rows as usize;
+    if n == 0 {
+        return Err(invalid_input("fit requires at least one row".into()));
+    }
+    if let Some(mask) = spec.fixed_holdout {
+        if mask.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!("fixed_holdout len {} != n_rows {n}", mask.len()),
+            });
+        }
+    }
     if let Some(g) = spec.bag_groups {
         if g.len() != n {
             return Err(PbError::ShapeMismatch {
@@ -2747,6 +2826,15 @@ fn validate_ensemble_fit_inputs(
                 what: format!("weight len {} != n_rows {n}", weight.len()),
             });
         }
+        if weight
+            .iter()
+            .any(|value| !value.is_finite() || *value < 0.0)
+            || !weight.iter().any(|value| *value > 0.0)
+        {
+            return Err(invalid_input(
+                "sample weights must be finite, nonnegative, and have positive total mass".into(),
+            ));
+        }
     }
     if let Some(exposure) = spec.exposure {
         if exposure.len() != n {
@@ -2763,6 +2851,117 @@ fn validate_ensemble_fit_inputs(
 struct BagOob {
     in_bag: Vec<bool>,
     preds: Vec<f32>,
+}
+
+/// Carve source observations rather than bootstrap positions, so copies stay together.
+fn bootstrap_holdout_mask(
+    rows: &[u32],
+    fraction: Option<f32>,
+    seed: u64,
+    bag: u32,
+    strata: Option<&[u32]>,
+) -> Result<Option<Vec<bool>>, PbError> {
+    if fraction.is_none() {
+        return Ok(None);
+    }
+    let sources: Vec<u32> = rows
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if sources.len() < 2 {
+        return Ok(None);
+    }
+    let local_strata = strata
+        .map(|values| gather_strata(values, &sources))
+        .transpose()?;
+    let Some(mask) = holdout_mask(
+        sources.len() as u32,
+        fraction,
+        pb_seed(seed, bag, Stage::Sample as u32, 0),
+        local_strata.as_deref(),
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(
+        rows.iter()
+            .map(|source| {
+                sources
+                    .binary_search(source)
+                    .ok()
+                    .and_then(|index| mask.get(index))
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .collect(),
+    ))
+}
+
+/// Deterministically retain positive training mass when a sparse weight ledger's
+/// positive observations were omitted by a bag draw. Preserve declared group membership.
+fn ensure_bag_training_mass(
+    rows: &mut Vec<u32>,
+    mask: &mut Option<Vec<bool>>,
+    spec: &FitSpec<'_>,
+) -> Result<(), PbError> {
+    let Some(weights) = spec.weight else {
+        return Ok(());
+    };
+    if rows.iter().enumerate().any(|(i, row)| {
+        !mask
+            .as_ref()
+            .and_then(|m| m.get(i))
+            .copied()
+            .unwrap_or(false)
+            && weights.get(*row as usize).is_some_and(|w| *w > 0.0)
+    }) {
+        return Ok(());
+    }
+    let positive = weights
+        .iter()
+        .enumerate()
+        .find(|(row, weight)| {
+            **weight > 0.0
+                && !spec
+                    .fixed_holdout
+                    .and_then(|m| m.get(*row))
+                    .copied()
+                    .unwrap_or(false)
+        })
+        .map(|(row, _)| row)
+        .ok_or_else(|| invalid_input("bag has no eligible positive training mass".into()))?;
+    let group = spec.bag_groups.and_then(|g| g.get(positive)).copied();
+    let retained = |row: usize| {
+        row == positive
+            || group.is_some_and(|id| spec.bag_groups.and_then(|g| g.get(row)) == Some(&id))
+    };
+    // If the source was carved into an automatic holdout, promote all its copies
+    // together rather than putting a newly appended copy into training alone.
+    if let Some(mask) = mask.as_mut() {
+        for (row, held) in rows.iter().zip(mask.iter_mut()) {
+            if retained(*row as usize) {
+                *held = false;
+            }
+        }
+    }
+    for row in 0..weights.len() {
+        if retained(row)
+            && !rows.contains(&(row as u32))
+            && !spec
+                .fixed_holdout
+                .and_then(|m| m.get(row))
+                .copied()
+                .unwrap_or(false)
+        {
+            rows.push(row as u32);
+            if let Some(mask) = mask.as_mut() {
+                mask.push(false);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn fit_outer_bag(
@@ -2823,7 +3022,9 @@ fn fit_outer_bag(
                 // training rows from train-proper only and appends the SHARED holdout, which the
                 // encoders were blinded to at binning time; the bag-local mask marks those rows so
                 // fit_single early-stops on them instead of carving its own (leaky) slice.
-                let (rows, bag_mask): (Vec<u32>, Option<Vec<bool>>) = match spec.fixed_holdout {
+                let (mut rows, mut bag_mask): (Vec<u32>, Option<Vec<bool>>) = match spec
+                    .fixed_holdout
+                {
                     Some(mask) => {
                         let train_idx: Vec<u32> =
                             (0..n_rows as u32).filter(|&r| !mask[r as usize]).collect();
@@ -2899,6 +3100,16 @@ fn fit_outer_bag(
                         (rows, None)
                     }
                 };
+                if bag_mask.is_none() && !subsample {
+                    bag_mask = bootstrap_holdout_mask(
+                        &rows,
+                        config.validation_fraction,
+                        spec.seed,
+                        bag_round,
+                        strata.as_deref(),
+                    )?;
+                }
+                ensure_bag_training_mass(&mut rows, &mut bag_mask, spec)?;
                 let data = row_subset(x, y, spec.weight, spec.exposure, &rows)?;
                 let bag_seed = pb_seed(spec.seed, bag_round, Stage::Sample as u32, 0);
                 let bag_spec = FitSpec {
@@ -3145,7 +3356,14 @@ fn attach_cell_correction(
     spec.loss.grad_hess(y, &oob_raw, &sample_w, &mut gh)?;
     // A deterministic ~15% slice held OUT of the correction fit, used below to choose a global
     // shrinkage so the correction can only help on honest data (the no-harm guard).
-    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
+    let is_holdout = |r: usize| {
+        let identity = spec
+            .bag_groups
+            .and_then(|groups| groups.get(r))
+            .copied()
+            .map_or(r as u64, u64::from);
+        (identity.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38
+    };
     let mut residual = vec![0.0_f64; n_rows];
     let mut weight = vec![0.0_f64; n_rows];
     for r in 0..n_rows {
@@ -4311,6 +4529,7 @@ fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
         schema_version: SCHEMA_VERSION_UNLIFTED,
         correction: None,
         bag_spans: Some(bag_spans),
+        bag_intercepts: Some(members.iter().map(|m| m.model.f0).collect()),
         // Filled in by `fit_outer_bag` (the only caller with a row partition to record).
         bag_in_bag: None,
         // Each bag ran its own independent gate (its own bootstrap/subagged rows ⇒ its own
@@ -4437,15 +4656,45 @@ fn raw_from_tree_alphas(
     x: &BinnedMatrix,
     trees: &[(f32, ObliviousTree)],
 ) -> Result<Vec<f32>, PbError> {
+    raw_from_tree_alphas_kept(f0, offset, x, trees, None)
+}
+
+fn raw_from_tree_alphas_kept(
+    f0: f32,
+    offset: Option<&[f32]>,
+    x: &BinnedMatrix,
+    trees: &[(f32, ObliviousTree)],
+    drops: Option<&[bool]>,
+) -> Result<Vec<f32>, PbError> {
+    Ok(raw64_from_tree_alphas_kept(f0, offset, x, trees, drops)?
+        .into_iter()
+        .map(|value| value as f32)
+        .collect())
+}
+
+fn raw64_from_tree_alphas_kept(
+    f0: f32,
+    offset: Option<&[f32]>,
+    x: &BinnedMatrix,
+    trees: &[(f32, ObliviousTree)],
+    drops: Option<&[bool]>,
+) -> Result<Vec<f64>, PbError> {
     let n_rows = x.n_rows as usize;
-    let mut out: Vec<f32> = crate::engine::Hist::try_zeroed_vec(n_rows, "AGBM raw")?;
+    let mut out: Vec<f64> = crate::engine::Hist::try_zeroed_vec(n_rows, "ensemble raw")?;
     let tree_columns: Vec<Vec<&[u8]>> = trees
         .iter()
         .map(|(_, tree)| tree_split_columns(tree, &x.data))
         .collect::<Result<_, _>>()?;
     for row in 0..n_rows {
         let mut score = base_raw(offset, f0, row)?;
-        for ((alpha, tree), columns) in trees.iter().zip(&tree_columns) {
+        for (index, ((alpha, tree), columns)) in trees.iter().zip(&tree_columns).enumerate() {
+            if drops
+                .and_then(|mask| mask.get(index))
+                .copied()
+                .unwrap_or(false)
+            {
+                continue;
+            }
             score +=
                 f64::from(*alpha) * f64::from(tree_value_for_row_with_columns(tree, columns, row)?);
         }
@@ -4456,7 +4705,7 @@ fn raw_from_tree_alphas(
         }
         *out.get_mut(row).ok_or_else(|| PbError::Internal {
             what: "AGBM raw write escaped".into(),
-        })? = score as f32;
+        })? = score;
     }
     Ok(out)
 }
@@ -4481,6 +4730,7 @@ fn raw_from_tree_alphas(
 /// accumulation vs the old full walk (a sum over 2 terms instead of over T tree contributions), so
 /// AGBM's fitted numbers move relative to the prior implementation — see `NesterovSpec::Agbm`'s doc;
 /// this function does not claim bit-identity with `raw_from_tree_alphas`, only algebraic equivalence.
+#[cfg(test)]
 fn agbm_lookahead_raw(raw: &[f32], raw_prev: &[f32], beta: f32) -> Result<Vec<f32>, PbError> {
     if raw.len() != raw_prev.len() {
         return Err(PbError::ShapeMismatch {
@@ -4530,6 +4780,7 @@ fn dart_drop_mask(
     Ok(out)
 }
 
+#[cfg(test)]
 fn raw_minus_dropped(
     raw: &[f32],
     x: &BinnedMatrix,
@@ -5338,7 +5589,7 @@ pub(crate) fn reanchor_delta(
 /// every row is included with p_i = 1). Callers MUST scale that round's `(g, h)` at each sampled
 /// row by its multiplier (see `reweighted_gh`) before using them for SPLIT SELECTION — the raw
 /// gradients/hessians are otherwise a gradient-biased sample of the population, not an unbiased
-/// estimator of the full-data gain.
+/// estimator of the full-data gradient and Hessian totals.
 ///
 /// Returns `Cow` rather than an owned `Vec`: `Sampling::Full` (and the MVS `k == n` fallback)
 /// borrow `all_rows` directly instead of copying it — this is the row list `fit_single`'s round
@@ -5353,79 +5604,18 @@ fn sample_rows<'a>(
     round: u32,
     all_rows: &'a [u32],
 ) -> Result<SampledRows<'a>, PbError> {
-    match *sampling {
-        Sampling::Full => Ok((std::borrow::Cow::Borrowed(all_rows), None)),
-        Sampling::Mvs { rate, min_rows } => {
-            let n = all_rows.len();
-            if n == 0 {
-                return Ok((std::borrow::Cow::Borrowed(all_rows), None));
-            }
-            let target = ((n as f64) * f64::from(rate)).ceil() as usize;
-            let min_rows = usize::try_from(min_rows).map_err(|_| PbError::Internal {
-                what: "MVS min_rows exceeded usize".into(),
-            })?;
-            let k = target.max(min_rows).min(n).max(1);
-            if k == n {
-                // Every row included ⇒ p_i = 1 everywhere, no reweighting needed.
-                return Ok((std::borrow::Cow::Borrowed(all_rows), None));
-            }
-            let mut keyed: Vec<(f64, u32, f64)> = Vec::with_capacity(n);
-            let mut total_weight = 0.0_f64;
-            for (pos, &row) in all_rows.iter().enumerate() {
-                let ru = row as usize;
-                let g = f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
-                    what: "MVS row escaped gradients".into(),
-                })?);
-                let h = f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
-                    what: "MVS row escaped hessians".into(),
-                })?);
-                let s = (g * g + h * h).sqrt().max(1e-12);
-                total_weight += s;
-                let block = u32::try_from(pos).map_err(|_| PbError::InvalidInput {
-                    what: "MVS sampling supports at most u32::MAX rows".into(),
-                })?;
-                let bits = pb_seed(seed, round, Stage::Sample as u32, block);
-                let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
-                // Efraimidis-Spirakis PPS-without-replacement key. Larger is better
-                // (`ln(unit)` is negative; dividing by a larger gradient weight moves
-                // it closer to zero).
-                keyed.push((unit.ln() / s, row, s));
-            }
-            keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            keyed.truncate(k);
-            // Restore ascending row-id order (row ids are unique ⇒ unstable sort is fine).
-            keyed.sort_unstable_by_key(|&(_, row, _)| row);
-            // §06.5: p_i = min(1, s_i/μ), the size-biased inclusion probability, with the
-            // threshold μ = W/k chosen so Σ p_i ≈ k (W = Σ s_i over the population sampled
-            // from). 1/p_i = max(1, μ/s_i): rows whose own weight already clears the threshold
-            // (would be selected regardless) are left unscaled; the rest are upweighted to
-            // compensate for their lower selection chance, keeping the sampled Newton gain an
-            // unbiased estimator of the full-data gain.
-            let mu = total_weight.max(f64::EPSILON) / (k as f64);
-            let reweight: Vec<f64> = keyed.iter().map(|&(_, _, s)| (mu / s).max(1.0)).collect();
-            let rows: Vec<u32> = keyed.into_iter().map(|(_, row, _)| row).collect();
-            Ok((std::borrow::Cow::Owned(rows), Some(reweight)))
-        }
-    }
+    sample_rows_by_norm(sampling, seed, round, all_rows, |row| {
+        let g = f64::from(*gh.g.get(row as usize).ok_or_else(|| PbError::Internal {
+            what: "MVS row escaped gradients".into(),
+        })?);
+        let h = f64::from(*gh.h.get(row as usize).ok_or_else(|| PbError::Internal {
+            what: "MVS row escaped hessians".into(),
+        })?);
+        Ok(g.hypot(h))
+    })
 }
 
-/// [`sample_rows`]'s K-class form: ONE row draw per round for all K class trees, weighted by the
-/// JOINT gradient/hessian norm over classes,
-///   `s_i = sqrt( Σ_k g_ik² + Σ_k h_ik² )`,
-/// which reduces to the single-output `sqrt(g² + h²)` at K = 1 and is the reading the softmax
-/// coupling forces: the classes grow against the same round-start probabilities, so a row that
-/// carries no signal in class 0 but a lot in class 2 must be kept for BOTH trees or the round's
-/// K columns stop describing the same data. Sampling per class independently would give one
-/// round's trees disjoint views and break that.
-///
-/// Everything else — the Efraimidis-Spirakis PPS-without-replacement key, the `μ = W/k`
-/// threshold, `1/p_i = max(1, μ/s_i)`, the `k == n` short circuit, the deterministic
-/// `pb_seed(seed, round, Sample, pos)` stream — is [`sample_rows`]'s, verbatim, so a K-class MVS
-/// draw is the same estimator on the same seed stream.
-///
-/// # Errors
-/// [`PbError::Internal`] if a row escapes a class's gradient/hessian buffers;
-/// [`PbError::InvalidInput`] beyond `u32::MAX` rows.
+/// One shared draw for all class trees, using the joint gradient/Hessian norm.
 fn mc_sample_rows<'a>(
     sampling: &Sampling,
     gh_by_class: &[GradHess],
@@ -5433,53 +5623,110 @@ fn mc_sample_rows<'a>(
     round: u32,
     all_rows: &'a [u32],
 ) -> Result<SampledRows<'a>, PbError> {
-    match *sampling {
-        Sampling::Full => Ok((std::borrow::Cow::Borrowed(all_rows), None)),
-        Sampling::Mvs { rate, min_rows } => {
-            let n = all_rows.len();
-            if n == 0 || gh_by_class.is_empty() {
-                return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+    if gh_by_class.is_empty() {
+        return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+    }
+    sample_rows_by_norm(sampling, seed, round, all_rows, |row| {
+        let mut squared = 0.;
+        for gh in gh_by_class {
+            let g = f64::from(*gh.g.get(row as usize).ok_or_else(|| PbError::Internal {
+                what: "multiclass MVS row escaped gradients".into(),
+            })?);
+            let h = f64::from(*gh.h.get(row as usize).ok_or_else(|| PbError::Internal {
+                what: "multiclass MVS row escaped hessians".into(),
+            })?);
+            squared += g * g + h * h;
+        }
+        Ok(squared.sqrt())
+    })
+}
+
+fn sample_rows_by_norm<'a>(
+    sampling: &Sampling,
+    seed: u64,
+    round: u32,
+    all_rows: &'a [u32],
+    norm: impl Fn(u32) -> Result<f64, PbError>,
+) -> Result<SampledRows<'a>, PbError> {
+    let Sampling::Mvs { rate, min_rows } = *sampling else {
+        return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+    };
+    let n = all_rows.len();
+    if n == 0 {
+        return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+    }
+    let min_rows = usize::try_from(min_rows).map_err(|_| PbError::Internal {
+        what: "MVS min_rows exceeded usize".into(),
+    })?;
+    let k = (((n as f64) * f64::from(rate)).ceil() as usize)
+        .max(min_rows)
+        .min(n)
+        .max(1);
+    if k == n {
+        return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+    }
+    let mut scores = all_rows
+        .iter()
+        .map(|&row| {
+            let score = norm(row)?;
+            if !score.is_finite() {
+                return Err(PbError::InvalidInput {
+                    what: "MVS requires finite gradient norms".into(),
+                });
             }
-            let target = ((n as f64) * f64::from(rate)).ceil() as usize;
-            let min_rows = usize::try_from(min_rows).map_err(|_| PbError::Internal {
-                what: "MVS min_rows exceeded usize".into(),
-            })?;
-            let k = target.max(min_rows).min(n).max(1);
-            if k == n {
-                return Ok((std::borrow::Cow::Borrowed(all_rows), None));
+            Ok((row, score.max(1e-12)))
+        })
+        .collect::<Result<Vec<_>, PbError>>()?;
+    scores.sort_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+
+    // Solve sum min(1, s_i / mu) = k. Summing the small scores first avoids
+    // subtracting a dominant score from the total and losing the remaining mass.
+    let mut prefix = 0.;
+    let mut mu = 0.;
+    for (pos, &(_, score)) in scores.iter().enumerate() {
+        prefix += score;
+        let count = pos + 1;
+        if count > n - k {
+            let candidate = prefix / (count - (n - k)) as f64;
+            if scores.get(count).is_none_or(|next| next.1 >= candidate) {
+                mu = candidate;
+                break;
             }
-            let mut keyed: Vec<(f64, u32, f64)> = Vec::with_capacity(n);
-            let mut total_weight = 0.0_f64;
-            for (pos, &row) in all_rows.iter().enumerate() {
-                let ru = row as usize;
-                let mut sq = 0.0_f64;
-                for gh in gh_by_class {
-                    let g = f64::from(*gh.g.get(ru).ok_or_else(|| PbError::Internal {
-                        what: "multiclass MVS row escaped gradients".into(),
-                    })?);
-                    let h = f64::from(*gh.h.get(ru).ok_or_else(|| PbError::Internal {
-                        what: "multiclass MVS row escaped hessians".into(),
-                    })?);
-                    sq += g * g + h * h;
-                }
-                let s = sq.sqrt().max(1e-12);
-                total_weight += s;
-                let block = u32::try_from(pos).map_err(|_| PbError::InvalidInput {
-                    what: "MVS sampling supports at most u32::MAX rows".into(),
-                })?;
-                let bits = pb_seed(seed, round, Stage::Sample as u32, block);
-                let unit = ((bits >> 11) as f64 + 1.0) / ((1_u64 << 53) as f64 + 1.0);
-                keyed.push((unit.ln() / s, row, s));
-            }
-            keyed.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-            keyed.truncate(k);
-            keyed.sort_unstable_by_key(|&(_, row, _)| row);
-            let mu = total_weight.max(f64::EPSILON) / (k as f64);
-            let reweight: Vec<f64> = keyed.iter().map(|&(_, _, s)| (mu / s).max(1.0)).collect();
-            let rows: Vec<u32> = keyed.into_iter().map(|(_, row, _)| row).collect();
-            Ok((std::borrow::Cow::Owned(rows), Some(reweight)))
         }
     }
+    if !mu.is_finite() || mu <= 0. {
+        return Err(PbError::Internal {
+            what: "MVS inclusion threshold is invalid".into(),
+        });
+    }
+    scores.sort_unstable_by_key(|&(row, _)| row);
+    // A random offset through cumulative inclusion probabilities is a fixed-size
+    // systematic sample. Each interval has length p_i, so its inclusion probability
+    // is exactly p_i and 1/p_i corrects both gradient and Hessian totals.
+    let bits = pb_seed(seed, round, Stage::Sample as u32, 0);
+    let mut next = (bits >> 12) as f64 / (1_u64 << 52) as f64;
+    let mut cumulative = 0.;
+    let mut rows = Vec::with_capacity(k);
+    let mut reweight = Vec::with_capacity(k);
+    for (pos, &(row, score)) in scores.iter().enumerate() {
+        let p = (score / mu).min(1.);
+        cumulative = if pos + 1 == n {
+            k as f64
+        } else {
+            cumulative + p
+        };
+        if next < cumulative && rows.len() < k {
+            rows.push(row);
+            reweight.push(1. / p);
+            next += 1.;
+        }
+    }
+    if rows.len() != k {
+        return Err(PbError::Internal {
+            what: "MVS draw missed its fixed sample size".into(),
+        });
+    }
+    Ok((std::borrow::Cow::Owned(rows), Some(reweight)))
 }
 
 /// Scale `gh`'s gradient/hessian at each of `rows` by the parallel `reweight` multiplier (§06.5
@@ -5621,6 +5868,42 @@ pub fn holdout_mask(
         }
     }
     Ok(Some(is_holdout))
+}
+
+// Zero-mass validation has no defined deviance. Disable early stopping in that case.
+// If an automatic carve takes every positive-weight row, abandon that carve entirely;
+// an explicit holdout must remain excluded from training, even when fitting is impossible.
+fn ensure_validation_mass(
+    train: &mut Vec<u32>,
+    validation: &mut Option<Vec<usize>>,
+    weight: &[f32],
+    fixed_holdout: bool,
+) -> Result<(), PbError> {
+    let has_training_mass = train
+        .iter()
+        .any(|&r| weight.get(r as usize).is_some_and(|&w| w > 0.0));
+    if !has_training_mass {
+        if fixed_holdout {
+            return Err(PbError::InvalidInput {
+                what: "training partition has no positive sample weight".into(),
+            });
+        }
+        if let Some(rows) = validation.take() {
+            for row in rows {
+                train.push(u32::try_from(row).map_err(|_| PbError::Internal {
+                    what: "validation row exceeds u32".into(),
+                })?);
+            }
+            train.sort_unstable();
+        }
+    } else if validation.as_ref().is_some_and(|rows| {
+        !rows
+            .iter()
+            .any(|&r| weight.get(r).is_some_and(|&w| w > 0.0))
+    }) {
+        *validation = None;
+    }
+    Ok(())
 }
 
 /// Split rows by a precomputed holdout mask into (train rows, validation rows) with the same
@@ -7278,6 +7561,7 @@ fn update_raw(
             let leaf = *leaf_of_row.get(r).ok_or_else(|| PbError::Internal {
                 what: "update_raw precomputed membership row escaped".into(),
             })?;
+            let previous = *slot;
             *slot += *tree
                 .leaves
                 .get(usize::from(leaf))
@@ -7292,6 +7576,11 @@ fn update_raw(
                     .ok_or_else(|| PbError::Internal {
                         what: "incremental-mu leaf id escaped the multiplier table".into(),
                     })?;
+                if previous.abs() >= 30.0 || slot.abs() >= 30.0 {
+                    if let Some(entry) = mu.get_mut(r) {
+                        *entry = f64::from(slot.clamp(-30.0, 30.0).exp());
+                    }
+                }
             }
         }
         return Ok(());
@@ -7299,11 +7588,17 @@ fn update_raw(
     let columns = tree_split_columns(tree, &x.data)?;
     for (r, slot) in raw.iter_mut().enumerate() {
         let v = tree_value_for_row_with_columns(tree, &columns, r)?;
+        let previous = *slot;
         *slot += v;
         if let Some(mu) = mu.as_deref_mut() {
             *mu.get_mut(r).ok_or_else(|| PbError::Internal {
                 what: "update_raw mu walk row escaped".into(),
             })? *= f64::from(v).exp();
+            if previous.abs() >= 30.0 || slot.abs() >= 30.0 {
+                if let Some(entry) = mu.get_mut(r) {
+                    *entry = f64::from(slot.clamp(-30.0, 30.0).exp());
+                }
+            }
         }
     }
     Ok(())
@@ -7337,6 +7632,7 @@ fn update_raw_split(
         let slot = raw.get_mut(r as usize).ok_or_else(|| PbError::Internal {
             what: "update_raw_split covered row escaped raw".into(),
         })?;
+        let previous = *slot;
         *slot += *tree
             .leaves
             .get(usize::from(leaf))
@@ -7351,6 +7647,11 @@ fn update_raw_split(
                 .ok_or_else(|| PbError::Internal {
                     what: "incremental-mu leaf id escaped the multiplier table".into(),
                 })?;
+            if previous.abs() >= 30.0 || slot.abs() >= 30.0 {
+                if let Some(entry) = mu.get_mut(r as usize) {
+                    *entry = f64::from(slot.clamp(-30.0, 30.0).exp());
+                }
+            }
         }
     }
     if !walk_rows.is_empty() {
@@ -7360,11 +7661,17 @@ fn update_raw_split(
             let slot = raw.get_mut(r).ok_or_else(|| PbError::Internal {
                 what: "update_raw_split walk row escaped raw".into(),
             })?;
+            let previous = *slot;
             *slot += v;
             if let Some(mu) = mu.as_deref_mut() {
                 *mu.get_mut(r).ok_or_else(|| PbError::Internal {
                     what: "update_raw_split walk mu row escaped".into(),
                 })? *= f64::from(v).exp();
+                if previous.abs() >= 30.0 || slot.abs() >= 30.0 {
+                    if let Some(entry) = mu.get_mut(r) {
+                        *entry = f64::from(slot.clamp(-30.0, 30.0).exp());
+                    }
+                }
             }
         }
     }
@@ -12668,6 +12975,42 @@ mod tests {
     }
 
     #[test]
+    fn bug001_scalar_and_multiclass_mvs_estimate_population_totals() {
+        let gh = GradHess {
+            g: vec![100., 0., 0.],
+            h: vec![1.; 3],
+        };
+        let sampling = Sampling::Mvs {
+            rate: 0.5,
+            min_rows: 1,
+        };
+        let rows = [0, 1, 2];
+        for multiclass in [false, true] {
+            let mut total_h = 0.;
+            let mut total_g = 0.;
+            for seed in 0..10_000 {
+                let (selected, weights) = if multiclass {
+                    mc_sample_rows(&sampling, std::slice::from_ref(&gh), seed, 0, &rows)
+                } else {
+                    sample_rows(&sampling, &gh, seed, 0, &rows)
+                }
+                .unwrap();
+                let weights = weights.unwrap();
+                for (&row, &weight) in selected.iter().zip(&weights) {
+                    total_h += f64::from(gh.h[row as usize]) * weight;
+                    total_g += f64::from(gh.g[row as usize]) * weight;
+                }
+            }
+            assert!(
+                (total_h / 10_000. - 3.).abs() < 0.1,
+                "biased Hessian estimate: {} (multiclass={multiclass})",
+                total_h / 10_000.
+            );
+            assert!((total_g / 10_000. - 100.).abs() < 1.);
+        }
+    }
+
+    #[test]
     fn mvs_reweight_matches_the_closed_form_and_is_absent_under_full_sampling() {
         // Sampling::Full needs no reweighting: every row is included with p_i = 1.
         let rows: Vec<u32> = (0..10).collect();
@@ -12680,7 +13023,8 @@ mod tests {
         assert_eq!(full_rows, rows);
         assert!(full_reweight.is_none());
 
-        // §06.5 closed form: p_i = min(1, s_i/mu) with mu = (Σ s_i)/k (k = sample size). Recompute
+        // This fixture has no saturated rows, so the solution of sum p_i = k is mu = Σs/k.
+        // §06.5: p_i = min(1, s_i/mu). Recompute
         // mu and each selected row's expected 1/p_i independently from the SAME per-row weights
         // sample_rows derives from `gh`, and assert an exact match — deterministic plumbing, not
         // a statistical property.

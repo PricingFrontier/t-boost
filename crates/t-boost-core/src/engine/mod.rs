@@ -864,6 +864,10 @@ pub struct Model {
     /// the averaged tables). Never serialized: `None` on single fits and loaded models.
     #[serde(skip)]
     pub bag_spans: Option<Vec<(u32, u32)>>,
+    /// Runtime-only intercept of each standalone bag, in the order of `bag_spans`.
+    /// Preserves honest out-of-bag predictions; omitted from wire identity.
+    #[serde(skip)]
+    pub bag_intercepts: Option<Vec<f32>>,
     /// Runtime-only per-bag IN-BAG row membership over the FIT rows (`bag_in_bag[b][r]` is
     /// true iff fit row `r` was drawn into bag `b`'s training sample, in the same bag order
     /// as [`Model::bag_spans`]), recorded by the outer-bag soup alongside the spans.
@@ -1267,8 +1271,8 @@ impl Model {
         Ok(acc)
     }
 
-    /// Raw score for one already-binned row, accumulated in the production `f32`
-    /// scoring width (spec §10 path A).
+    /// Raw score for one already-binned row, accumulated in `f64` and rounded once
+    /// to the public `f32` scoring width (spec §10 path A).
     ///
     /// # Errors
     /// [`PbError::ShapeMismatch`] if `row_bins` does not match this model's width;
@@ -1283,12 +1287,12 @@ impl Model {
                 ),
             });
         }
-        let mut acc = self.f0 + offset;
+        let mut acc = f64::from(self.f0) + f64::from(offset);
         for (alpha, tree) in &self.trees {
-            acc += *alpha * tree.lookup(row_bins)?;
+            acc += f64::from(*alpha) * f64::from(tree.lookup(row_bins)?);
         }
-        acc += self.correction_delta(row_bins)? as f32;
-        Ok(acc)
+        acc += self.correction_delta(row_bins)?;
+        Ok(acc as f32)
     }
 
     /// Batch raw scores over a column-major [`BinnedMatrix`] into `out`.
@@ -1405,9 +1409,10 @@ impl Model {
         ];
         for &r in rows {
             let r = r as usize;
-            let mut score = self.f0;
+            let mut score = f64::from(self.f0);
             for ((alpha, tree), columns) in self.trees.iter().zip(&tree_columns) {
-                score += *alpha * tree_value_for_row_with_columns(tree, columns, r)?;
+                score += f64::from(*alpha)
+                    * f64::from(tree_value_for_row_with_columns(tree, columns, r)?);
             }
             if self.correction.is_some() {
                 for (a, col) in x.data.iter().enumerate() {
@@ -1415,11 +1420,11 @@ impl Model {
                         what: "score_trees_rows column shorter than n_rows".into(),
                     })?;
                 }
-                score += self.correction_delta(&row_bins)? as f32;
+                score += self.correction_delta(&row_bins)?;
             }
             *out.get_mut(r).ok_or_else(|| PbError::Internal {
                 what: "score_trees_rows row escaped out".into(),
-            })? = score;
+            })? = score as f32;
         }
         Ok(())
     }

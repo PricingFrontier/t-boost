@@ -37,6 +37,14 @@ pub fn build_grid(
                 what: format!("weight len {} != column len {}", w.len(), col.len()),
             });
         }
+        if w.iter().any(|value| !value.is_finite() || *value < 0.0)
+            || !w.iter().any(|value| *value > 0.0)
+        {
+            return Err(PbError::InvalidInput {
+                what: "sample weights must be finite, nonnegative, and have positive total mass"
+                    .into(),
+            });
+        }
     }
 
     // Collect finite (value, weight) pairs — NaN and ±inf are excluded from border
@@ -59,7 +67,7 @@ pub fn build_grid(
             fw.push((v, wt));
         }
     }
-    if fw.is_empty() {
+    if fw.iter().all(|(_, weight)| *weight == 0.0) {
         // All-missing axis: no interior borders ⇒ 1 degenerate data bin + missing.
         return Ok(BorderGrid {
             borders: Vec::new(),
@@ -87,7 +95,13 @@ pub fn build_grid(
         quantile_borders(&fw, cfg.max_bin)?
     } else {
         let sample = subsample_sorted(&fw, cfg.subsample_for_binning, seed, feat)?;
-        quantile_borders(&sample, cfg.max_bin)?
+        if sample.iter().any(|(_, weight)| *weight > 0.0) {
+            quantile_borders(&sample, cfg.max_bin)?
+        } else {
+            // A valid weighted feature can have all of its mass outside the
+            // seeded binning sample. Use its full ledger in that case.
+            quantile_borders(&fw, cfg.max_bin)?
+        }
     };
 
     if cfg.min_data_per_bin > 0 {
@@ -135,10 +149,20 @@ fn midpoint_borders(distinct: &[f32]) -> Vec<f32> {
     distinct
         .windows(2)
         .filter_map(|w| match w {
-            [a, b] => Some(((f64::from(*a) + f64::from(*b)) / 2.0) as f32),
+            [a, b] => Some(separating_border(*a, *b)),
             _ => None,
         })
         .collect()
+}
+
+fn separating_border(a: f32, b: f32) -> f32 {
+    let midpoint = ((f64::from(a) + f64::from(b)) * 0.5) as f32;
+    // Borders are upper-inclusive: rounding to b would merge the two values.
+    if midpoint >= b {
+        a
+    } else {
+        midpoint
+    }
 }
 
 /// Interior quantile probabilities `linspace(0,1,max_bin+1)[1..max_bin]` — the
@@ -191,7 +215,10 @@ fn weighted_quantiles(
         // (cum[i] == target), the quantile straddles vals[i] and vals[i+1] — average
         // them. Otherwise (cum[i] > target) the inverted-CDF value vals[i] stands.
         let v = if i < last && *cum.get(i).ok_or_else(internal("quantile cum"))? == target {
-            (hi + *vals.get(i + 1).ok_or_else(internal("quantile next"))?) / 2.0
+            f64::from(separating_border(
+                hi as f32,
+                *vals.get(i + 1).ok_or_else(internal("quantile next"))? as f32,
+            ))
         } else {
             hi
         };
@@ -278,7 +305,7 @@ fn refill_borders(borders: Vec<f32>, fw: &[(f32, f64)], max_bin: usize) -> Vec<f
         let (Some(a), Some(b)) = (val(split - 1), val(split)) else {
             break;
         };
-        out.push(((f64::from(a) + f64::from(b)) * 0.5) as f32);
+        out.push(separating_border(a, b));
         if let Some(slot) = intervals.get_mut(k) {
             *slot = (lo, split);
         }
@@ -401,6 +428,27 @@ mod tests {
         assert_eq!(g.borders, vec![1.5, 2.5]);
         assert_eq!(g.n_bins, 4); // 3 data + missing
         assert!(is_strictly_ascending(&g.borders));
+    }
+
+    #[test]
+    fn bug006_adjacent_floats_separate_in_midpoints_quantiles_and_refills() {
+        for (a, b) in [
+            (16_777_218., 16_777_220.),
+            (16_777_216., 16_777_218.),
+            (-16_777_220., -16_777_218.),
+            (f32::from_bits(1), f32::from_bits(2)),
+            (-f32::from_bits(2), -f32::from_bits(1)),
+            (f32::from_bits(f32::MAX.to_bits() - 1), f32::MAX),
+        ] {
+            for border in [
+                midpoint_borders(&[a, b])[0],
+                refill_borders(vec![], &[(a, 1.), (b, 1.)], 2)[0],
+                weighted_quantiles(&[f64::from(a), f64::from(b)], &[1., 2.], 2., &[0.5]).unwrap()
+                    [0],
+            ] {
+                assert!(a <= border && border < b, "{a} <= {border} < {b}");
+            }
+        }
     }
 
     #[test]

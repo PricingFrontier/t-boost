@@ -166,7 +166,7 @@ jobs:
             target: x86_64
             manylinux: "musllinux_1_2"
             artifact: linux-x86_64-musllinux_1_2
-          - os: macos-13
+          - os: macos-15-intel
             target: x86_64
             artifact: macos-x86_64
           - os: macos-14
@@ -209,7 +209,7 @@ jobs:
             source .venv-smoke/bin/activate
           fi
           python -m pip install --upgrade pip
-          python -m pip install --find-links dist t-boost
+          python -m pip install dist/*.whl
           python - <<'PY'
           import numpy as np
           from t_boost.sklearn import TBoostRegressor

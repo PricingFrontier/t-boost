@@ -1074,8 +1074,8 @@ fn best_level_split_scored(
         let ndb = *n_data_bins
             .get(p)
             .ok_or_else(internal("n_data_bins index"))?;
-        if ndb < 2 {
-            continue; // need >=2 data bins for a non-trivial split
+        if ndb == 0 {
+            continue;
         }
         // Does a candidate on THIS axis reuse a level already on the tree? Invariant for
         // the whole axis, so it is resolved once here rather than per candidate bin (B8).
@@ -1147,13 +1147,16 @@ fn best_level_split_scored(
             })
             .sum();
 
-        // Prefix the data bins 1..=v as v advances; evaluate both missing directions.
+        // v=0 isolates missing rows; later thresholds prefix finite bins.
         let mut data_l_g = smallvec::SmallVec::<[f64; MAX_SCAN_LEAVES]>::from_elem(0.0_f64, nl);
         let mut data_l_h = smallvec::SmallVec::<[f64; MAX_SCAN_LEAVES]>::from_elem(0.0_f64, nl);
         let mut data_l_c = smallvec::SmallVec::<[u64; MAX_SCAN_LEAVES]>::from_elem(0u64, nl);
         let mut data_l_w = smallvec::SmallVec::<[f64; MAX_SCAN_LEAVES]>::from_elem(0.0_f64, nl);
-        for v in 1..ndb {
+        for v in 0..ndb {
             for leaf in 0..nl {
+                if v == 0 {
+                    continue;
+                }
                 let o = hist
                     .offset(leaf, p, v)
                     .ok_or_else(internal("prefix offset"))?;
@@ -1175,6 +1178,9 @@ fn best_level_split_scored(
             // `low_bit`) must stay in agreement; the grow→lookup round-trip proptest
             // guards that. A change to the routing rule must touch both.
             for &ml in &[false, true] {
+                if v == 0 && !ml {
+                    continue;
+                }
                 let mut acc = 0.0_f64;
                 // Credibility (§07.3 step 2): a candidate is rejected if ANY of its child
                 // cells across ALL current leaves falls under a floor — the symmetric
@@ -2259,12 +2265,13 @@ pub(crate) fn grow_oblivious_tree(
 
 fn axis_raw_if_splittable(x: &BinnedMatrix, axis: u32) -> Option<u32> {
     let prov = x.provenance.get(axis as usize)?;
-    // Degenerate-axis pre-filter: an axis with < 2 data bins (n_bins ≤ 2) has no candidate split
-    // and is unconditionally skipped in `best_level_split` (ndb < 2). Excluding it here is
-    // byte-identical to building-then-skipping it, but avoids the wasted O(rows) histogram build.
+    // A single finite bin can still split informative missingness.
     let grid = x.grids.get(axis as usize)?;
     if usize::from(grid.n_bins).saturating_sub(1) < 2 {
-        return None;
+        let bins = x.data.get(axis as usize)?;
+        if !bins.contains(&0) || !bins.iter().any(|&bin| bin != 0) {
+            return None;
+        }
     }
     Some(prov.raw.0)
 }
@@ -4225,6 +4232,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         }

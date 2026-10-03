@@ -205,6 +205,7 @@ impl TableModel {
                     ),
                 });
             }
+            validate_effect_identity(&what, &table.u, &table.axes, self.bank.merged_grids.len())?;
             for (axis_idx, axis) in table.axes.iter().enumerate() {
                 validate_axis(&what, axis_idx, axis)?;
             }
@@ -253,6 +254,7 @@ impl TableModel {
                     ),
                 });
             }
+            validate_effect_identity(&what, &triple.u, &triple.axes, self.bank.merged_grids.len())?;
             for (axis_idx, axis) in triple.axes.iter().enumerate() {
                 validate_axis(&what, axis_idx, axis)?;
             }
@@ -442,9 +444,13 @@ impl TableModel {
         let mut raw64 = vec![0.0_f64; n_rows];
         match maps {
             Some(m) => {
-                if m.merged_grids != self.bank.merged_grids {
+                if m.merged_grids != self.bank.merged_grids
+                    || m.grids != self.grids
+                    || m.provenance != self.provenance
+                    || m.cat_encoders != self.schema.cat_encoders
+                {
                     return Err(PbError::InvalidInput {
-                        what: "cell maps were built for a model with different merged grids".into(),
+                        what: "cell maps were built for different grids, provenance, or categorical encoders".into(),
                     });
                 }
                 crate::scoring::score_bank_binned_with_maps(&self.bank, &m.maps, x, &mut raw64)?;
@@ -497,6 +503,26 @@ impl TableModel {
 /// Validate one [`BorderGrid`]'s well-formedness: `missing_bin == 0`, `n_bins` in range and
 /// consistent with `borders.len()`, every border finite, and borders strictly ascending.
 /// Mirrors `Model::validate`'s grid loop (engine/mod.rs) field-for-field.
+fn validate_effect_identity(
+    what: &str,
+    u: &crate::explain::FeatureSet,
+    axes: &[AxisId],
+    n_raw: usize,
+) -> Result<(), PbError> {
+    let sorted = u.0.windows(2).all(|pair| matches!(pair, [a, b] if a < b));
+    if !sorted
+        || u.0
+            .iter()
+            .zip(axes)
+            .any(|(raw, axis)| *raw != axis.raw || raw.0 as usize >= n_raw)
+    {
+        return Err(PbError::ShapeMismatch {
+            what: format!("{what} feature set does not match its ordered raw axes"),
+        });
+    }
+    Ok(())
+}
+
 fn validate_border_grid(what: &str, axis: usize, grid: &BorderGrid) -> Result<(), PbError> {
     if grid.missing_bin != 0 {
         return Err(PbError::InvalidInput {

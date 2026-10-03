@@ -81,6 +81,12 @@ def concentration_gini(y: Any, score: Any, weight: Any | None = None) -> float:
     order = _order_desc(score)
     ws = w[order]
     ys = yc[order] * ws
+    # A tied score carries no ordering evidence. Traverse each tie as one
+    # straight segment, independent of the input row order within that group.
+    ranked = score[order]
+    starts = np.r_[0, np.flatnonzero(ranked[1:] != ranked[:-1]) + 1]
+    ws = np.add.reduceat(ws, starts)
+    ys = np.add.reduceat(ys, starts)
     x = np.cumsum(ws) / total_w
     yy = np.cumsum(ys) / total_yw
     prev_x = np.concatenate(([0.0], x[:-1]))
@@ -168,15 +174,21 @@ def mean_tweedie_deviance(y: Any, pred: Any, weight: Any | None = None, power: f
     """
     y = np.asarray(y, dtype=np.float64)
     pred = np.asarray(pred, dtype=np.float64)
+    if y.ndim != 1 or pred.ndim != 1 or y.size == 0:
+        raise ValueError("y and pred must be nonempty vectors")
     n = y.shape[0]
     if pred.shape[0] != n:
         raise ValueError(f"pred has {pred.shape[0]} rows but y has {n}")
     weight = np.ones(n, dtype=np.float64) if weight is None else np.asarray(weight, dtype=np.float64)
-    if weight.shape[0] != n:
-        raise ValueError(f"weight has {weight.shape[0]} rows but y has {n}")
+    if weight.shape != (n,):
+        raise ValueError(f"weight must contain {n} values")
+    if not all(np.all(np.isfinite(v)) for v in (y, pred, weight)):
+        raise ValueError("y, pred, and weight must be finite")
+    if np.any(weight < 0) or weight.sum() <= 0:
+        raise ValueError("weight must be non-negative with positive total mass")
 
     p = float(power)
-    if p < 0.0 or 0.0 < p < 1.0:
+    if not np.isfinite(p) or p < 0.0 or 0.0 < p < 1.0:
         raise ValueError(f"power={p} is not supported (use 0, or any power >= 1)")
     if p == 0.0:
         dev = (y - pred) ** 2

@@ -13,6 +13,9 @@ use crate::{pb_seed, Stage};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod training_prior;
+use training_prior::TrainingPriorIndex;
+
 const MAX_CAT_BINS: usize = 254;
 const MAX_AUTO_SMOOTH: f64 = 1_000_000.0;
 const MIN_AUTO_VARIANCE: f64 = 1.0e-12;
@@ -1097,7 +1100,7 @@ pub fn fit_cat_encoder(
                 &fit_levels,
                 &row_terms,
                 base,
-                smooth,
+                spec.config.smooth,
                 spec.seed,
                 n_perms,
             )?,
@@ -1106,12 +1109,12 @@ pub fn fit_cat_encoder(
                 id_labels.len(),
                 &row_terms,
                 base,
-                smooth,
+                spec.config.smooth,
                 spec.seed,
                 k,
             )?,
             LeakageScheme::LeaveOneOut => {
-                loo_training_encodings(&fit_levels, &row_terms, base, smooth)?
+                loo_training_encodings(&fit_levels, &row_terms, base, spec.config.smooth)?
             }
         }
     };
@@ -1831,10 +1834,113 @@ fn assign_fisher_bins(levels: &mut [CatLevel]) -> Result<(), PbError> {
     Ok(())
 }
 
+/// Sufficient moments for a training-only categorical prior and Auto strength.
+#[derive(Clone, Copy, Default)]
+struct TrainingMoment {
+    weight: f64,
+    mean: f64,
+    within: f64,
+}
+
+impl TrainingMoment {
+    fn merge(self, other: Self) -> Self {
+        let weight = self.weight + other.weight;
+        if weight <= 0.0 {
+            return Self::default();
+        }
+        let delta = other.mean - self.mean;
+        Self {
+            weight,
+            mean: self.mean + delta * other.weight / weight,
+            within: self.within
+                + other.within
+                + delta * delta * self.weight * other.weight / weight,
+        }
+    }
+
+    fn add(&mut self, row: CatRowTerm) {
+        if row.denom > 0.0 {
+            *self = self.merge(Self {
+                weight: row.denom,
+                mean: row.sum_y / row.denom,
+                within: 0.0,
+            });
+        }
+    }
+}
+
+fn training_prior(moments: &[TrainingMoment], smooth: Smooth) -> Result<(f32, Smooth), PbError> {
+    let positive: Vec<_> = moments.iter().filter(|m| m.weight > 0.0).collect();
+    let global = positive
+        .iter()
+        .fold(TrainingMoment::default(), |all, m| all.merge(**m));
+    if global.weight <= 0.0 {
+        // No allowed target yet (e.g. the first ordered row). A fixed neutral
+        // target-scale prior is the only value independent of withheld targets.
+        return Ok((0.0, Smooth::Fixed { m: 0.0 }));
+    }
+    let base = global.mean as f32;
+    if matches!(smooth, Smooth::Fixed { .. }) {
+        return Ok((base, smooth));
+    }
+    let sum_within: f64 = positive.iter().map(|m| m.within).sum();
+    let strength = if positive.len() <= 2 {
+        let within = sum_within / global.weight;
+        let between = positive
+            .iter()
+            .map(|m| m.weight * (m.mean - f64::from(base)).powi(2))
+            .sum::<f64>()
+            / global.weight;
+        if between <= MIN_AUTO_VARIANCE {
+            if within <= MIN_AUTO_VARIANCE {
+                0.0
+            } else {
+                MAX_AUTO_SMOOTH
+            }
+        } else {
+            (within / between).min(MAX_AUTO_SMOOTH)
+        }
+    } else {
+        let within = sum_within / (global.weight - positive.len() as f64).max(MIN_AUTO_VARIANCE);
+        if within <= MIN_AUTO_VARIANCE {
+            0.0
+        } else {
+            let (mut zsum, mut wsum) = (0.0, 0.0);
+            for moment in &positive {
+                let z2 = moment.weight * (moment.mean - f64::from(base)).powi(2) / within;
+                if z2 > CRED_Z2_THRESHOLD {
+                    zsum += z2 - 1.0;
+                    wsum += moment.weight;
+                }
+            }
+            let numerator = within * (zsum - CRED_NULL_KAPPA * positive.len() as f64);
+            if wsum <= 0.0 || numerator / wsum <= MIN_AUTO_VARIANCE {
+                MAX_AUTO_SMOOTH
+            } else {
+                (within * wsum / numerator).min(MAX_AUTO_SMOOTH)
+            }
+        }
+    };
+    Ok((
+        base,
+        Smooth::Fixed {
+            m: finite_m(strength)?,
+        },
+    ))
+}
+
+fn training_value(moment: TrainingMoment, base: f32, smooth: Smooth) -> Result<f32, PbError> {
+    if moment.weight <= 0.0 {
+        Ok(base)
+    } else {
+        shrunken_encoding(moment.mean * moment.weight, moment.weight, base, smooth)
+    }
+}
+
 fn ordered_training_encodings(
     levels: &[String],
     rows: &[CatRowTerm],
-    base: f32,
+    _base: f32,
     smooth: Smooth,
     seed: u64,
     n_perms: u32,
@@ -1844,80 +1950,91 @@ fn ordered_training_encodings(
             what: "Ordered target statistics require n_perms > 0".into(),
         });
     }
-    let n = levels.len();
-    let mut out = vec![0.0_f64; n];
+    let (ids, labels) = intern_levels(levels)?;
+    let mut out = vec![0.0_f64; rows.len()];
     for perm in 0..n_perms {
-        let mut order = Vec::with_capacity(n);
-        for row in 0..n {
-            order.push((
-                pb_seed(
-                    seed,
-                    perm,
-                    Stage::Categorical as u32,
-                    u32::try_from(row).map_err(|_| PbError::InvalidInput {
-                        what: "categorical fit supports at most u32::MAX rows".into(),
-                    })?,
-                ),
-                row,
-            ));
-        }
-        order.sort_unstable_by_key(|(key, row)| (*key, *row));
-        let mut prefix: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
+        let mut order: Vec<_> = (0..rows.len())
+            .map(|row| {
+                let id = u32::try_from(row).map_err(|_| PbError::InvalidInput {
+                    what: "too many categorical rows".into(),
+                })?;
+                Ok((pb_seed(seed, perm, Stage::Categorical as u32, id), row))
+            })
+            .collect::<Result<_, PbError>>()?;
+        order.sort_unstable();
+        let mut prefix = vec![TrainingMoment::default(); labels.len()];
+        let mut prior = TrainingPriorIndex::new(labels.len())?;
         for (_, row) in order {
-            let label = levels.get(row).ok_or_else(|| PbError::Internal {
-                what: "ordered categorical row escaped levels".into(),
+            let id = *ids.get(row).ok_or_else(|| PbError::Internal {
+                what: "ordered id escaped".into(),
+            })? as usize;
+            let (base, local_smooth) = prior.prior(smooth)?;
+            let moment = prefix.get_mut(id).ok_or_else(|| PbError::Internal {
+                what: "ordered moment escaped".into(),
             })?;
-            let prev = prefix.get(label.as_str()).copied().unwrap_or_default();
-            let enc = if prev.denom > 0.0 {
-                shrunken_encoding(prev.sum_y, prev.denom, base, smooth)?
-            } else {
-                base
-            };
-            let slot = out.get_mut(row).ok_or_else(|| PbError::Internal {
-                what: "ordered categorical row escaped output".into(),
-            })?;
-            *slot += f64::from(enc);
-            let term = rows.get(row).ok_or_else(|| PbError::Internal {
-                what: "ordered categorical row escaped terms".into(),
-            })?;
-            let entry = prefix.entry(label.as_str()).or_default();
-            entry.sum_y += term.sum_y;
-            entry.denom += term.denom;
+            let encoded = training_value(*moment, base, local_smooth)?;
+            *out.get_mut(row).ok_or_else(|| PbError::Internal {
+                what: "ordered output escaped".into(),
+            })? += f64::from(encoded);
+            moment.add(*rows.get(row).ok_or_else(|| PbError::Internal {
+                what: "ordered term escaped".into(),
+            })?);
+            prior.set(id, *moment)?;
         }
     }
-    let scale = 1.0 / f64::from(n_perms);
-    Ok(out.into_iter().map(|v| (v * scale) as f32).collect())
+    Ok(out
+        .into_iter()
+        .map(|value| (value / f64::from(n_perms)) as f32)
+        .collect())
 }
 
-/// Leave-one-out training encodings: each row sees its level's full `(Σwy, Σw)` with its
-/// OWN term subtracted, then shrunk. The variance floor of the cross-fit family (no fold or
-/// permutation noise), deterministic and seed-free, and leakage-free (the row's own target
-/// never enters its encoding). Falls back to `base` when the row is the only member of its
-/// level. Summation is in fixed row order ⇒ thread-count independent.
 fn loo_training_encodings(
     levels: &[String],
     rows: &[CatRowTerm],
-    base: f32,
+    _base: f32,
     smooth: Smooth,
 ) -> Result<Vec<f32>, PbError> {
-    let mut total: BTreeMap<&str, CatRowTerm> = BTreeMap::new();
-    for (label, term) in levels.iter().zip(rows) {
-        let t = total.entry(label.as_str()).or_default();
-        t.sum_y += term.sum_y;
-        t.denom += term.denom;
+    let (ids, labels) = intern_levels(levels)?;
+    let mut all = vec![TrainingMoment::default(); labels.len()];
+    let mut prefixes = Vec::with_capacity(rows.len());
+    for (&id, &term) in ids.iter().zip(rows) {
+        let moment = all.get_mut(id as usize).ok_or_else(|| PbError::Internal {
+            what: "LOO moment escaped".into(),
+        })?;
+        prefixes.push(*moment);
+        moment.add(term);
     }
-    let mut out = Vec::with_capacity(levels.len());
-    for (label, term) in levels.iter().zip(rows) {
-        let all = total.get(label.as_str()).copied().unwrap_or_default();
-        let held = CatRowTerm {
-            sum_y: all.sum_y - term.sum_y,
-            denom: all.denom - term.denom,
-        };
-        out.push(if held.denom > 0.0 {
-            shrunken_encoding(held.sum_y, held.denom, base, smooth)?
-        } else {
-            base
-        });
+    let mut suffix = vec![TrainingMoment::default(); labels.len()];
+    let mut excluded = vec![TrainingMoment::default(); rows.len()];
+    for (row, (&id, &term)) in ids.iter().zip(rows).enumerate().rev() {
+        let moment = suffix
+            .get_mut(id as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: "LOO suffix escaped".into(),
+            })?;
+        *excluded.get_mut(row).ok_or_else(|| PbError::Internal {
+            what: "LOO excluded escaped".into(),
+        })? = prefixes
+            .get(row)
+            .copied()
+            .unwrap_or_default()
+            .merge(*moment);
+        moment.add(term);
+    }
+    let mut prior = TrainingPriorIndex::new(labels.len())?;
+    for (id, moment) in all.iter().enumerate() {
+        prior.set(id, *moment)?;
+    }
+    let mut out = Vec::with_capacity(rows.len());
+    for (row, &id) in ids.iter().enumerate() {
+        let held = excluded.get(row).copied().unwrap_or_default();
+        let saved = *all.get(id as usize).ok_or_else(|| PbError::Internal {
+            what: "LOO level escaped".into(),
+        })?;
+        prior.set(id as usize, held)?;
+        let (base, local_smooth) = prior.prior(smooth)?;
+        out.push(training_value(held, base, local_smooth)?);
+        prior.set(id as usize, saved)?;
     }
     Ok(out)
 }
@@ -1926,83 +2043,53 @@ fn kfold_training_encodings(
     fit_ids: &[u32],
     n_ids: usize,
     rows: &[CatRowTerm],
-    base: f32,
+    _base: f32,
     smooth: Smooth,
     seed: u64,
     k: u32,
 ) -> Result<Vec<f32>, PbError> {
     if k < 2 {
         return Err(PbError::InvalidConfig {
-            what: format!("KFold target statistics require k >= 2, got {k}"),
+            what: "KFold target statistics require k >= 2".into(),
         });
     }
-    // Dense `[id]` total and `[fold*n_ids + id]` per-fold accumulators (vs the old string-keyed
-    // `BTreeMap<&str>` / `BTreeMap<(u32,&str)>`). Same row order ⇒ byte-identical f64 sums, and the
-    // OOF held-out subtraction `total[id] − by_fold[fold,id]` reads the same values.
-    let fold_cells = usize::try_from(k)
-        .ok()
-        .and_then(|kk| kk.checked_mul(n_ids))
-        .ok_or_else(|| PbError::Internal {
-            what: "kfold accumulator size overflow".into(),
-        })?;
-    let mut total = vec![CatRowTerm::default(); n_ids];
-    let mut by_fold = vec![CatRowTerm::default(); fold_cells];
-    let mut folds = Vec::with_capacity(fit_ids.len());
-    for (row, (&lid, term)) in fit_ids.iter().zip(rows).enumerate() {
-        let fold = (pb_seed(
-            seed,
-            0,
-            Stage::Categorical as u32,
-            u32::try_from(row).map_err(|_| PbError::InvalidInput {
-                what: "categorical fit supports at most u32::MAX rows".into(),
-            })?,
-        ) % u64::from(k)) as u32;
-        folds.push(fold);
-        let t = total
-            .get_mut(lid as usize)
-            .ok_or_else(|| PbError::Internal {
-                what: "kfold total level id escaped".into(),
+    let folds: Vec<_> = (0..rows.len())
+        .map(|row| {
+            let id = u32::try_from(row).map_err(|_| PbError::InvalidInput {
+                what: "too many categorical rows".into(),
             })?;
-        t.sum_y += term.sum_y;
-        t.denom += term.denom;
-        let fc = (fold as usize)
-            .checked_mul(n_ids)
-            .and_then(|b| b.checked_add(lid as usize))
-            .ok_or_else(|| PbError::Internal {
-                what: "kfold by_fold index overflow".into(),
-            })?;
-        let f = by_fold.get_mut(fc).ok_or_else(|| PbError::Internal {
-            what: "kfold by_fold cell escaped".into(),
-        })?;
-        f.sum_y += term.sum_y;
-        f.denom += term.denom;
-    }
-    let mut out = Vec::with_capacity(fit_ids.len());
-    for (row, &lid) in fit_ids.iter().enumerate() {
-        let fold = *folds.get(row).ok_or_else(|| PbError::Internal {
-            what: "kfold categorical row escaped folds".into(),
-        })?;
-        let all = *total.get(lid as usize).ok_or_else(|| PbError::Internal {
-            what: "kfold total read escaped".into(),
-        })?;
-        let fc = (fold as usize)
-            .checked_mul(n_ids)
-            .and_then(|b| b.checked_add(lid as usize))
-            .ok_or_else(|| PbError::Internal {
-                what: "kfold by_fold read index overflow".into(),
-            })?;
-        let held = *by_fold.get(fc).ok_or_else(|| PbError::Internal {
-            what: "kfold by_fold read escaped".into(),
-        })?;
-        let term = CatRowTerm {
-            sum_y: all.sum_y - held.sum_y,
-            denom: all.denom - held.denom,
-        };
-        out.push(if term.denom > 0.0 {
-            shrunken_encoding(term.sum_y, term.denom, base, smooth)?
-        } else {
-            base
-        });
+            Ok((pb_seed(seed, 0, Stage::Categorical as u32, id) % u64::from(k)) as u32)
+        })
+        .collect::<Result<_, PbError>>()?;
+    let mut out = vec![0.0; rows.len()];
+    // Compute each complement directly: no subtraction of held-out targets,
+    // and no held-out targets in either the prior or automatic strength.
+    for fold in 0..k {
+        let mut moments = vec![TrainingMoment::default(); n_ids];
+        for ((&id, &term), &row_fold) in fit_ids.iter().zip(rows).zip(&folds) {
+            if row_fold != fold {
+                moments
+                    .get_mut(id as usize)
+                    .ok_or_else(|| PbError::Internal {
+                        what: "KFold moment escaped".into(),
+                    })?
+                    .add(term);
+            }
+        }
+        let (base, local_smooth) = training_prior(&moments, smooth)?;
+        let values = moments
+            .into_iter()
+            .map(|moment| training_value(moment, base, local_smooth))
+            .collect::<Result<Vec<_>, _>>()?;
+        for (row, (&id, &row_fold)) in fit_ids.iter().zip(&folds).enumerate() {
+            if row_fold == fold {
+                *out.get_mut(row).ok_or_else(|| PbError::Internal {
+                    what: "KFold output escaped".into(),
+                })? = *values.get(id as usize).ok_or_else(|| PbError::Internal {
+                    what: "KFold value escaped".into(),
+                })?;
+            }
+        }
     }
     Ok(out)
 }
@@ -2868,7 +2955,7 @@ mod tests {
             (enc[1] - 1.0).abs() < 1e-6,
             "row 1 sees only row 0's target"
         );
-        // A singleton level has no other rows ⇒ falls back to base.
+        // With no allowed observations, even the prior must be target independent.
         let solo = loo_training_encodings(
             &["b".to_string()],
             &[CatRowTerm {
@@ -2879,7 +2966,7 @@ mod tests {
             Smooth::Fixed { m: 0.0 },
         )
         .unwrap();
-        assert!((solo[0] - 2.0).abs() < 1e-6, "singleton ⇒ base");
+        assert_eq!(solo[0], 0.0, "singleton ⇒ neutral prior");
     }
 
     #[test]

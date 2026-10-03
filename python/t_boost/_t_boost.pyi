@@ -588,12 +588,14 @@ class _MultiClassModel:
         self,
         x: np.ndarray,
         cat_x: Sequence[Sequence[str]] | None = None,
+        n_jobs: int | None = None,
     ) -> np.ndarray: ...
 
     def predict_raw(
         self,
         x: np.ndarray,
         cat_x: Sequence[Sequence[str]] | None = None,
+        n_jobs: int | None = None,
     ) -> np.ndarray: ...
 
     def mc_supports(
@@ -712,6 +714,7 @@ class _MultiClassTableModel:
         x: np.ndarray,
         cat_x: Sequence[Sequence[str]] | None = None,
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
     ) -> np.ndarray: ...
 
     def predict_raw(
@@ -719,6 +722,7 @@ class _MultiClassTableModel:
         x: np.ndarray,
         cat_x: Sequence[Sequence[str]] | None = None,
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
     ) -> np.ndarray: ...
     def effect_contributions(
         self,

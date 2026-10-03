@@ -9,12 +9,12 @@ external benchmarking harnesses.
 
 from __future__ import annotations
 
-from functools import lru_cache as _lru_cache
+from functools import lru_cache as _lru_cache, wraps
 
 import json
 import math
 import warnings
-from typing import Any, Callable
+from typing import Any, Callable, TypeVar, cast
 
 import numpy as np
 
@@ -53,6 +53,33 @@ from ._ingest import (
 )
 
 
+_FitMethod = TypeVar("_FitMethod", bound=Callable[..., Any])
+
+
+def _atomic_fit(method: _FitMethod) -> _FitMethod:
+    """Restore the complete estimator state if any stage of a refit fails."""
+    @wraps(method)
+    def fit(self: _BaseTBoost, *args: Any, **kwargs: Any) -> Any:
+        previous = self.__dict__.copy()
+        try:
+            self._categorical_encoding_version_ = 3
+            return method(self, *args, **kwargs)
+        except BaseException:
+            self.__dict__.clear()
+            self.__dict__.update(previous)
+            raise
+
+    return cast(_FitMethod, fit)
+
+
+def _canonical_objective(name: str) -> str:
+    normalized = str(name).replace("-", "_").lower()
+    return {
+        "squarederror": "squared_error", "l2": "squared_error", "regression": "squared_error",
+        "binary_logloss": "logistic", "log_loss": "logistic", "classifier": "logistic",
+    }.get(normalized, normalized)
+
+
 def _reject_sparse(x: Any) -> None:
     """Raise a clear ``ValueError`` for scipy-sparse input (t-boost needs a dense design).
 
@@ -79,7 +106,7 @@ def _reject_sparse(x: Any) -> None:
 # NUMERIC regressor with no envelope at all; both still load. A header from a NEWER schema is
 # refused rather than half-read (rustystats' fail-loud rule).
 _ESTIMATOR_MAGIC = b"TBP1"
-_ENVELOPE_SCHEMA_VERSION = 2
+_ENVELOPE_SCHEMA_VERSION = 4
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
 _TABLES_MAGIC = b"TBTM"  # the Rust tables-only (pruned) container prefix (see serialize.rs)
 _MULTICLASS_TABLES_MAGIC = b"TBMT"  # the Rust pruned-multiclass tables container prefix
@@ -814,8 +841,8 @@ def _guard_reanchor(
 ) -> "np.ndarray":
     """Apply the DEPLOY re-anchor to a raw-bank score before the guard measures it.
 
-    `apply_keepset` shifts the shipped bank's intercept by `ln(Σwy / Σwμ)` whenever
-    `reanchor` is on (native `prune::reanchor_shift`, mirrored here exactly). The per-bag banks
+    `apply_keepset` balances the shipped bank's response total: a closed-form log-link
+    shift, a logit bisection, or an identity-link mean correction. The per-bag banks
     the out-of-bag evidence sums have NOT had that shift, and the shift is NOT second-order:
     purification centres each table under the REFERENCE measure (Laplace-smoothed product of
     marginals), not the empirical one, so dropping a large share of the tables moves the
@@ -834,7 +861,21 @@ def _guard_reanchor(
     y = np.asarray(y, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
     sum_wy = float((w * y).sum())
+    sum_w = float(w.sum())
+    if obj == "logistic":
+        if not 0.0 < sum_wy < sum_w:
+            raise ValueError("logit reanchor requires positives strictly inside (0, total weight)")
+        lo, hi = -60.0, 60.0
+        for _ in range(96):
+            mid = 0.5 * (lo + hi)
+            if float(np.dot(w, _guard_mu(obj, raw + mid))) < sum_wy:
+                lo = mid
+            else:
+                hi = mid
+        return raw + 0.5 * (lo + hi)
     sum_wmu = float((w * _guard_mu(obj, raw)).sum())
+    if obj not in {"poisson", "gamma", "tweedie"}:
+        return raw + (sum_wy - sum_wmu) / sum_w if sum_w > 0.0 else raw
     if sum_wmu > 0.0 and sum_wy > 0.0:
         return raw + math.log(sum_wy / sum_wmu)
     return raw
@@ -1245,6 +1286,7 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
         "kind": kind,
         "objective": est.objective,
         "tweedie_rho": est.tweedie_rho,
+        "categorical_encoding_version": getattr(est, "_categorical_encoding_version_", 3),
         "params": {k: _encode_param(k, v) for k, v in est.get_params(deep=False).items()},
     }
     for key in _COLUMN_SPECS:
@@ -1258,6 +1300,7 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     classes = getattr(est, "classes_", None)
     if classes is not None:
         md["classes_"] = np.asarray(classes).tolist()
+        md["classes_dtype"] = np.asarray(classes).dtype.str
     # The INPUT column count, which `_attach_model` cannot recover from the model alone: its
     # `n_features` is AXIS-indexed, and a multi-channel categorical (`cat_channels`) owns more
     # than one axis. Without this a reloaded multi-channel model rejects the very frame it was
@@ -1325,6 +1368,60 @@ def _restore_params(est: "_BaseTBoost", md: dict[str, Any]) -> None:
 
 
 def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
+    # Category maps store strings, without enough type information to migrate
+    # float32 labels unambiguously. Preserve the writer's ingestion rules instead.
+    encoding_version = md.get("categorical_encoding_version", 3 if md.get("schema_version", 1) >= 3 else 2)
+    if type(encoding_version) is not int or encoding_version not in (2, 3):
+        raise SerializationError("Unsupported categorical encoding version")
+    est._categorical_encoding_version_ = encoding_version
+    fitted = getattr(est, "_multi_model", None)
+    if fitted is None:
+        fitted = est._model
+    native = json.loads(fitted.to_json())["model"]
+    if "classes" in native:
+        native = native["classes"][0]
+    provenance = native["provenance"]
+    n_inputs = max((int(p["raw"]) for p in provenance), default=-1) + 1
+    n_inputs = n_inputs or int(fitted.n_features)
+    cat_positions = md.get("cat_indices", [])
+    if (not isinstance(cat_positions, list) or any(type(v) is not int for v in cat_positions)
+            or len(set(cat_positions)) != len(cat_positions)
+            or any(v < 0 or v >= n_inputs for v in cat_positions)):
+        raise SerializationError("Invalid categorical positions in estimator envelope")
+    native_categorical = {int(axis["raw"]) for axis in provenance
+                          if isinstance(axis["kind"], dict) and "CategoricalTS" in axis["kind"]}
+    if ("cat_indices" in md or "schema_version" in md) and len(cat_positions) != len(native_categorical):
+        raise SerializationError("Envelope categorical positions disagree with native model")
+    if "n_features_in_" in md and (type(md["n_features_in_"]) is not int
+                                   or md["n_features_in_"] != n_inputs):
+        raise SerializationError("Envelope feature count disagrees with native model")
+    names = md.get("feature_names_in_")
+    if names is not None:
+        if (not isinstance(names, list) or len(names) != n_inputs
+                or not all(isinstance(name, str) for name in names) or len(set(names)) != len(names)):
+            raise SerializationError("Invalid feature names in estimator envelope")
+        raw_to_input = [i for i in range(n_inputs) if i not in cat_positions] + cat_positions
+        expected_names = []
+        seen_raw: set[int] = set()
+        for axis in provenance:
+            raw = int(axis["raw"])
+            name = names[raw_to_input[raw]]
+            if raw in seen_raw:
+                encoding = int(axis["kind"]["CategoricalTS"]["encoding"])
+                suffix = "#mean" if encoding == 0 else "#count" if encoding == 1 else f"#cls{encoding-2}"
+                name += suffix
+            expected_names.append(name)
+            seen_raw.add(raw)
+        if expected_names != native["schema"]["feature_names"]:
+            raise SerializationError("Envelope feature names disagree with native axis mapping")
+    if "classes_" in md:
+        labels = md["classes_"]
+        native_labels = list(fitted.class_labels or [])
+        if (not isinstance(labels, list) or len(labels) != len(native_labels)
+                or len(labels) < 2 or [str(label) for label in labels] != native_labels):
+            raise SerializationError("Envelope class labels disagree with native model")
+    if "objective" in md and _canonical_objective(md["objective"]) != _canonical_objective(est.objective):
+        raise SerializationError("Envelope objective disagrees with native model")
     for key in _COLUMN_SPECS:
         value = md.get(key)
         setattr(est, key, value if isinstance(value, str) else None)
@@ -1345,7 +1442,22 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
         # say, so their loads keep the placeholders.)
         del est.feature_names_in_
     if md.get("classes_") is not None:
-        est.classes_ = np.asarray(md["classes_"])
+        try:
+            labels = md["classes_"]
+            dtype = md.get("classes_dtype")
+            if dtype is None and all(type(label) is int for label in labels):
+                # Legacy envelopes stored exact JSON integers but no dtype. NumPy
+                # otherwise promotes mixed signed/unsigned ranges to lossy float64.
+                if min(labels) >= 0 and max(labels) > np.iinfo(np.int64).max:
+                    dtype = "uint64" if max(labels) <= np.iinfo(np.uint64).max else "object"
+                elif min(labels) < np.iinfo(np.int64).min or max(labels) > np.iinfo(np.int64).max:
+                    dtype = "object"
+            restored_classes = np.asarray(labels, dtype=dtype)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise SerializationError("Invalid class-label dtype in estimator envelope") from exc
+        if [str(label) for label in restored_classes] != list(fitted.class_labels or []):
+            raise SerializationError("Envelope class-label dtype changes native labels")
+        est.classes_ = restored_classes
     # Restore the INPUT column count over `_attach_model`'s axis count (see
     # `_estimator_metadata`); older blobs without the key keep whatever `_attach_model` set.
     if md.get("n_features_in_") is not None:
@@ -1394,18 +1506,28 @@ def _unpack_json(text: str) -> tuple[dict[str, Any], str]:
         inner = str(obj["model"])
         # As in `_unpack_bytes`: trust the inner JSON's own kind string over a stale envelope
         # kind, so old 'multi'-labeled tables blobs still dispatch correctly (H8).
-        if '"t-boost-multiclass-tables"' in inner:
+        marker = _native_json_kind(inner)
+        if marker == "t-boost-multiclass-tables":
             obj["kind"] = "multi_tables"
-        elif '"t-boost-multiclass"' in inner:
+        elif marker == "t-boost-multiclass":
             obj["kind"] = "multi"
+        else:
+            obj["kind"] = "single"
         return obj, inner
-    if '"t-boost-multiclass-tables"' in text:
+    marker = _native_json_kind(text)
+    if marker == "t-boost-multiclass-tables":
         kind = "multi_tables"
-    elif '"t-boost-multiclass"' in text:
+    elif marker == "t-boost-multiclass":
         kind = "multi"
     else:
         kind = "single"
     return {"kind": kind}, text
+
+
+def _native_json_kind(text: str) -> str | None:
+    doc = json.loads(text)
+    marker = doc.get("kind") if isinstance(doc, dict) else None
+    return marker if isinstance(marker, str) else None
 
 __all__ = [
     "PrecisionWarning",
@@ -1471,13 +1593,13 @@ def _n_columns(x: Any) -> int:
     return int(shape[1])
 
 
-def _column_as_str_list(x: Any, j: int) -> list[str]:
+def _column_as_str_list(x: Any, j: int, *, legacy: bool = False) -> list[str]:
     if hasattr(x, "iloc"):
-        return _series_as_str_list(x.iloc[:, j])
+        return _series_as_str_list(x.iloc[:, j], legacy=legacy)
     arr = np.asarray(x)
     if arr.ndim != 2:
         raise ValueError(f"X must be 2-dimensional, got ndim={arr.ndim}")
-    return [_cat_level(v) for v in arr[:, j].tolist()]
+    return [_cat_level(v, legacy=legacy) for v in arr[:, j].tolist()]
 
 
 def _input_column_values(x: Any, j: int, name: str | None) -> list[Any]:
@@ -1625,12 +1747,12 @@ def _factorize_safe(col: Any) -> tuple[np.ndarray, Any] | None:
     return None
 
 
-def _factorized_labels(uniques: Any) -> list[str]:
+def _factorized_labels(uniques: Any, *, legacy: bool = False) -> list[str]:
     """``_cat_level`` of each factorized level, plus ``_CAT_MISSING`` last (factorize's ``-1``)."""
-    return [_cat_level(u) for u in uniques] + [_CAT_MISSING]
+    return [_cat_level(u, legacy=legacy) for u in uniques] + [_CAT_MISSING]
 
 
-def _factorized_levels(col: Any) -> list[str] | None:
+def _factorized_levels(col: Any, *, legacy: bool = False) -> list[str] | None:
     """``[_cat_level(v) for v in col]`` for a pandas Series, computed once per DISTINCT level.
 
     The per-value loop runs ``_cat_level`` (and its ``pd.isna`` probe) on every row — 0.56 s of a
@@ -1643,12 +1765,12 @@ def _factorized_levels(col: Any) -> list[str] | None:
         return None
     codes, uniques = fz
     lookup = np.empty(len(uniques) + 1, dtype=object)
-    lookup[:] = _factorized_labels(uniques)
+    lookup[:] = _factorized_labels(uniques, legacy=legacy)
     out: list[str] = lookup[np.asarray(codes)].tolist()  # code -1 -> last slot, _CAT_MISSING
     return out
 
 
-def _column_as_codes(x: Any, j: int) -> tuple[np.ndarray, list[str]]:
+def _column_as_codes(x: Any, j: int, *, legacy: bool = False) -> tuple[np.ndarray, list[str]]:
     """Categorical column ``j`` as ``(codes, labels)``: row ``r``'s label is
     ``labels[codes[r]]``, exactly the label ``_column_as_str_list`` gives it. The native serve
     path then encodes and bins each distinct label once instead of hashing a string per row, and
@@ -1658,24 +1780,24 @@ def _column_as_codes(x: Any, j: int) -> tuple[np.ndarray, list[str]]:
         fz = _factorize_safe(col)
         if fz is not None:
             codes, uniques = fz
-            labels = _factorized_labels(uniques)
+            labels = _factorized_labels(uniques, legacy=legacy)
             codes = np.asarray(codes, dtype=np.int64)
             codes = np.where(codes < 0, len(labels) - 1, codes).astype(np.uint32)
             return codes, labels
-        labels_per_row = [_cat_level(v) for v in col.to_numpy()]
+        labels_per_row = [_cat_level(v, legacy=legacy) for v in col.to_numpy()]
     else:
-        labels_per_row = _column_as_str_list(x, j)
+        labels_per_row = _column_as_str_list(x, j, legacy=legacy)
     # Small or factorize-unsafe columns: one label per row (labels may repeat), which costs what
     # the per-row label path always did — deduplicating here would only add work.
     return np.arange(len(labels_per_row), dtype=np.uint32), labels_per_row
 
 
-def _series_as_str_list(col: Any) -> list[str]:
+def _series_as_str_list(col: Any, *, legacy: bool = False) -> list[str]:
     """A pandas Series' per-row category labels (see `_factorized_levels`)."""
-    levels = _factorized_levels(col)
+    levels = _factorized_levels(col, legacy=legacy)
     if levels is not None:
         return levels
-    return [_cat_level(v) for v in col.to_numpy()]
+    return [_cat_level(v, legacy=legacy) for v in col.to_numpy()]
 
 
 def _numeric_subset(x: Any, idx: list[int]) -> Any:
@@ -2164,6 +2286,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # is byte-identical whichever spelling the caller used. See `_DEPRECATED`.
         self.prune_size_penalty = prune_size_penalty
         self.early_stopping = early_stopping
+        self._resolve_merged_aliases()
+
+    def _resolve_merged_aliases(self) -> None:
+        prune_size_penalty = self.prune_size_penalty
+        prune_lambda_tables = self.prune_lambda_tables
+        early_stopping = self.early_stopping
+        early_stopping_rounds = self.early_stopping_rounds
+        early_stopping_adaptive = self.early_stopping_adaptive
         # The conflict test is DISAGREEMENT, not mere presence, and that is load-bearing:
         # `sklearn.clone` reconstructs from `get_params()`, which returns BOTH the new spelling
         # and the legacy attribute this resolution just wrote. A presence test would therefore
@@ -2199,7 +2329,28 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 self.early_stopping_adaptive = float(early_stopping)
 
     def set_params(self, **params: Any) -> "_BaseTBoost":
-        result: _BaseTBoost = super().set_params(**params)
+        if not params:
+            return self
+        previous = self.__dict__.copy()
+        # Replacing or resetting an alias releases the effective value it owned.
+        if "prune_size_penalty" in params and "prune_lambda_tables" not in params:
+            self.prune_lambda_tables = 0.0
+        elif "prune_lambda_tables" in params and "prune_size_penalty" not in params:
+            self.prune_size_penalty = None
+        if "early_stopping" in params:
+            if "early_stopping_rounds" not in params:
+                self.early_stopping_rounds = 500
+            if "early_stopping_adaptive" not in params:
+                self.early_stopping_adaptive = _ES_ADAPTIVE_DEFAULT
+        elif "early_stopping_rounds" in params or "early_stopping_adaptive" in params:
+            self.early_stopping = None
+        try:
+            result: _BaseTBoost = super().set_params(**params)
+            self._resolve_merged_aliases()
+        except Exception:
+            self.__dict__.clear()
+            self.__dict__.update(previous)
+            raise
         for name in (
             "_model",
             "_multi_model",
@@ -2906,7 +3057,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             seq: list[Any] = [cats]
         else:
             seq = list(cats)
-        if all(isinstance(v, (bool, np.bool_)) for v in seq):
+        if seq and all(isinstance(v, (bool, np.bool_)) for v in seq):
             if len(seq) != n_features:
                 raise ValueError(
                     f"categorical_features mask length {len(seq)} != n_features {n_features}"
@@ -2937,11 +3088,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     def _split_columns(
         self, X: Any, cat_idx: list[int], feature_names: list[str] | None, *, coded: bool = False
     ) -> tuple[np.ndarray, Any, list[str] | None]:
+        legacy = getattr(self, "_categorical_encoding_version_", 3) == 2
         if is_polars_eager(X):
             # Polars-native split: numeric block lands F-contiguous float32 (polars'
             # to_numpy default order — the native layer's cheap no-transpose ingest),
             # categorical columns become string lists with nulls -> _CAT_MISSING.
-            numeric_x, cat_x, needs_warn = split_polars_columns(X, cat_idx, coded=coded)
+            numeric_x, cat_x, needs_warn = split_polars_columns(X, cat_idx, coded=coded, legacy=legacy)
             if needs_warn and not getattr(self, "_precision_warning_emitted_", False):
                 warnings.warn(
                     "t-boost converts input features to float32 before fitting/scoring",
@@ -2966,7 +3118,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         numeric_idx = [i for i in range(n_features) if i not in cat_set]
         numeric_x = self._as_float32_2d_once(_numeric_subset(X, numeric_idx))
         cat_x = [
-            _column_as_codes(X, j) if coded else _column_as_str_list(X, j) for j in cat_idx
+            _column_as_codes(X, j, legacy=legacy) if coded else _column_as_str_list(X, j, legacy=legacy) for j in cat_idx
         ]
         for pos, col in zip(cat_idx, cat_x):
             if len(col[0] if coded else col) != numeric_x.shape[0]:
@@ -3002,15 +3154,19 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         return X, resolved
 
     def _explain_mass(
-        self, sample_weight: Any, exposure: Any, model: Any
+        self, sample_weight: Any, exposure: Any, model: Any, *, joint: bool = False
     ) -> "tuple[np.ndarray | None, np.ndarray | None]":
         """The per-row mass ``tables()`` hands the native export. Explicit values win, each
         defaulting independently to its fit-time stash (multiclass fits never stash
         exposure). A tables-only model keeps the ledger it stored at fit unless the caller
         passes a mass, so only then do the fit-time defaults apply."""
         tables_only = isinstance(model, (_TableModel, _MultiClassTableModel))
-        if tables_only and sample_weight is None and exposure is None:
+        if tables_only and sample_weight is None and exposure is None and not joint:
             return None, None
+        for name, value in (("sample_weight", sample_weight), ("exposure", exposure)):
+            if (value is None and getattr(self, f"_ae_requires_{'weight' if name == 'sample_weight' else name}_", False)
+                    and getattr(self, f"_fit_{name}_", None) is None):
+                raise ValueError(f"tables requires explicit {name} aligned to X after loading")
         weight32 = (
             _as_float32_1d(sample_weight, "sample_weight")
             if sample_weight is not None
@@ -3155,7 +3311,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if value is None and getattr(self, flag, False):
                 raise ValueError(f"actual_vs_expected requires explicit {name} aligned to X")
         x32, cat_x = self._serve_design(X)
-        yv = _as_float32_1d(y, "y").astype(np.float64)
+        if hasattr(self, "classes_"):
+            labels = np.asarray(y)
+            if labels.ndim == 2 and labels.shape[1] == 1:
+                labels = labels[:, 0]
+            if labels.ndim != 1 or not np.all(np.isin(labels, self.classes_)):
+                raise ValueError("y must contain a vector of fitted class labels")
+            if len(self.classes_) != 2:
+                raise ValueError("actual_vs_expected supports binary classifiers only")
+            yv = (labels == self.classes_[1]).astype(np.float64)
+        else:
+            yv = _as_float32_1d(y, "y").astype(np.float64)
         n = int(x32.shape[0])
         if yv.shape[0] != n:
             raise ValueError(f"y has {yv.shape[0]} rows but X has {n}")
@@ -3186,7 +3352,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             mass = np.bincount(c, weights=w * e, minlength=k)
             rows = np.bincount(c, minlength=k)
             with np.errstate(divide="ignore", invalid="ignore"):
-                ae = np.where(expected > 0, actual / expected, np.nan)
+                ae = np.where(expected != 0, actual / expected, np.nan)
             out.append({
                 "feature": name,
                 "raw": j,
@@ -3217,6 +3383,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             exposure=vectors["exposure"],
         ))
         axes = {int(a["raw"]): a for t in bank["tables"] for a in t["axes"]}
+        deployed = json.loads(self._model.to_json())["model"]["bank"]
+        for raw, grid in enumerate(deployed["merged_grids"]):
+            axis = axes.get(raw, {"raw": raw})
+            if not axis.get("joint_channels"):
+                axes[raw] = {**axis, "borders": grid["borders"], "cells": grid["n_bins"],
+                             "band_of": None}
         for factor in ae:
             # Undefined ratios have an explicit JSON null in the portable report.
             factor["ae"] = [float(v) if np.isfinite(v) else None for v in factor["ae"]]
@@ -3285,7 +3457,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # Reanchor_slope (evidence-gated affine holdout recalibration) keeps the log-link-only
         # default: validated there, unmeasured for logistic.
         # `None` = link-aware default; an explicit bool always wins.
-        obj = str(self.objective).replace("-", "_").lower()
+        obj = _canonical_objective(self.objective)
         reanchor = self.reanchor
         if reanchor is None:
             reanchor = obj in {"poisson", "gamma", "tweedie", "logistic"}
@@ -3808,7 +3980,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # `reanchor` explicitly — which the tuned recipe does for every log-link objective
         # (`recommended_recipe`, `params["reanchor"] = True`). That crashed every grouped tuned
         # deploy fit with UnboundLocalError (insur-arena fremotor_prem, 9/9 splits NaN).
-        obj = str(self.objective).replace("-", "_").lower()
+        obj = _canonical_objective(self.objective)
         reanchor = self.reanchor
         if reanchor is None:
             # keep in lockstep with `_new_booster`'s resolution (logistic added 2026-07-23,
@@ -5309,9 +5481,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         ``logit`` or (a multiclass fit) ``softmax``."""
         if getattr(self, "_multi_model", None) is not None:
             return "softmax"
-        if self.objective == "logistic":
+        if _canonical_objective(self.objective) == "logistic":
             return "logit"
-        return "identity" if self.objective == "squared_error" else "log"
+        return "identity" if _canonical_objective(self.objective) == "squared_error" else "log"
 
     @property
     def feature_importances_(self) -> np.ndarray:
@@ -5475,7 +5647,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         if validate:
             self._validate_contributions(X, etas, mus, log_exposure, atol, rtol)
 
-        family = "multinomial" if multiclass else str(self.objective)
+        family = "multinomial" if multiclass else _canonical_objective(self.objective)
         output_space = "response" if link == "identity" else "linear_predictor"
         prediction_space = "probability" if multiclass else "response"
         labels = [_label_value(c) for c in self.classes_] if multiclass else [None]
@@ -5488,6 +5660,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
             frames = []
             for label, part in zip(labels, parts):
+                if not part["terms"]:
+                    part = {**part, "terms": [("intercept", "intercept", [None] * n_rows)],
+                            "matrix": np.zeros((n_rows, 1)), "ranks": np.ones((n_rows, 1), dtype=int)}
                 n_terms = len(part["terms"])
                 cols: dict[str, Any] = {"row_index": np.repeat(np.arange(n_rows), n_terms)}
                 if multiclass:
@@ -5546,13 +5721,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         model = multi if multi is not None else self._model
         x32, cat_kw = self._serve_kwargs(X, model)
         if multi is not None:
-            raw = np.asarray(model.predict_raw(x32, **cat_kw), dtype=np.float64)
+            raw = np.asarray(model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64)
             pred = np.asarray(self.predict_proba(X), dtype=np.float64)
         else:
             raw = np.asarray(
                 model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
             )[:, None]
-            if self.objective == "logistic":
+            if _canonical_objective(self.objective) == "logistic":
                 pred = np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1:]
             else:
                 pred = np.asarray(self.predict(X), dtype=np.float64)[:, None]
@@ -5603,6 +5778,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         multi_bytes = state.pop("__t_boost_multi_bytes__", None)
         model_bytes = state.pop("__t_boost_model_bytes__", None)
         self.__dict__.update(state)
+        if "_categorical_encoding_version_" not in state:
+            self._categorical_encoding_version_ = 3 if version is not None and version >= 3 else 2
         if multi_bytes is not None:
             if multi_bytes[:4] == _MULTICLASS_TABLES_MAGIC:
                 self._multi_model = _MultiClassTableModel.from_bytes(multi_bytes)
@@ -6404,7 +6581,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         md, inner = _unpack_json(data)
         _check_envelope(cls, md)
         _restore_params(est, md)
-        if '"t-boost-tables"' in inner:
+        if _native_json_kind(inner) == "t-boost-tables":
             est._attach_model(_TableModel.from_json(inner))
         else:
             est._attach_model(_Model.from_json(inner))
@@ -6415,10 +6592,11 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         # `predict` returns the mean per unit exposure for the log-link objectives (exposure
         # entered the fit as an offset), so the expected total is prediction × exposure.
         pred = np.asarray(self.predict(X), dtype=np.float64)
-        if exposure is not None and self.objective in {"poisson", "gamma", "tweedie"}:
+        if exposure is not None and self.link == "log":
             pred = pred * _as_float32_1d(exposure, "exposure").astype(np.float64)
         return pred
 
+    @_atomic_fit
     def fit(
         self,
         X: Any,
@@ -6622,7 +6800,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             the SAME function under that measure — the table sum on every cell, and so every
             prediction, is unchanged; only which table owns shared mass moves. Without a
             call-time ``sample_weight``/``exposure`` this runs on the bank's own stored
-            support, so no rows are read.
+            support, except for ``"joint"``: joint variance shares require aligned rows
+            and their mass. Joint exports use the fit-time mass when available; after
+            loading a weighted/exposure fit, pass that mass explicitly.
             ``"exposure"`` weights each axis by its exposure-weighted empirical marginal plus
             the ``measure_floor`` positivity floor; ``"product_marginals"`` is the legacy
             half-uniform row-count blend (``laplace``); ``"uniform"`` weights every cell
@@ -6691,7 +6871,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         check_is_fitted(self, "_model")
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
         x32, cat_x = self._serve_design(X)
-        weight32, exposure32 = self._explain_mass(sample_weight, exposure, self._model)
+        weight32, exposure32 = self._explain_mass(sample_weight, exposure, self._model, joint=ref_measure == "joint")
         payload = self._model.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),
@@ -7565,7 +7745,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             est._attach_multiclass_model(_MultiClassModel.from_json(inner))
         elif md.get("kind") == "multi_tables":
             est._attach_multiclass_model(_MultiClassTableModel.from_json(inner))
-        elif '"t-boost-tables"' in inner:
+        elif _native_json_kind(inner) == "t-boost-tables":
             est._attach_classifier_model(_TableModel.from_json(inner))
         else:
             est._attach_classifier_model(_Model.from_json(inner))
@@ -7803,9 +7983,18 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     def _expected_response(self, X: Any, exposure: Any | None) -> "np.ndarray":
         proba = np.asarray(self.predict_proba(X), dtype=np.float64)
         if proba.ndim == 2 and proba.shape[1] == 2:
-            return proba[:, 1]
+            if exposure is None:
+                return proba[:, 1]
+            e = _as_float32_1d(exposure, "exposure").astype(np.float64)
+            if not np.all(np.isfinite(e) & (e > 0)):
+                raise ValueError("exposure must be finite and strictly positive")
+            raw = np.asarray(self.decision_function(X), dtype=np.float64)
+            if e.shape != raw.shape:
+                raise ValueError("exposure must be aligned to X")
+            return _inverse_link(raw + np.log(e), "logit")
         raise ValueError("actual_vs_expected is defined for regression and binary fits only")
 
+    @_atomic_fit
     def fit(
         self,
         X: Any,
@@ -7868,7 +8057,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # `clone`/`get_params` re-enter constantly. The unhonourable-parameter RAISES run
         # later on their own paths and outrank these warnings.
         self._warn_deprecated_params()
-        if str(self.objective).replace("-", "_").lower() != "logistic":
+        if _canonical_objective(self.objective) != "logistic":
             raise ValueError("TBoostClassifier currently requires objective='logistic'")
         X, resolved = self._resolve_fit_vectors(
             X,
@@ -7885,6 +8074,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         exposure = resolved["exposure"]
         groups = resolved["groups"]
         y_arr = np.asarray(y)
+        if y_arr.ndim == 2 and y_arr.shape[1] == 1:
+            y_arr = y_arr[:, 0]
+        if y_arr.ndim != 1 or (y_arr.dtype.kind in "fc" and not np.all(np.isfinite(y_arr))):
+            raise ValueError("y must be a vector of finite class labels")
         target_type = type_of_target(y_arr)
         if target_type in ("continuous", "continuous-multioutput"):
             raise ValueError(
@@ -8212,7 +8405,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # float64 outputs (the core scores in f32): sklearn convention; avoids f32 error in
         # downstream log-loss / Brier / AUROC.
         if mm is not None:
-            return np.asarray(mm.predict_proba(x32, **cat_kw), dtype=np.float64)
+            return np.asarray(mm.predict_proba(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64)
         return np.asarray(
             self._model.predict_proba(x32, **cat_kw, n_jobs=self._resolve_n_jobs()),
             dtype=np.float64,
@@ -8244,7 +8437,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         x32, cat_kw = self._serve_kwargs(X, mm if mm is not None else self._model)
         if mm is not None:
             # Multiclass: (n_samples, n_classes) raw logits, per sklearn's OvR-shaped convention.
-            return np.asarray(mm.predict_raw(x32, **cat_kw), dtype=np.float64)
+            return np.asarray(mm.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64)
         return np.asarray(
             self._model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()),
             dtype=np.float64,
@@ -8412,7 +8605,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         target: _MultiClassModel | _MultiClassTableModel | _Model | _TableModel = (
             mm if mm is not None else self._model
         )
-        weight32, exposure32 = self._explain_mass(sample_weight, exposure, target)
+        weight32, exposure32 = self._explain_mass(sample_weight, exposure, target, joint=ref_measure == "joint")
         payload = target.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),
@@ -8479,7 +8672,7 @@ def recommended_recipe(
     ``leaf_refine_steps`` has no effect (a K>=3 refinement measured harmful as a drop-in and
     was removed).
     """
-    obj = str(objective).replace("-", "_").lower()
+    obj = _canonical_objective(objective)
     is_classifier = obj in _CLASSIFIER_OBJECTIVES
 
     params: dict[str, Any] = {

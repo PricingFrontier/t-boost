@@ -605,7 +605,21 @@ impl Tensor {
 /// ever spills; it SERIALIZES as a length-prefixed sequence, so the inline width is a
 /// pure stack-layout choice with no wire consequence.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
-pub struct FeatureSet(pub SmallVec<[FeatureId; MAX_ORDER]>);
+pub struct FeatureSet(
+    #[serde(deserialize_with = "deserialize_feature_ids")] pub SmallVec<[FeatureId; MAX_ORDER]>,
+);
+
+// SmallVec reserves the entire untrusted sequence size hint. Serde's Vec visitor
+// caps its initial reservation and grows only as elements are actually decoded.
+// Both representations use the same length-prefixed sequence on the wire.
+fn deserialize_feature_ids<'de, D>(
+    deserializer: D,
+) -> Result<SmallVec<[FeatureId; MAX_ORDER]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Vec::<FeatureId>::deserialize(deserializer).map(SmallVec::from_vec)
+}
 
 impl FeatureSet {
     /// Build a feature set from raw ids (caller ensures distinct/sorted).
@@ -820,6 +834,10 @@ pub struct TableBank {
     /// [`EffectTable`] would, for score/shap/sobol and the five I2 gates.
     #[serde(default)]
     pub factored: Vec<FactoredEffect>,
+    /// Joint model variance measured on aligned rows, including covariance. Runtime only:
+    /// after loading a joint bank, supply rows again before requesting variance shares.
+    #[serde(skip)]
+    pub joint_variance: Option<f64>,
 }
 
 /// Tolerances for the I2 checks (spec §13.1). `recon_tol` is the canonical
@@ -1654,11 +1672,107 @@ fn accumulate(
 }
 
 /// [`accumulate`] over precomputed [`tree_supports`] (one per tree, in tree order).
+#[cfg(test)]
 fn accumulate_with_supports(
     model: &Model,
     grids: &MergedGrids,
     budget: &TableBudget,
     supports: &[FeatureSet],
+) -> Result<(RawBank, BTreeSet<FeatureSet>), PbError> {
+    accumulate_with_plan(model, grids, budget, supports, None)
+}
+
+/// Reserve the entire decomposition's dense footprint before allocating any tensor.
+fn table_allocation_plan(
+    model: &Model,
+    grids: &MergedGrids,
+    budget: &TableBudget,
+    supports: &[FeatureSet],
+) -> Result<BTreeMap<FeatureSet, bool>, PbError> {
+    let mut roots: BTreeSet<FeatureSet> = supports.iter().cloned().collect();
+    if let Some(correction) = &model.correction {
+        for table in &correction.tables {
+            let mut ids = SmallVec::new();
+            for axis in &table.axes {
+                let raw = model
+                    .provenance
+                    .get(*axis as usize)
+                    .ok_or_else(|| PbError::Internal {
+                        what: "correction axis absent from provenance".into(),
+                    })?
+                    .raw;
+                if !ids.contains(&raw) {
+                    ids.push(raw);
+                }
+            }
+            ids.sort_unstable();
+            roots.insert(FeatureSet(ids));
+        }
+    }
+    let mut closure = BTreeSet::new();
+    for root in roots {
+        for mask in 1..(1usize << root.order()) {
+            let subset = FeatureSet(
+                root.0
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, raw)| ((mask >> i) & 1 == 1).then_some(*raw))
+                    .collect(),
+            );
+            if !matches!(budget.on_overflow, OverflowPolicy::Factored)
+                || subset.order() < LEGACY_MAX_ORDER
+            {
+                closure.insert(subset);
+            }
+        }
+    }
+    let mut counts = BTreeMap::new();
+    let mut total = 0u64;
+    for support in closure {
+        let extents = support
+            .0
+            .iter()
+            .map(|r| grids.cells(*r))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cells = product_u64(&extents)?;
+        total = total.checked_add(cells).ok_or_else(|| PbError::Internal {
+            what: "decomposition cell count overflowed".into(),
+        })?;
+        counts.insert(support, cells);
+    }
+    let sparse = matches!(budget.on_overflow, OverflowPolicy::SparseFallback { .. })
+        && (total > budget.max_bank_cells
+            || counts.values().any(|cells| *cells > budget.max_table_cells));
+    if !sparse {
+        for (support, cells) in &counts {
+            if *cells > budget.max_table_cells {
+                return Err(PbError::TableBudget {
+                    what: format!("decomposition table {support:?}"),
+                    cells: *cells,
+                    budget: budget.max_table_cells,
+                });
+            }
+        }
+        if total > budget.max_bank_cells {
+            return Err(PbError::TableBudget {
+                what: "complete decomposition bank".into(),
+                cells: total,
+                budget: budget.max_bank_cells,
+            });
+        }
+    }
+    Ok(counts
+        .into_keys()
+        .map(|support| (support, sparse))
+        .collect())
+}
+
+fn accumulate_with_plan(
+    model: &Model,
+    grids: &MergedGrids,
+    budget: &TableBudget,
+    supports: &[FeatureSet],
+    plan: Option<&BTreeMap<FeatureSet, bool>>,
 ) -> Result<(RawBank, BTreeSet<FeatureSet>), PbError> {
     if supports.len() != model.trees.len() {
         return Err(PbError::Internal {
@@ -1674,6 +1788,33 @@ fn accumulate_with_supports(
     }
     let mut tables: BTreeMap<FeatureSet, RawTable> = BTreeMap::new();
     let mut bank_cells: u64 = 0;
+    if let Some(plan) = plan {
+        for (support, sparse) in plan {
+            let axes = support
+                .0
+                .iter()
+                .map(|raw| grids.axis_id(*raw))
+                .collect::<Result<Vec<_>, _>>()?;
+            let extents = support
+                .0
+                .iter()
+                .map(|raw| grids.cells(*raw))
+                .collect::<Result<Vec<_>, _>>()?;
+            let values = if *sparse {
+                Tensor::try_sparse_zeros(extents)?
+            } else {
+                Tensor::try_zeros(extents)?
+            };
+            tables.insert(
+                support.clone(),
+                RawTable {
+                    u: support.clone(),
+                    axes,
+                    values,
+                },
+            );
+        }
+    }
     // Order-3 supports kept in compact factored form under OverflowPolicy::Factored — never
     // materialized as a dense cube here; the pipeline sheds each per tree into the shared lower
     // tables and keeps only the pure 3-way residual factored (§08.10).
@@ -1973,10 +2114,44 @@ fn build_weights(
 /// Subtract the `axis_w`-weighted slice mean along position `p` from `values`,
 /// returning that mean as a tensor over the remaining axes (the mass moved one order
 /// down). For an order-1 table the returned tensor is 0-D (a scalar → the intercept).
+#[cfg(test)]
 fn center_along(values: &mut Tensor, p: usize, axis_w: &[f64]) -> Result<Tensor, PbError> {
+    center_along_with_budget(values, p, axis_w, None)
+}
+
+fn check_sparse_budget(values: &Tensor, budget: Option<&TableBudget>) -> Result<(), PbError> {
+    if let Some(TableBudget {
+        on_overflow: OverflowPolicy::SparseFallback { density_threshold },
+        max_table_cells,
+        ..
+    }) = budget
+    {
+        if let Some(nnz) = values.sparse_nnz() {
+            if nnz as f64 > (density_threshold * values.len() as f64).floor() {
+                return Err(PbError::TableBudget {
+                    what: "sparse decomposition density".into(),
+                    cells: values.len() as u64,
+                    budget: *max_table_cells,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn center_along_with_budget(
+    values: &mut Tensor,
+    p: usize,
+    axis_w: &[f64],
+    budget: Option<&TableBudget>,
+) -> Result<Tensor, PbError> {
     let extents = values.shape();
     let sub_extents = drop_index(&extents, p);
-    let mut means = Tensor::try_zeros(sub_extents)?;
+    let mut means = if values.is_sparse() {
+        Tensor::try_sparse_zeros(sub_extents)?
+    } else {
+        Tensor::try_zeros(sub_extents)?
+    };
     if let (Some(split), Some(data), Some(mdata)) = (
         axis_split(&extents, p),
         values.dense_slice_mut(),
@@ -1996,7 +2171,8 @@ fn center_along(values: &mut Tensor, p: usize, axis_w: &[f64]) -> Result<Tensor,
         let v = values.at(coord).ok_or_else(|| PbError::Internal {
             what: "centering coord out of range".into(),
         })?;
-        means.add(&drop_index(coord, p), wp * v)
+        means.add(&drop_index(coord, p), wp * v)?;
+        check_sparse_budget(&means, budget)
     })?;
     // Pass 2: subtract the mean from every cell of the slice.
     walk_extents(&extents, |coord| {
@@ -2005,7 +2181,8 @@ fn center_along(values: &mut Tensor, p: usize, axis_w: &[f64]) -> Result<Tensor,
             .ok_or_else(|| PbError::Internal {
                 what: "centering mean coord out of range".into(),
             })?;
-        values.add(coord, -m)
+        values.add(coord, -m)?;
+        check_sparse_budget(values, budget)
     })?;
     Ok(means)
 }
@@ -2091,6 +2268,16 @@ fn purify(
     grids: &MergedGrids,
     mode: PurifyMode,
 ) -> Result<TableBank, PbError> {
+    purify_with_budget(raw, w, grids, mode, None)
+}
+
+fn purify_with_budget(
+    raw: RawBank,
+    w: &WeightCache,
+    grids: &MergedGrids,
+    mode: PurifyMode,
+    budget: Option<&TableBudget>,
+) -> Result<TableBank, PbError> {
     // Work map: support → (axes, values). Seed from the raw realized supports.
     let mut axes_of: BTreeMap<FeatureSet, Vec<AxisId>> = BTreeMap::new();
     let mut values_of: BTreeMap<FeatureSet, Tensor> = BTreeMap::new();
@@ -2138,7 +2325,7 @@ fn purify(
                             let r = *u.0.get(p).ok_or_else(|| PbError::Internal {
                                 what: "purify axis position escaped support".into(),
                             })?;
-                            center_along(values, p, w.axis(r)?)
+                            center_along_with_budget(values, p, w.axis(r)?, budget)
                         })
                         .collect::<Result<Vec<_>, PbError>>()
                 })
@@ -2182,7 +2369,8 @@ fn purify(
                         let m = means.at(coord).ok_or_else(|| PbError::Internal {
                             what: "cascade mean coord out of range".into(),
                         })?;
-                        target.add(coord, m)
+                        target.add(coord, m)?;
+                        check_sparse_budget(target, budget)
                     })?;
                 }
                 values_of.insert(u, values);
@@ -2202,7 +2390,11 @@ fn purify(
                 what: "table lost its axes".into(),
             })?;
             let variance = table_variance(&u, &values, w)?;
-            let support = Tensor::try_zeros(values.shape())?;
+            let support = if values.is_sparse() {
+                Tensor::try_sparse_zeros(values.shape())?
+            } else {
+                Tensor::try_zeros(values.shape())?
+            };
             Ok(EffectTable {
                 u,
                 axes,
@@ -2220,6 +2412,7 @@ fn purify(
         merged_grids: grids.border_grids()?,
         w: w.kind.clone(),
         factored: Vec::new(),
+        joint_variance: None,
     })
 }
 
@@ -2669,6 +2862,7 @@ impl FactoredEffect {
     /// [`PbError::ShapeMismatch`] if a box's corner count is not `2^order`, if its mask count
     /// is not the order, or if a mask is shorter than its axis's merged-cell count.
     pub fn validate_shape(&self) -> Result<(), PbError> {
+        check_factorable_order(&self.u)?;
         let k = self.u.order();
         let mismatch = |what: String| PbError::ShapeMismatch { what };
         if self.axes.len() != k || self.per_axis_w.len() != k {
@@ -2681,6 +2875,14 @@ impl FactoredEffect {
         }
         let corners = 1usize << k;
         for (i, b) in self.boxes.iter().enumerate() {
+            if b.p.iter().any(|value| !value.is_finite()) {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "factored effect {:?} box {i}: nonfinite coefficient",
+                        self.u
+                    ),
+                });
+            }
             if b.p.len() != corners || b.low.len() != k {
                 return Err(mismatch(format!(
                     "factored effect {:?} box {i}: {} corners / {} masks, expected \
@@ -2702,6 +2904,18 @@ impl FactoredEffect {
             }
         }
         for (d, (wd, axis)) in self.per_axis_w.iter().zip(self.axes.iter()).enumerate() {
+            let total: f64 = wd.iter().sum();
+            if wd.iter().any(|weight| !weight.is_finite() || *weight < 0.0)
+                || !total.is_finite()
+                || total <= 0.0
+            {
+                return Err(PbError::InvalidInput {
+                    what: format!(
+                        "factored effect {:?} axis {d}: invalid reference weights",
+                        self.u
+                    ),
+                });
+            }
             if wd.len() < axis.cells as usize {
                 return Err(mismatch(format!(
                     "factored effect {:?} axis {d}: {} weights for {} merged cells",
@@ -4269,6 +4483,13 @@ pub(crate) fn check_variance_sum(
     bank: &TableBank,
     w: &WeightCache,
 ) -> Result<(), PbError> {
+    let centered_score = |bins: &[u8]| -> Result<f64, PbError> {
+        let mut score = model.correction_delta(bins)?;
+        for (alpha, tree) in &model.trees {
+            score += f64::from(*alpha) * f64::from(tree.lookup(bins)?);
+        }
+        Ok(score)
+    };
     let tol = ExactTol::for_model(model).var_tol;
     let grids = MergedGrids::from_model(model)?;
     let feats = gate_features(model, bank)?;
@@ -4285,10 +4506,14 @@ pub(crate) fn check_variance_sum(
         let (mut m1, mut m2, mut wsum) = (0.0_f64, 0.0_f64, 0.0_f64);
         enumerate_check_points(&grids, &feats, |x_cells, rep_bins| {
             let wprod = joint_weight(w, &feats, x_cells)?;
-            let e = model.ensemble_f64(rep_bins)?;
-            m1 += wprod * e;
-            m2 += wprod * e * e;
-            wsum += wprod;
+            let e = centered_score(rep_bins)?;
+            if wprod > 0.0 {
+                let next_weight = wsum + wprod;
+                let delta = e - m1;
+                m1 += delta * wprod / next_weight;
+                m2 += wprod * delta * (e - m1);
+                wsum = next_weight;
+            }
             Ok(())
         })?;
         if !wsum.is_finite() || wsum <= 0.0 {
@@ -4296,7 +4521,7 @@ pub(crate) fn check_variance_sum(
                 what: "variance check accumulated non-positive total weight".into(),
             });
         }
-        ((m2 / wsum) - (m1 / wsum) * (m1 / wsum), false)
+        (m2 / wsum, false)
     } else {
         // SAMPLED: draw each axis's cell from the REFERENCE MEASURE `w` itself (per-axis
         // inverse-CDF via a deterministic splitmix draw), then take an UNWEIGHTED average.
@@ -4347,12 +4572,13 @@ pub(crate) fn check_variance_sum(
                     })? = cell as u32;
                 ma.write_rep_bins(cell, &mut rep_bins)?;
             }
-            let e = model.ensemble_f64(&rep_bins)?;
-            m1 += e;
-            m2 += e * e;
+            let e = centered_score(&rep_bins)?;
+            let delta = e - m1;
+            m1 += delta / (s + 1) as f64;
+            m2 += delta * (e - m1);
         }
         let nf = samples as f64;
-        ((m2 / nf) - (m1 / nf) * (m1 / nf), true)
+        (m2 / nf, true)
     };
     let var_tables: f64 = bank.tables.iter().map(|t| t.variance).sum::<f64>()
         + bank.factored.iter().map(|ft| ft.variance).sum::<f64>();
@@ -4404,8 +4630,12 @@ pub fn assert_exact_decomposition(
     bank: &TableBank,
     x: &ServeBinnedMatrix,
 ) -> Result<(), PbError> {
-    let grids = MergedGrids::from_model(model)?;
-    let w = build_weights(x, &grids, &bank.w, None)?;
+    if x.0.grids != model.grids || x.0.provenance != model.provenance {
+        return Err(PbError::ShapeMismatch {
+            what: "exactness serve grids do not match model".into(),
+        });
+    }
+    let w = build_weights_from_support(bank, &bank.w)?;
     check_reconstruction(model, bank)?;
     check_mass_conservation(model, bank, &w)?;
     check_purity(model, bank, &w)?;
@@ -4714,8 +4944,9 @@ impl Model {
         }
 
         let supports = tree_supports(self)?;
+        let plan = table_allocation_plan(self, grids, &budget, &supports)?;
         let (mut raw, factored_supports) =
-            accumulate_with_supports(self, grids, &budget, &supports)?;
+            accumulate_with_plan(self, grids, &budget, &supports, Some(&plan))?;
         // Each factored support's trees, in tree order, so a shed visits only its own trees
         // (the same trees in the same order as a full-ensemble scan would match).
         let mut trees_of: BTreeMap<&FeatureSet, Vec<usize>> = BTreeMap::new();
@@ -4780,7 +5011,8 @@ impl Model {
             verify_raw_accumulation(self, &raw, &factored, grids)?;
             mark!("verify_raw");
         }
-        let mut bank = purify(raw, &weights, grids, PurifyMode::SinglePass)?;
+        let mut bank =
+            purify_with_budget(raw, &weights, grids, PurifyMode::SinglePass, Some(&budget))?;
         bank.factored = factored;
         mark!("purify");
         fill_support(&mut bank, grids, x, mass)?;
@@ -5157,6 +5389,83 @@ impl TableBank {
         Ok(())
     }
 
+    /// Measure joint component and model variances on the same aligned rows and mass.
+    /// The model variance includes covariance between effects; its intercept is excluded
+    /// from accumulation to preserve precision under harmless intercept translations.
+    ///
+    /// # Errors
+    /// Returns a typed input error for empty or zero-mass rows and propagates cell-map,
+    /// shape, mass validation and effect evaluation errors.
+    pub fn measure_joint_variance(
+        &mut self,
+        cat_encoders: &crate::cat::CatEncoderStore,
+        x: &crate::data::BinnedMatrix,
+        mass: Option<&[f32]>,
+    ) -> Result<(), PbError> {
+        let n_rows = x.n_rows as usize;
+        validate_mass(mass, n_rows, "joint variance")?;
+        let total = mass.map_or(n_rows as f64, |w| w.iter().map(|v| f64::from(*v)).sum());
+        if total <= 0.0 || !total.is_finite() {
+            return Err(PbError::InvalidInput {
+                what: "joint variance needs positive finite row mass".into(),
+            });
+        }
+        let maps = crate::scoring::build_cell_maps(&self.merged_grids, cat_encoders, x)?;
+        let mut cells = vec![0; self.merged_grids.len()];
+        let count = self.tables.len() + self.factored.len();
+        let mut means = vec![0.0; count + 1];
+        let mut m2 = vec![0.0; count + 1];
+        let mut seen = 0.0;
+        for row in 0..n_rows {
+            let weight = mass.and_then(|w| w.get(row)).map_or(1.0, |w| f64::from(*w));
+            if weight == 0.0 {
+                continue;
+            }
+            crate::scoring::fill_row_cells(x, &maps, row, &mut cells)?;
+            seen += weight;
+            let mut sum = 0.0;
+            let values = self
+                .tables
+                .iter()
+                .map(|t| t.eval(&cells))
+                .chain(self.factored.iter().map(|t| t.eval(&cells)));
+            for (index, value) in values.enumerate() {
+                let value = value?;
+                sum += value;
+                let mean = means.get_mut(index).ok_or_else(|| PbError::Internal {
+                    what: "joint moment index escaped".into(),
+                })?;
+                let moment = m2.get_mut(index).ok_or_else(|| PbError::Internal {
+                    what: "joint moment index escaped".into(),
+                })?;
+                let delta = value - *mean;
+                *mean += weight / seen * delta;
+                *moment += weight * delta * (value - *mean);
+            }
+            let mean = means.last_mut().ok_or_else(|| PbError::Internal {
+                what: "joint total moment missing".into(),
+            })?;
+            let moment = m2.last_mut().ok_or_else(|| PbError::Internal {
+                what: "joint total moment missing".into(),
+            })?;
+            let delta = sum - *mean;
+            *mean += weight / seen * delta;
+            *moment += weight * delta * (sum - *mean);
+        }
+        for (table, moment) in self.tables.iter_mut().zip(&m2) {
+            table.variance = (moment / total).max(0.0);
+        }
+        for (table, moment) in self
+            .factored
+            .iter_mut()
+            .zip(m2.iter().skip(self.tables.len()))
+        {
+            table.variance = (moment / total).max(0.0);
+        }
+        self.joint_variance = m2.last().map(|moment| (moment / total).max(0.0));
+        Ok(())
+    }
+
     /// Exact interventional Shapley values `φ_i(x) = Σ_{u ∋ i} f_u(x_u)/|u|` (spec §08.5),
     /// indexed by raw feature id. Sums to `score(x) − f0`. O(#tables) table reads, zero
     /// model calls.
@@ -5187,11 +5496,19 @@ impl TableBank {
     }
 
     /// Sobol importances `S_u = σ²(f_u)/σ²(F)` from the cached table variances (spec
-    /// §08.5), sorted descending. Under product/uniform `w` they sum to ~1.
+    /// §08.5), sorted descending. Under product/uniform `w` they sum to ~1. Joint
+    /// shares require [`Self::measure_joint_variance`]; otherwise no shares are returned.
     #[must_use]
     pub fn sobol(&self) -> Vec<(FeatureSet, f64)> {
-        let total: f64 = self.tables.iter().map(|t| t.variance).sum::<f64>()
-            + self.factored.iter().map(|ft| ft.variance).sum::<f64>();
+        let total: f64 = if self.w == RefMeasure::Joint {
+            let Some(total) = self.joint_variance else {
+                return Vec::new();
+            };
+            total
+        } else {
+            self.tables.iter().map(|t| t.variance).sum::<f64>()
+                + self.factored.iter().map(|ft| ft.variance).sum::<f64>()
+        };
         let mut out: Vec<(FeatureSet, f64)> = self
             .tables
             .iter()
@@ -5226,7 +5543,9 @@ impl TableBank {
     ///
     /// # Errors
     /// [`PbError::InvalidConfig`] for the v1-unsupported `Joint` measure; plus propagated
-    /// grid/purify errors.
+    /// grid/purify errors. [`PbError::InvalidInput`] when pruning or banding removed
+    /// the support needed to identify the requested marginal; use [`Self::recentre_on`]
+    /// with aligned rows and mass in that case.
     pub fn recompute_under(&self, w: RefMeasure) -> Result<TableBank, PbError> {
         self.recompute_under_with(w, None)
     }
@@ -5277,7 +5596,7 @@ impl TableBank {
             }
             marginals.push(counts);
         }
-        let mut base = self.clone();
+        let mut base = self.recompute_under_with(w, Some(&marginals))?;
         for table in &mut base.tables {
             table.support = Tensor::try_zeros(table.values.shape())?;
             let mut coord = vec![0usize; table.axes.len()];
@@ -5296,7 +5615,7 @@ impl TableBank {
                 table.support.add(&coord, row_mass(row))?;
             }
         }
-        base.recompute_under_with(w, Some(&marginals))
+        Ok(base)
     }
 
     /// [`Self::recompute_under`] with each axis's empirical marginal from `marginals` (see
@@ -5314,6 +5633,13 @@ impl TableBank {
             return crate::banding::repurify_bank_under_with(self, &w, marginals);
         }
         let grids = MergedGrids::from_border_grids(&self.merged_grids);
+        let axis_templates: BTreeMap<FeatureId, AxisId> = self
+            .tables
+            .iter()
+            .flat_map(|t| &t.axes)
+            .chain(self.factored.iter().flat_map(|f| &f.axes))
+            .map(|axis| (axis.raw, axis.clone()))
+            .collect();
         let weights = build_weights_from_support_with(self, &w, marginals)?;
         // Seed a RawBank from the current (already-purified) dense tables: together with the
         // factored effects they sum to F_ens, a valid input to purify under the new measure.
@@ -5360,7 +5686,13 @@ impl TableBank {
                     Some(f) => f.axes.clone(),
                     None => {
                         u.0.iter()
-                            .map(|r| grids.axis_id(*r))
+                            .map(|r| {
+                                axis_templates
+                                    .get(r)
+                                    .cloned()
+                                    .map(Ok)
+                                    .unwrap_or_else(|| grids.axis_id(*r))
+                            })
                             .collect::<Result<_, _>>()?
                     }
                 };
@@ -5392,8 +5724,13 @@ impl TableBank {
         bank.factored = factored;
         // Support is data-derived (w-independent), so carry it over by support key.
         for t in &mut bank.tables {
-            if let Some(src) = self.tables.iter().find(|s| s.u == t.u) {
-                t.support = src.support.clone();
+            for axis in &mut t.axes {
+                if let Some(template) = axis_templates.get(&axis.raw) {
+                    *axis = template.clone();
+                }
+            }
+            if let Some(support) = support_for_axes(&self.tables, &t.axes)? {
+                t.support = support;
             }
         }
         // Same restoration `purify_raw_effects` applies, and for the same reason: `purify`
@@ -5623,6 +5960,55 @@ fn build_weights_from_effect_support(
     })
 }
 
+/// Recover subset mass only when the surviving tensor identifies its cells exactly.
+/// In particular, never invent a within-band mass distribution from a compressed axis.
+pub(crate) fn support_for_axes(
+    tables: &[EffectTable],
+    axes: &[AxisId],
+) -> Result<Option<Tensor>, PbError> {
+    let source = tables
+        .iter()
+        .filter(|table| {
+            axes.iter().all(|axis| {
+                table.axes.iter().any(|a| {
+                    a.raw == axis.raw && a.cells == axis.cells && a.band_of == axis.band_of
+                })
+            })
+        })
+        .min_by_key(|table| table.u.order());
+    let Some(source) = source else {
+        return Ok(None);
+    };
+    let positions = axes
+        .iter()
+        .map(|axis| {
+            source
+                .axes
+                .iter()
+                .position(|a| a.raw == axis.raw)
+                .ok_or_else(|| PbError::Internal {
+                    what: "support projection lost an axis".into(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut support = Tensor::try_zeros(axes.iter().map(|axis| axis.cells as usize).collect())?;
+    walk_extents(&source.support.shape(), |coord| {
+        let subset = positions
+            .iter()
+            .map(|&p| {
+                coord.get(p).copied().ok_or_else(|| PbError::Internal {
+                    what: "support projection coordinate escaped".into(),
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mass = source.support.at(coord).ok_or_else(|| PbError::Internal {
+            what: "support projection source escaped".into(),
+        })?;
+        support.add(&subset, mass)
+    })?;
+    Ok(Some(support))
+}
+
 fn support_for_subset(
     support_by_u: &BTreeMap<FeatureSet, Tensor>,
     target: &FeatureSet,
@@ -5756,6 +6142,7 @@ fn build_weights_from_support_with(
 ) -> Result<WeightCache, PbError> {
     let rule = axis_rule(w)?;
 
+    let grids = MergedGrids::from_border_grids(&bank.merged_grids);
     let mut per_axis = Vec::with_capacity(bank.merged_grids.len());
     for (r, g) in bank.merged_grids.iter().enumerate() {
         let cells = usize::from(g.n_bins);
@@ -5787,15 +6174,13 @@ fn build_weights_from_support_with(
                 // w-mass (spec §08.7) — a flat row count when the bank was built
                 // unweighted, Σ w·e otherwise; either way it's already the right
                 // numerator for an empirical marginal, so this is agnostic to which.
-                let main = bank
-                    .tables
-                    .iter()
-                    .find(|t| t.u.0.len() == 1 && t.u.0.first() == Some(&FeatureId(r as u32)));
+                let axis = grids.axis_id(FeatureId(r as u32))?;
+                let support = support_for_axes(&bank.tables, &[axis])?;
                 let mut counts = vec![0.0_f64; cells];
                 let mut n_total = 0.0_f64;
-                if let Some(t) = main {
+                if let Some(support) = support {
                     for c in 0..cells {
-                        let v = t.support.at(&[c]).ok_or_else(|| PbError::Internal {
+                        let v = support.at(&[c]).ok_or_else(|| PbError::Internal {
                             what: "support cell out of range for recompute weights".into(),
                         })?;
                         *counts.get_mut(c).ok_or_else(|| PbError::Internal {
@@ -5803,6 +6188,18 @@ fn build_weights_from_support_with(
                         })? = v;
                         n_total += v;
                     }
+                } else if bank
+                    .tables
+                    .iter()
+                    .any(|t| t.u.contains(FeatureId(r as u32)))
+                    || bank
+                        .factored
+                        .iter()
+                        .any(|t| t.u.contains(FeatureId(r as u32)))
+                {
+                    return Err(PbError::InvalidInput {
+                        what: "stored support cannot recover this marginal; supply aligned rows and mass for recentering".into(),
+                    });
                 }
                 let inv_n = if n_total > 0.0 { 1.0 / n_total } else { 0.0 };
                 rule.raw_weights(&counts, inv_n, cells)
@@ -5902,6 +6299,7 @@ pub fn fixture_model() -> Model {
         schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
         correction: None,
         bag_spans: None,
+        bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
     }
@@ -6041,6 +6439,7 @@ pub fn fixture_multichannel_model() -> Model {
         schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
         correction: None,
         bag_spans: None,
+        bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
     }
@@ -6118,6 +6517,7 @@ pub fn fixture_over_budget_model() -> Model {
         schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
         correction: None,
         bag_spans: None,
+        bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
     }
@@ -8769,6 +9169,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -8844,6 +9245,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -8950,6 +9352,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };
@@ -9134,6 +9537,7 @@ mod tests {
             schema_version: crate::serialize::SCHEMA_VERSION_UNLIFTED,
             correction: None,
             bag_spans: None,
+            bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
         };

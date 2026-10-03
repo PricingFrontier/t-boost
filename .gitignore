@@ -33,3 +33,7 @@ examples/frequency_model.bin
 
 # local secrets (API tokens)
 .env
+
+# bugs.md reproduction harness outputs (specs/roadmap/repro/README.md)
+/specs/roadmap/repro/out/*
+!/specs/roadmap/repro/out/.gitkeep
