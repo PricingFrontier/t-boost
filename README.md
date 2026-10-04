@@ -3,6 +3,8 @@
 **A Tabulating Boosting Machine (TBM): gradient boosting whose fitted model is *exactly* a set of
 rating tables.**
 
+Documentation: <https://pricingfrontier.github.io/t-boost/>
+
 ## Why
 
 Gradient-boosted trees are usually more accurate than a GLM, but they are hard to read, review or

@@ -24,8 +24,9 @@ with.
 | `python/tests/` | The Python test suite (pytest). |
 | `xtask/` | Dev-only Rust tasks: the grep-gates (`check-all`), `bit-repro`, `accuracy`, `release-preflight`. |
 | `fuzz/` | cargo-fuzz targets (a separate workspace with its own lock file). |
-| `scripts/` | Release tooling: `release_version.py`, `verify_pypi_release.py`, `package_smoke_check.py`. |
-| `.github/workflows/` | `ci.yml` (the gates), `release.yml` (PyPI), `release-gate.yml` (manual pre-publish checklist), `coverage.yml`, `fuzz.yml`. |
+| `docs/`, `mkdocs.yml` | The documentation site (MkDocs + Material), published to GitHub Pages. Hand-written, laid out and worded after the CatBoost documentation. `docs/_snippets/` holds fragments shared by several pages. |
+| `scripts/` | Release tooling: `release_version.py`, `verify_pypi_release.py`, `package_smoke_check.py`; `check_docs.py` keeps the parameter reference in step with the estimators. |
+| `.github/workflows/` | `ci.yml` (the gates), `docs.yml` (the documentation site), `release.yml` (PyPI), `release-gate.yml` (manual pre-publish checklist), `coverage.yml`, `fuzz.yml`. |
 
 ## Environment
 
@@ -56,6 +57,8 @@ Run the gates for every area you touched:
 | `t-boost-core` | `cargo test --release -p t-boost-core --all-features` (~1 min) · the slow suite `cargo test --release -p t-boost-core --all-features --test '*' -- --ignored` (~13 min) · `cargo test -p t-boost-core --doc` · the bit-repro pair below |
 | The binding (`t-boost-py`) or the stub | `uv sync --reinstall-package t-boost` · `uv run python -m mypy.stubtest t_boost._t_boost` · the Python row |
 | Python (`python/t_boost`) | `uv run pytest python/tests -q` (~3 min) · `uv run mypy --strict python/t_boost` |
+| A constructor parameter of the estimators | its entry under `docs/training-parameters/` (Description / Type / Default value) · `uv run --no-project python scripts/check_docs.py fix` · the documentation row |
+| Documentation (`docs/`, `mkdocs.yml`) | `uv run --no-project python scripts/check_docs.py check` · `uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict` |
 | `pyproject.toml` / dependencies | `uv lock` (commit `uv.lock`) · `uv sync --locked` · the Python row |
 | `xtask/` | `cargo test -p xtask` · `cargo run -p xtask -- check-all` |
 | Workflows | `uvx --from actionlint-py actionlint .github/workflows/*.yml` |
@@ -101,6 +104,10 @@ On push to `main`, nightly and manual dispatch only (not on pull requests):
 `platform-matrix` re-runs the core gates on Linux x86_64/aarch64, macOS arm64 and Windows
 under Rust 1.96.1 and 1.85, and `bit-repro-cpu-baseline` byte-compares a
 `target-cpu=x86-64-v3` build against the portable baseline.
+
+`docs.yml` runs `scripts/check_docs.py check` and a strict MkDocs build on every pull request,
+and deploys the site to GitHub Pages on every push to `main`. Preview the site locally with
+`uv run --no-project --with-requirements docs/requirements.txt mkdocs serve`.
 
 `coverage.yml` runs `cargo llvm-cov` over the core nightly and on demand. It is informational
 (it gates nothing yet) and lives outside `ci.yml` because the instrumented suite runs for over

@@ -32,7 +32,7 @@ dynamic = ["version"] # from the Cargo workspace; bump with scripts/release_vers
 
 [project.urls]
 Repository = "https://github.com/PricingFrontier/t-boost"
-Documentation = "https://github.com/PricingFrontier/t-boost#readme"
+Documentation = "https://pricingfrontier.github.io/t-boost/"
 
 [dependency-groups]
 # pandas, pyarrow and scikit-learn are optional interop paths the test suite exercises

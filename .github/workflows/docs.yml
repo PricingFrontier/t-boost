@@ -2,7 +2,9 @@ name: Docs
 
 # Builds the MkDocs site (docs/, mkdocs.yml) on every PR and deploys it to GitHub Pages from
 # main. The build is strict: a broken link, a missing page or a page left out of the nav fails
-# it. The pages are hand-written, so the job needs neither the Rust toolchain nor t-boost.
+# it, and so does a constructor parameter missing from the parameter reference
+# (scripts/check_docs.py). The pages are hand-written, so the job needs neither the Rust
+# toolchain nor t-boost.
 #
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 
@@ -31,6 +33,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      # Every constructor parameter documented once, with its real default; the generated class
+      # signatures and parameter overview current. Parses the source: no build needed.
+      - name: Check the parameter reference
+        run: uv run --no-project python scripts/check_docs.py check
       # --no-project: build the site without building t-boost itself.
       - name: Build (strict)
         run: uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict
