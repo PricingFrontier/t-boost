@@ -9,6 +9,7 @@ external benchmarking harnesses.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache as _lru_cache, wraps
 
 import json
@@ -72,6 +73,48 @@ def _atomic_fit(method: _FitMethod) -> _FitMethod:
     return cast(_FitMethod, fit)
 
 
+# Fitted attributes describing the deployed fit's boosting (R2/R3), cleared with the fit.
+_STOP_REASONS = frozenset({"max_trees", "early_stopping", "no_split", "callback"})
+_FIT_REPORT_ATTRS = (
+    "n_trees_per_bag_",
+    "stopping_reason_per_bag_",
+    "n_trees_",
+    "stopping_reason_",
+    "evals_result_",
+    "_fit_eval_set_",
+)
+
+
+def _round_observer(callbacks: list[Callable[..., Any]], n_bags: int) -> Callable[..., bool]:
+    """Adapt the public `callbacks` (each called with an info dict, truthy = stop) to the
+    native observer's positional signature."""
+
+    def observer(
+        bag: int, round_: int, n_trees: int, train_deviance: float, eval_deviance: float | None
+    ) -> bool:
+        info = {
+            "phase": "fit",
+            "bag": bag,
+            "n_bags": n_bags,
+            "round": round_,
+            "n_trees": n_trees,
+            "train_deviance": train_deviance,
+            "eval_deviance": eval_deviance,
+        }
+        stop = False
+        for callback in callbacks:
+            if callback(dict(info)):
+                stop = True
+        return stop
+
+    return observer
+
+
+# Constructor parameters that only steer scoring, never the fit: changing them through
+# `set_params` keeps the fitted model.
+_SERVE_ONLY_PARAMS = frozenset({"unknown_category"})
+
+
 def _canonical_objective(name: str) -> str:
     normalized = str(name).replace("-", "_").lower()
     return {
@@ -106,7 +149,9 @@ def _reject_sparse(x: Any) -> None:
 # NUMERIC regressor with no envelope at all; both still load. A header from a NEWER schema is
 # refused rather than half-read (rustystats' fail-loud rule).
 _ESTIMATOR_MAGIC = b"TBP1"
-_ENVELOPE_SCHEMA_VERSION = 4
+# 5 (0.7.0): the caller's `metadata` slot and the fit report (`n_trees_per_bag_`, ...). A 0.6.2
+# loader would silently drop both, so it refuses these headers instead.
+_ENVELOPE_SCHEMA_VERSION = 5
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
 _TABLES_MAGIC = b"TBTM"  # the Rust tables-only (pruned) container prefix (see serialize.rs)
 _MULTICLASS_TABLES_MAGIC = b"TBMT"  # the Rust pruned-multiclass tables container prefix
@@ -1319,7 +1364,28 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     for key in ("_ae_requires_weight_", "_ae_requires_exposure_"):
         if getattr(est, key, False):
             md[key] = True
+    user = getattr(est, "_metadata", None)
+    if user:
+        md["metadata"] = _checked_user_metadata(user)
+    per_bag = getattr(est, "n_trees_per_bag_", None)
+    if per_bag is not None:
+        md["fit_report"] = {
+            "n_trees_per_bag": [int(v) for v in per_bag],
+            "stopping_reason_per_bag": [str(v) for v in est.stopping_reason_per_bag_ or []],
+        }
     return md
+
+
+def _checked_user_metadata(value: Any) -> dict[str, Any]:
+    """The caller's `metadata` slot as plain JSON, or `SerializationError`. Round-tripping
+    through strict JSON (no NaN/inf) here means a document that saves always loads back."""
+    if not isinstance(value, dict) or not all(isinstance(k, str) for k in value):
+        raise SerializationError("metadata must be a dict with str keys")
+    try:
+        checked: dict[str, Any] = json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise SerializationError(f"metadata is not JSON-serializable: {exc}") from exc
+    return checked
 
 
 def _check_envelope(cls: type, md: dict[str, Any]) -> None:
@@ -1462,6 +1528,18 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
     # `_estimator_metadata`); older blobs without the key keep whatever `_attach_model` set.
     if md.get("n_features_in_") is not None:
         est.n_features_in_ = int(md["n_features_in_"])
+    if "metadata" in md:
+        est._metadata = _checked_user_metadata(md["metadata"])
+    report = md.get("fit_report")
+    if not isinstance(report, dict):
+        est._clear_fit_counts()
+    else:
+        per_bag, reasons = report.get("n_trees_per_bag"), report.get("stopping_reason_per_bag")
+        if (not isinstance(per_bag, list) or not isinstance(reasons, list)
+                or len(per_bag) != len(reasons) or any(type(v) is not int for v in per_bag)
+                or any(r not in _STOP_REASONS for r in reasons)):
+            raise SerializationError("Invalid fit report in estimator envelope")
+        est._set_fit_counts(per_bag, reasons)
 
 
 def _pack_bytes(est: "_BaseTBoost", inner: bytes) -> bytes:
@@ -1530,11 +1608,46 @@ def _native_json_kind(text: str) -> str | None:
     return marker if isinstance(marker, str) else None
 
 __all__ = [
+    "ContributionMatrix",
     "PrecisionWarning",
     "TBoostRegressor",
     "TBoostClassifier",
     "recommended_recipe",
 ]
+
+
+@dataclass(frozen=True)
+class ContributionMatrix:
+    """``predict_contributions(..., return_format="matrix")``: every row's raw score as a
+    dense ``rows x terms`` matrix.
+
+    ``base_value + values.sum(axis=-1)`` equals the raw (link-scale) score, including any
+    ``exposure`` or ``offset`` passed, which appear as their own columns.
+
+    Attributes
+    ----------
+    base_value : numpy.ndarray
+        The intercept for each row (float64, link scale): shape ``(n_rows,)``, or
+        ``(n_classes, n_rows)`` for a multiclass model.
+    values : numpy.ndarray
+        The contributions (float64): shape ``(n_rows, n_terms)``, or
+        ``(n_classes, n_rows, n_terms)`` for a multiclass model.
+    terms : list[tuple[str, ...]]
+        Each column's feature names: one name for a main effect (or, with
+        ``split_interactions=True``, a feature), several for an interaction. The ``exposure``
+        and ``offset`` columns carry their argument's name alone.
+    term_types : list[str]
+        Each column's kind: ``"main"``, ``"interaction"``, ``"feature"``, ``"exposure"`` or
+        ``"offset"``. A feature that happens to be named ``"exposure"`` stays ``"main"``.
+    classes : list or None
+        The class labels along the leading axis of a multiclass result, else ``None``.
+    """
+
+    base_value: np.ndarray
+    values: np.ndarray
+    terms: list[tuple[str, ...]]
+    term_types: list[str]
+    classes: list[Any] | None = None
 
 
 class PrecisionWarning(UserWarning):
@@ -1627,6 +1740,16 @@ def _inverse_link(eta: "np.ndarray", link: str) -> "np.ndarray":
     return eta
 
 
+def _offset_array(offset: Any, n_rows: int, name: str = "offset") -> "np.ndarray":
+    """A link-scale offset as finite float64, one per row."""
+    arr = np.asarray(offset, dtype=np.float64).reshape(-1)
+    if arr.shape[0] != n_rows:
+        raise ValueError(f"{name} has {arr.shape[0]} rows but X has {n_rows}")
+    if not np.all(np.isfinite(arr)):
+        raise ValueError(f"{name} must be finite")
+    return arr
+
+
 def _softmax(etas: "np.ndarray") -> "np.ndarray":
     shifted = np.exp(np.clip(etas - etas.max(axis=1, keepdims=True), -_EXP_CLAMP, _EXP_CLAMP))
     return np.asarray(shifted / shifted.sum(axis=1, keepdims=True))
@@ -1667,6 +1790,52 @@ def _contribution_terms(
             joint = [{names[j]: columns[j][i] for j in cols} for i in range(n_rows)]
             terms.append((":".join(names[j] for j in cols), "interaction", joint))
     return np.asarray(values, dtype=np.float64), terms
+
+
+def _contribution_matrix(
+    ladders: list[tuple[float, "np.ndarray", list[list[int]]]],
+    names: list[str],
+    to_input: list[int],
+    split_interactions: bool,
+    trailing: list[str],
+    classes: list[Any] | None,
+) -> ContributionMatrix:
+    """The ``return_format="matrix"`` result from each bank's ``(f0, matrix, feature sets)``
+    as `_contribution_terms` laid it out. A multiclass model's classes may keep different
+    effects, so their columns are scattered onto the union of effects (zero where a class has
+    none)."""
+    terms: list[tuple[str, ...]]
+    if split_interactions:
+        terms = [(name,) for name in names]
+        term_types = ["feature"] * len(names)
+        placed = [np.asarray(m, dtype=np.float64) for _, m, _ in ladders]
+    else:
+        index: dict[tuple[str, ...], int] = {}
+        bank_terms = [
+            [tuple(names[to_input[raw]] for raw in raws) for raws in sets]
+            for _, _, sets in ladders
+        ]
+        for keys in bank_terms:
+            for key in keys:
+                index.setdefault(key, len(index))
+        terms = list(index)
+        term_types = ["main" if len(t) == 1 else "interaction" for t in terms]
+        placed = []
+        for (_, m, _), keys in zip(ladders, bank_terms):
+            full = np.zeros((m.shape[0], len(terms)), dtype=np.float64)
+            for col, key in enumerate(keys):
+                full[:, index[key]] = m[:, col]
+            if trailing:
+                full = np.column_stack([full, m[:, len(keys):]])
+            placed.append(full)
+    for name in trailing:
+        terms.append((name,))
+        term_types.append(name)
+    base = np.stack([np.full(m.shape[0], f0, dtype=np.float64) for (f0, _, _), m in zip(ladders, placed)])
+    values = np.stack(placed)
+    if classes is None:
+        return ContributionMatrix(base[0], values[0], terms, term_types)
+    return ContributionMatrix(base, values, terms, term_types, classes)
 
 
 def _ladder_parts(
@@ -1832,6 +2001,32 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     # / binary), or the multiclass `_multi_model` (K>=3 softmax). Annotated for the type checker.
     _model: _Model | _TableModel
     _multi_model: _MultiClassModel | _MultiClassTableModel | None
+    n_trees_per_bag_: list[int] | None
+    stopping_reason_per_bag_: list[str] | None
+    n_trees_: int | None
+    stopping_reason_: str | None
+    evals_result_: dict[str, dict[str, list[list[float]]]]
+
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Caller-owned JSON metadata, saved with the model by :meth:`to_bytes` /
+        :meth:`to_json` and returned unchanged by ``from_bytes`` / ``from_json``.
+
+        t-boost never reads it: it has no effect on fitting, predictions or ``tables()``, and a
+        refit keeps it. Keys must be strings and values JSON-serializable (no NaN or infinity);
+        anything else raises ``SerializationError`` when the model is saved.
+        """
+        value: dict[str, Any] | None = self.__dict__.get("_metadata")
+        if value is None:
+            value = {}
+            self._metadata = value
+        return value
+
+    @metadata.setter
+    def metadata(self, value: dict[str, Any]) -> None:
+        if not isinstance(value, dict):
+            raise TypeError(f"metadata must be a dict, got {type(value).__name__}")
+        self._metadata = value
 
     # NOTE: constructor defaults deliberately embed the recommended recipe so a bare estimator
     # performs well without tuning (see `recommended_recipe`) — and, since 2026-07-15, they match
@@ -1992,6 +2187,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
+        unknown_category: str = "default_cell",
     ) -> None:
         self.n_trees = n_trees
         self.learning_rate = learning_rate
@@ -2287,6 +2483,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_size_penalty = prune_size_penalty
         self.early_stopping = early_stopping
         self._resolve_merged_aliases()
+        # Scoring-time policy for a categorical level the fit never saw (see `_check_unknown`).
+        self.unknown_category = unknown_category
 
     def _resolve_merged_aliases(self) -> None:
         prune_size_penalty = self.prune_size_penalty
@@ -2351,6 +2549,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self.__dict__.clear()
             self.__dict__.update(previous)
             raise
+        if set(params) <= _SERVE_ONLY_PARAMS:
+            # Scoring-time policy only: the fitted model is still the model these params describe.
+            return result
         for name in (
             "_model",
             "_multi_model",
@@ -2369,6 +2570,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "_ae_requires_weight_",
             "_ae_requires_exposure_",
             "graduation_validation_",
+            *_FIT_REPORT_ATTRS,
             *_COLUMN_SPECS,
         ):
             if hasattr(self, name):
@@ -2395,6 +2597,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "_ae_requires_weight_",
             "_ae_requires_exposure_",
             "graduation_validation_",
+            *_FIT_REPORT_ATTRS,
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -2577,6 +2780,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             add("monotone_constraints", "HONOURED",
                 f"signs expanded onto every axis of each named feature"
                 + (f"; input features: {names}" if names else ""))
+
+        if getattr(self, "_fit_eval_set_", False) and self.validation_fraction is not None:
+            add("validation_fraction", "INERT",
+                "eval_set supplied the early-stopping rows, so no holdout was carved", "eval_set")
 
         # deprecated spellings still work, but say so here as well as in the warning
         for old, (new, _why) in self._DEPRECATED.items():
@@ -3234,7 +3441,68 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         numeric_x, cat_x, _ = self._split_columns(
             X, list(cat_idx), _feature_names_from_x(X), coded=coded
         )
+        self._check_unknown(cat_x)
         return numeric_x, cat_x
+
+    def _resolve_offset(self, X: Any, offset: Any | None) -> tuple[Any, Any]:
+        """A scoring call's `offset` (array, or a column name of a polars `X`). Multiclass
+        models take none."""
+        if offset is None:
+            return X, None
+        if getattr(self, "_multi_model", None) is not None:
+            raise ValueError("offset is not supported for multiclass (K >= 3) models")
+        if isinstance(offset, str):
+            X = collect_frame(X)
+            return X, resolve_vector(X if is_polars_eager(X) else None, offset, "offset")
+        return X, offset
+
+    def _check_unknown(self, cat_x: Any) -> None:
+        """Enforce `unknown_category` on a serve design's categorical columns (per-row labels,
+        or `(codes, distinct labels)` pairs), in `_cat_indices_` order."""
+        policy = getattr(self, "unknown_category", "default_cell")
+        if policy not in ("default_cell", "error"):
+            raise ValueError(
+                f"unknown_category must be 'default_cell' or 'error', got {policy!r}"
+            )
+        if policy == "default_cell" or not cat_x:
+            return
+        known = self._known_labels()
+        names = self._input_feature_names()
+        for pos, column in zip(getattr(self, "_cat_indices_", None) or [], cat_x):
+            labels = column[1] if isinstance(column, tuple) else column
+            fitted = known.get(int(pos), set())
+            unseen: list[str] = []
+            for label in dict.fromkeys(labels):
+                if label != _CAT_MISSING and label not in fitted:
+                    unseen.append(label)
+                    if len(unseen) == 5:
+                        break
+            if unseen:
+                raise ValueError(
+                    f"feature {names[int(pos)]!r} has categorical value(s) the fit never saw: "
+                    f"{', '.join(map(repr, unseen))} (unknown_category='error')"
+                )
+
+    def _known_labels(self) -> dict[int, set[str]]:
+        """Each categorical input column's fitted labels, keyed by input position."""
+        model = getattr(self, "_multi_model", None) or self._model
+        to_input = self._raw_to_input_column()
+        return {to_input[raw]: set(labels) for raw, labels in model.categorical_labels()}
+
+    @property
+    def categories_(self) -> dict[str, list[str | None]]:
+        """The fitted levels of each categorical feature, keyed by feature name: every value
+        the fit saw, including those pooled into the ``"<rare>"`` level, with ``None`` for the
+        missing level when the fit saw nulls. Values are listed as the canonical strings
+        t-boost matches on (a numeric category ``1`` is ``"1"``)."""
+        check_is_fitted(self)
+        model = getattr(self, "_multi_model", None) or self._model
+        names = self._input_feature_names()
+        to_input = self._raw_to_input_column()
+        return {
+            names[to_input[raw]]: [None if label == _CAT_MISSING else label for label in labels]
+            for raw, labels in model.categorical_labels()
+        }
 
     def _default_fit_pool(self, n_features: int) -> int | None:
         """Fit-pool width when ``n_jobs=None`` (P1.1 diagnosis, plan/speed-campaign-2.md).
@@ -3432,6 +3700,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         disable_cell_refit: bool = False,
         early_stopping_rounds_override: int | None = None,
         fit_pool_width: int | None = None,
+        external_eval: bool = False,
     ) -> _Booster:
         # `n_bags` override lets the v2-prune CV fit cheap single-bag fold models (structure, not
         # variance-reduction, drives table selection) while the deployed model keeps its full bagging.
@@ -3464,6 +3733,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         reanchor_slope = self.reanchor_slope
         if reanchor_slope is None:
             reanchor_slope = obj in {"poisson", "gamma", "tweedie"}
+        if external_eval:
+            # The slope recalibration fits on the stopping holdout, and an `eval_set` must only
+            # score early stopping (an explicit True was refused in `_stage_fit_extras`).
+            reanchor_slope = False
         # path_smooth `None` resolves objective-aware (2026-07-23): heavy-tail gamma/tweedie
         # deviance is dominated by sparse-evidence cell variance, and the parent-shrinkage
         # credibility blend is the zero-cost smoother for exactly that (6-set screen:
@@ -3576,6 +3849,169 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             fit_pool_width=fit_pool_width,
         )
 
+    def _stage_fit_extras(
+        self,
+        eval_set: Any,
+        eval_sample_weight: Any,
+        eval_exposure: Any,
+        callbacks: Any,
+        has_exposure: bool,
+        eval_offset: Any = None,
+        has_offset: bool = False,
+    ) -> None:
+        """Validate and stash the fit's `eval_set` / `callbacks` for the deployed fit. The
+        stash lives only for the duration of `fit` (see `_fit_with_extras`)."""
+        extras: dict[str, Any] = {}
+        if eval_set is not None:
+            if not isinstance(eval_set, (tuple, list)) or len(eval_set) != 2:
+                raise ValueError("eval_set must be an (X_val, y_val) pair")
+            if self.reanchor_slope is True:
+                raise ValueError(
+                    "reanchor_slope=True cannot be combined with eval_set: the slope "
+                    "recalibration fits on the early-stopping rows, and eval_set rows may only "
+                    "score early stopping. Leave reanchor_slope at None."
+                )
+            x_val, vectors = self._resolve_fit_vectors(
+                eval_set[0],
+                {
+                    "y": eval_set[1], "sample_weight": eval_sample_weight,
+                    "exposure": eval_exposure, "offset": eval_offset,
+                },
+            )
+            if vectors["y"] is None:
+                raise ValueError("eval_set needs a target: (X_val, y_val)")
+            if has_exposure and vectors["exposure"] is None:
+                raise ValueError("the fit rows have exposure, so eval_exposure is required")
+            if not has_exposure and vectors["exposure"] is not None:
+                raise ValueError("eval_exposure needs exposure on the fit rows too")
+            if has_offset != (vectors["offset"] is not None):
+                raise ValueError("offset and eval_offset must be given together")
+            extras["eval"] = (
+                x_val, vectors["y"], vectors["sample_weight"], vectors["exposure"],
+                vectors["offset"],
+            )
+        elif eval_sample_weight is not None or eval_exposure is not None or eval_offset is not None:
+            raise ValueError("eval_sample_weight, eval_exposure and eval_offset need eval_set")
+        if callbacks is not None:
+            funcs = [callbacks] if callable(callbacks) else list(callbacks)
+            if not all(callable(f) for f in funcs):
+                raise TypeError("callbacks must be a callable or a list of callables")
+            if funcs:
+                extras["callbacks"] = funcs
+        self._fit_extras_ = extras
+
+    def _eval_target(self, y: Any) -> np.ndarray:
+        return _as_float32_1d(y, "eval y")
+
+    def _eval_design(
+        self, evals: tuple[Any, Any, Any, Any, Any], cat_idx: list[int],
+        feature_names: list[str] | None, n_features: int, fit_cats: Any = None,
+    ) -> dict[str, Any]:
+        """The `eval_set` rows laid out exactly as the fit design (same columns, same
+        categorical split), for the native fit's `eval_*` arguments."""
+        x_val, y_val, w_val, e_val, o_val = evals
+        _reject_sparse(x_val)
+        x_val = collect_frame(x_val)
+        if is_polars_eager(x_val) and feature_names is not None:
+            x_val = select_feature_columns(x_val, feature_names)
+        if _n_columns(x_val) != n_features:
+            raise ValueError(
+                f"eval_set X has {_n_columns(x_val)} features but X has {n_features}"
+            )
+        xv32, cat_v, _ = self._split_columns(x_val, cat_idx, feature_names)
+        if getattr(self, "unknown_category", "default_cell") == "error" and cat_v:
+            # The model does not exist yet, so the fit rows' own labels are the known set.
+            for pos, fit_col, val_col in zip(cat_idx, fit_cats or [], cat_v):
+                known = set(fit_col)
+                unseen = [v for v in dict.fromkeys(val_col)
+                          if v != _CAT_MISSING and v not in known][:5]
+                if unseen:
+                    name = feature_names[pos] if feature_names else f"f{pos}"
+                    raise ValueError(
+                        f"eval_set feature {name!r} has categorical value(s) the fit never "
+                        f"saw: {', '.join(map(repr, unseen))} (unknown_category='error')"
+                    )
+        n = int(xv32.shape[0])
+        if n == 0:
+            raise ValueError("eval_set has 0 rows")
+        out: dict[str, Any] = {
+            "eval_x": xv32,
+            "eval_y": np.ascontiguousarray(self._eval_target(y_val)),
+            "eval_cat_x": cat_v,
+        }
+        for key, value, name in (
+            ("eval_weight", w_val, "eval_sample_weight"),
+            ("eval_exposure", e_val, "eval_exposure"),
+        ):
+            if value is not None:
+                out[key] = np.ascontiguousarray(_as_float32_1d(value, name))
+        for key in ("eval_y", "eval_weight", "eval_exposure"):
+            if key in out and out[key].shape[0] != n:
+                raise ValueError(f"{key} has {out[key].shape[0]} rows but eval_set X has {n}")
+        if "eval_weight" in out and float(np.sum(out["eval_weight"])) <= 0.0:
+            raise ValueError("eval_sample_weight sums to zero")
+        if o_val is not None:
+            out["eval_y"], exposure = self._apply_offset(
+                out["eval_y"], out.get("eval_exposure"), _offset_array(o_val, n, "eval_offset")
+            )
+            if exposure is not None:
+                out["eval_exposure"] = exposure
+        return out
+
+    def _apply_offset(
+        self, y32: np.ndarray, exposure32: np.ndarray | None, offset: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        """Fold a link-scale offset into what the native fit consumes (R6).
+
+        Under the identity link an offset is exactly a target shift: the fit of ``y - offset``
+        is the fit of ``y`` around the offset, every stage included. Under the log and logit
+        links the native exposure already enters the raw score as ``log(exposure)``, so the
+        offset joins it as ``exposure * exp(offset)``.
+        """
+        if _canonical_objective(self.objective) == "squared_error":
+            shifted = np.asarray(y32, dtype=np.float64) - offset
+            return np.ascontiguousarray(shifted.astype(np.float32)), exposure32
+        base = (
+            np.ones(offset.shape[0]) if exposure32 is None
+            else np.asarray(exposure32, dtype=np.float64)
+        )
+        combined = base * np.exp(offset)
+        if not np.all(np.isfinite(combined) & (combined > 0)) or np.any(combined > np.finfo(np.float32).max):
+            raise ValueError("exp(offset) overflows; the offset must stay on the link scale")
+        return y32, np.ascontiguousarray(combined.astype(np.float32))
+
+    def _record_fit_report(self, model: Any) -> None:
+        """R2/R3 attributes from the deployed fit's native per-bag report."""
+        report = model.fit_report() if hasattr(model, "fit_report") else None
+        if report is None:
+            self._clear_fit_counts()
+            return
+        self._set_fit_counts([int(r[0]) for r in report], [str(r[2]) for r in report])
+        deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
+        if deploy.get("record_history"):
+            result: dict[str, dict[str, list[list[float]]]] = {}
+            if any(r[3] for r in report):
+                result["train"] = {"deviance": [list(r[3]) for r in report]}
+            if any(r[4] for r in report):
+                result["eval"] = {"deviance": [list(r[4]) for r in report]}
+            self.evals_result_ = result
+        else:
+            self.__dict__.pop("evals_result_", None)
+
+    def _clear_fit_counts(self) -> None:
+        """No boosting report (a multiclass fit, or a model saved before 0.7.0)."""
+        self.n_trees_per_bag_ = self.stopping_reason_per_bag_ = None
+        self.n_trees_ = self.stopping_reason_ = None
+        self.__dict__.pop("evals_result_", None)
+
+    def _set_fit_counts(self, per_bag: list[int], reasons: list[str]) -> None:
+        self.n_trees_per_bag_ = per_bag
+        self.stopping_reason_per_bag_ = reasons
+        self.n_trees_ = max(per_bag) if per_bag else 0
+        self.stopping_reason_ = next(
+            (r for r in ("callback", "early_stopping", "no_split") if r in reasons), "max_trees"
+        )
+
     def _fit_model(
         self,
         x: Any,
@@ -3585,6 +4021,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         exposure: Any | None,
         class_labels: list[str] | None,
         groups: Any | None = None,
+        offset: Any | None = None,
     ) -> _Model | _TableModel:
         self._clear_stale_fit_state()
         high_alpha = self.graduation_high_order_alpha
@@ -3634,6 +4071,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         y32 = _as_float32_1d(y, "y")
         if x32.shape[0] != y32.shape[0]:
             raise ValueError(f"X has {x32.shape[0]} rows but y has {y32.shape[0]}")
+        extras = self.__dict__.get("_fit_extras_") or {}
+        deploy: dict[str, Any] = {}
+        if "eval" in extras:
+            deploy.update(
+                self._eval_design(extras["eval"], cat_idx, feature_names, n_features, cat_x)
+            )
+        if "callbacks" in extras:
+            deploy["observer"] = _round_observer(extras["callbacks"], int(self.n_bags))
+        if deploy:
+            deploy["record_history"] = True
+        extras["deploy"] = deploy
+        self._fit_eval_set_ = "eval" in extras
         if x32.shape[0] == 0:
             raise ValueError("X has 0 samples; need at least 1 row to fit")
         weight32 = None
@@ -3647,6 +4096,16 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 raise ValueError("sample_weight sums to zero; no effective samples to fit")
         exposure32 = None
         if exposure is not None:
+            # Exposure enters as a log(exposure) offset on the raw score: a rate model under a
+            # log link, and the rare-event approximation under the logit link (BUG-056). Under
+            # the identity link it would add log(exposure) to a mean, which models nothing.
+            if _canonical_objective(self.objective) == "squared_error":
+                raise ValueError(
+                    "exposure is not supported with objective='squared_error': it enters as a "
+                    "log(exposure) offset, which has no meaning under the identity link. Use "
+                    "objective='poisson', 'gamma' or 'tweedie' for a rate model, or "
+                    "sample_weight to weight rows"
+                )
             exposure32 = _as_float32_1d(exposure, "exposure")
             if exposure32.shape[0] != y32.shape[0]:
                 raise ValueError(
@@ -3684,6 +4143,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._fit_sample_weight_ = weight32
         if exposure32 is not None:
             self._fit_exposure_ = exposure32
+        if offset is not None:
+            # After the stash above: `tables()` defaults to the caller's own mass, never the
+            # offset folded into the native exposure here.
+            y32, exposure32 = self._apply_offset(
+                y32, exposure32, _offset_array(offset, int(y32.shape[0]))
+            )
         # Monotone signs are positional over the ORIGINAL features; native categoricals
         # reorder the design (numeric axes first, then categoricals, per `_split_columns`),
         # so remap the sign vector to that axis order before handing it to the core.
@@ -3696,7 +4161,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         if monotone is not None and any(monotone) and self.cell_refit_base is not None:
             raise ValueError("cell_refit_base cannot preserve monotone_constraints; leave it unset")
-        booster = self._new_booster(fit_pool_width=self._default_fit_pool(n_features))
+        booster = self._new_booster(
+            fit_pool_width=self._default_fit_pool(n_features), external_eval="eval_x" in deploy
+        )
         model: _Model | _TableModel
         self._validate_box_budget_reachable()
         if self.prune:
@@ -3714,7 +4181,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         else:
             es_holdout: list[bool] | None = None
-            if groups_arr is not None and self.validation_fraction is not None:
+            if groups_arr is not None and self.validation_fraction is not None and not deploy:
                 seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
                 es_holdout = _carve_group_holdout(
                     groups_arr, float(self.validation_fraction), [seed, 1]
@@ -3730,7 +4197,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 cat_x=cat_x,
                 es_holdout=es_holdout,
                 bag_groups=bag_codes,
+                **deploy,
             )
+            self._record_fit_report(model)
         if not self.prune and isinstance(model, _Model):
             self.delta_step_gate_ = model.delta_step_gate
             # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
@@ -4007,7 +4476,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # byte-identical to guard-off fits at EVERY size.
         deploy_es_holdout: list[bool] | None = None
         fold_es_holdout: list[bool] | None = None
-        if self.validation_fraction is not None and groups_arr is not None:
+        deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
+        if self.validation_fraction is not None and groups_arr is not None and "eval_x" not in deploy:
             # ES-runaway fix #2 (2026-07-20): on high-zero-mass Poisson/Tweedie panels an
             # unstratified group-honest carve can land almost entirely on zero-event groups —
             # the group-carve analog of the row-level bug es_strata_for_loss fixes (native
@@ -4052,7 +4522,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             cat_x=cat_x,
             es_holdout=deploy_es_holdout,
             bag_groups=bag_codes,
+            **deploy,
         )
+        self._record_fit_report(full_model)
         # §05.6-addendum rate-collapse gate report for the DEPLOYED fit (the pruning fold
         # models have their own, uninteresting, gates). Recorded here rather than after the
         # prune because pruning replaces the `_Model` with a `_TableModel`, which carries no
@@ -5517,6 +5989,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         X: Any,
         *,
         exposure: Any | None = None,
+        offset: Any | None = None,
         split_interactions: bool = False,
         return_format: str = "records",
         validate: bool = True,
@@ -5544,15 +6017,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             Adds an ``"exposure"`` contribution of ``log(exposure)``, so ``prediction_value``
             becomes the expected total (``predict(X) * exposure``) instead of the rate per
             unit exposure that :meth:`predict` returns.
+        offset : str or array-like, optional
+            A link-scale offset per row, as passed to ``fit(offset=...)``. Adds an
+            ``"offset"`` contribution, so the identities above hold for the raw score
+            including it. Regression and binary models only.
         split_interactions : bool, default False
             ``False``: one contribution per effect, main effects (``term_type="main"``) and
             interactions (``"interaction"``, named ``"a:b"``) alike. ``True``: one contribution
             per input feature (``term_type="feature"``), each interaction shared equally among
             its features. These are exact interventional Shapley values.
-        return_format : {"records", "dataframe"}, default "records"
+        return_format : {"records", "dataframe", "matrix"}, default "records"
             ``"records"``: one dict per row with a nested ``contributions`` list.
             ``"dataframe"``: a long polars DataFrame, one row per ``(row_index, term)`` (per
             ``(row_index, class, term)`` for a multiclass model).
+            ``"matrix"``: a :class:`ContributionMatrix` holding a dense ``rows x terms``
+            float64 matrix whose terms are tuples of feature names, so feature names may
+            contain ``:``. An intercept-only model gives zero columns. With
+            ``split_interactions=True`` the columns are the fitted features in input order, a
+            feature no table uses being a zero column. The fastest format.
         validate : bool, default True
             Check both identities above against the model's own raw score and prediction (the
             class probabilities for a classifier), raising ``ValueError`` on a breach.
@@ -5579,17 +6061,25 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             For exposure on a non-log-link model, non-positive exposure, or a model saved by
             an older t-boost without its rating tables.
         """
-        if return_format not in ("records", "dataframe"):
-            raise ValueError(f"return_format must be 'records' or 'dataframe', got {return_format!r}")
+        if return_format not in ("records", "dataframe", "matrix"):
+            raise ValueError(
+                "return_format must be 'records', 'dataframe' or 'matrix', "
+                f"got {return_format!r}"
+            )
         model = self._deployed_tables()
         if is_polars_frame(X):
             names = getattr(self, "feature_names_in_", None)
             needed = None
             if names is not None:
-                needed = [str(n) for n in names] + ([exposure] if isinstance(exposure, str) else [])
+                needed = [str(n) for n in names] + [
+                    v for v in (exposure, offset) if isinstance(v, str)
+                ]
             X = collect_frame(X, needed)
         frame = X if is_polars_eager(X) else None
         exposure = resolve_vector(frame, exposure, "exposure")
+        offset = resolve_vector(frame, offset, "offset")
+        if offset is not None and isinstance(model, _MultiClassTableModel):
+            raise ValueError("offset is not supported for multiclass (K >= 3) models")
         link = self.link
         if exposure is not None and link != "log":
             raise ValueError("exposure= is only meaningful for log-link models")
@@ -5605,8 +6095,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         names = self._input_feature_names()
         to_input = self._raw_to_input_column()
         named = getattr(self, "feature_names_in_", None) is not None
+        matrix_format = return_format == "matrix"
+        # The matrix format names terms by tuple and never reads the per-row feature values.
         columns = [
-            _input_column_values(X, j, names[j] if named else None) for j in range(len(names))
+            [] if matrix_format else _input_column_values(X, j, names[j] if named else None)
+            for j in range(len(names))
         ]
 
         log_exposure = None
@@ -5619,13 +6112,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 raise ValueError("exposure must be finite and strictly positive")
             log_exposure = np.log(exp_arr)
             exp_list = exp_arr.tolist()
+        off_arr = None if offset is None else _offset_array(offset, n_rows)
 
         # One ladder per bank: a single-output model has one, a multiclass model one per class.
         ladders = []
         for f0, values, feature_sets in banks:
-            matrix, terms = _contribution_terms(
-                values, feature_sets, names, to_input, columns, split_interactions, n_rows
-            )
+            terms: list[tuple[str, str, list[Any]]]
+            if matrix_format and not split_interactions:
+                matrix, terms = np.asarray(values, dtype=np.float64), []
+            else:
+                matrix, terms = _contribution_terms(
+                    values, feature_sets, names, to_input, columns, split_interactions, n_rows
+                )
             # Summed left to right from f0, exactly as the native scorer sums, so the raw score
             # is reproduced to the last float64 bit before its float32 rounding.
             eta = np.cumsum(np.column_stack([np.full(n_rows, f0), values]), axis=1)[:, -1]
@@ -5633,6 +6131,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 matrix = np.column_stack([matrix, log_exposure])
                 eta = eta + log_exposure
                 terms.append(("exposure", "exposure", exp_list))
+            if off_arr is not None:
+                matrix = np.column_stack([matrix, off_arr])
+                eta = eta + off_arr
+                terms.append(("offset", "offset", [] if matrix_format else off_arr.tolist()))
             ladders.append((float(f0), matrix, terms, eta))
 
         etas = np.column_stack([lad[3] for lad in ladders])
@@ -5645,7 +6147,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         else:
             mus = _inverse_link(etas, link)
         if validate:
-            self._validate_contributions(X, etas, mus, log_exposure, atol, rtol)
+            self._validate_contributions(X, etas, mus, log_exposure, atol, rtol, off_arr)
+        if matrix_format:
+            trailing = [name for name, arr in (("exposure", log_exposure), ("offset", off_arr))
+                        if arr is not None]
+            return _contribution_matrix(
+                [(f0, matrix, sets) for (f0, matrix, _, _), (_, _, sets) in zip(ladders, banks)],
+                names, to_input, split_interactions, trailing,
+                [_label_value(c) for c in self.classes_] if multiclass else None,
+            )
 
         family = "multinomial" if multiclass else _canonical_objective(self.objective)
         output_space = "response" if link == "identity" else "linear_predictor"
@@ -5708,6 +6218,39 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 records.append({**head, **per_class[0]})
         return records
 
+    def cell_indices(self, X: Any) -> dict[tuple[str, ...], np.ndarray]:
+        """The rating-table cell every row of ``X`` scores in, per deployed table.
+
+        Keyed like :meth:`predict_contributions` ``return_format="matrix"`` terms and the
+        ``feature_names`` of :meth:`tables`: one entry per dense table, holding an
+        ``(n_rows, order)`` uint32 array with the row's cell on each of the table's axes, in
+        that table's axis order. ``values[numpy.ravel_multi_index(tuple(cells.T), shape)]``
+        of the exported table is the row's contribution from it. Over-budget effects kept in
+        factored form (``tables()["factored"]``) have no cells and are not listed.
+
+        The cells follow the rules documented under :meth:`tables`: numeric values compare
+        in float32, cell 0 is missing, and a value equal to a border lands in the lower cell.
+
+        Raises
+        ------
+        ValueError
+            For a multiclass model (one table bank per class), or a model saved by an older
+            t-boost without its rating tables.
+        """
+        model = self._deployed_tables()
+        if isinstance(model, _MultiClassTableModel):
+            raise ValueError("cell_indices supports regression and binary models only")
+        if is_polars_frame(X):
+            names = getattr(self, "feature_names_in_", None)
+            X = collect_frame(X, None if names is None else [str(n) for n in names])
+        x32, cat_kw = self._serve_kwargs(X, model)
+        names = self._input_feature_names()
+        to_input = self._raw_to_input_column()
+        out: dict[tuple[str, ...], np.ndarray] = {}
+        for raws, cells in model.table_cell_indices(x32, **cat_kw, n_jobs=self._resolve_n_jobs()):
+            out[tuple(names[to_input[raw]] for raw in raws)] = np.asarray(cells, dtype=np.uint32)
+        return out
+
     def _validate_contributions(
         self,
         X: Any,
@@ -5716,6 +6259,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         log_exposure: "np.ndarray | None",
         atol: float,
         rtol: float,
+        offset: "np.ndarray | None" = None,
     ) -> None:
         multi = getattr(self, "_multi_model", None)
         model = multi if multi is not None else self._model
@@ -5727,10 +6271,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             raw = np.asarray(
                 model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
             )[:, None]
+            if offset is not None:
+                raw = raw + offset[:, None]
             if _canonical_objective(self.objective) == "logistic":
-                pred = np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1:]
+                pred = np.asarray(self.predict_proba(X, offset=offset), dtype=np.float64)[:, 1:]
             else:
-                pred = np.asarray(self.predict(X), dtype=np.float64)[:, None]
+                pred = np.asarray(self.predict(X, offset=offset), dtype=np.float64)[:, None]
         if log_exposure is not None:
             raw = raw + log_exposure[:, None]
             pred = pred * np.exp(log_exposure)[:, None]
@@ -6139,6 +6685,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
+    unknown_category : {"default_cell", "error"}, default="default_cell"
+        What scoring does with a categorical value the fit never saw. ``"default_cell"``
+        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
+        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+        ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
+        feature and up to five unseen values. A null is never unknown: it scores in the
+        missing level. The fitted levels are listed in ``categories_``.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -6551,6 +7104,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostRegressor
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_bytes(data)
@@ -6576,6 +7140,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostRegressor
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_json(data)
@@ -6604,6 +7179,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         sample_weight: Any | None = None,
         exposure: Any | None = None,
         groups: Any | None = None,
+        *,
+        offset: Any | None = None,
+        eval_set: tuple[Any, Any] | None = None,
+        eval_sample_weight: Any | None = None,
+        eval_exposure: Any | None = None,
+        eval_offset: Any | None = None,
+        callbacks: Any | None = None,
     ) -> "TBoostRegressor":
         """Fit the boosted ensemble.
 
@@ -6646,6 +7228,47 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             row-level internal carves — as does an ALL-SINGLETON grouping, which is normalized
             to ``None`` at ingest because at group size 1 it means the same thing (a ``str``
             column is still consumed out of the feature set either way).
+        offset : array-like of shape (n_samples,), or str, optional
+            A link-scale offset added to every row's raw score and never learned (XGBoost's
+            ``base_margin``, LightGBM's ``init_score``); a ``str`` names a column of the polars
+            ``X``. Under ``squared_error`` the fit is exactly the fit of ``y - offset``. Under
+            the log and logit links it joins the exposure offset (``log(exposure) + offset``),
+            and like exposure there it also scales the row's mass in the tables' reference
+            measure and ``support``. Scoring adds it only when passed again (``offset=`` on
+            the ``predict*`` methods); omitted, a row scores on a zero offset.
+        eval_set : (X_val, y_val), optional
+            Rows that only score early stopping: every bag stops at its own best round on
+            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
+            they never reach training, the intercept, the cell refit, the tables or pruning.
+            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
+            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
+        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
+            The evaluation rows' weight, exposure and offset (``str`` names a column of
+            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
+            ``eval_offset`` when ``offset`` is.
+        callbacks : callable or list of callables, optional
+            Each called after every boosting round of the deployed fit with a dict:
+            ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
+            ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
+            rows and its early-stopping rows; ``None`` without the latter). Bags run in
+            parallel, so calls for different bags interleave; each bag's rounds arrive in
+            order, all on the calling thread. A truthy return stops every bag after its
+            current round (``stopping_reason_ == "callback"``); an exception stops the fit
+            and propagates. The per-round history is kept in ``evals_result_``.
+
+        Notes
+        -----
+        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
+        ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
+        ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
+        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
+        boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
+        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
+        ``evals_result_`` holds each bag's per-round mean deviances:
+        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
+        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
+        is an extra pass per round, so it is computed only when ``callbacks`` are given.
 
         Returns
         -------
@@ -6665,24 +7288,34 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
                 "sample_weight": sample_weight,
                 "exposure": exposure,
                 "groups": groups,
+                "offset": offset,
             },
         )
         self._record_column_specs(y, sample_weight, exposure, groups)
-        self._fit_model(
-            X,
-            resolved["y"],
-            sample_weight=resolved["sample_weight"],
-            exposure=resolved["exposure"],
-            class_labels=None,
-            groups=resolved["groups"],
+        self._stage_fit_extras(
+            eval_set, eval_sample_weight, eval_exposure, callbacks,
+            has_exposure=resolved["exposure"] is not None,
+            eval_offset=eval_offset, has_offset=resolved["offset"] is not None,
         )
+        try:
+            self._fit_model(
+                X,
+                resolved["y"],
+                sample_weight=resolved["sample_weight"],
+                exposure=resolved["exposure"],
+                class_labels=None,
+                groups=resolved["groups"],
+                offset=resolved["offset"],
+            )
+        finally:
+            self.__dict__.pop("_fit_extras_", None)
         # Proactive half of `binding_report_`: interrupt when a parameter the caller set
         # was actively CANCELLED by another. Fires after the fit because the verdict needs
         # the prune report and the deployed artifact. OVERRIDDEN only — see the method.
         self._warn_voided_params()
         return self
 
-    def predict(self, X: Any) -> np.ndarray:
+    def predict(self, X: Any, *, offset: Any | None = None) -> np.ndarray:
         """Predict on the response scale, per unit exposure for log-link fits.
 
         With Poisson/Gamma/Tweedie exposure offsets, this returns a rate, not a row
@@ -6697,6 +7330,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             ``LazyFrame`` collects only the needed columns. Array-likes (and a model fitted
             without column names) must instead have the same number and layout of features
             as the data passed to ``fit``.
+        offset : array-like of shape (n_samples,), or str, optional
+            The link-scale offset to add, as passed to ``fit(offset=...)`` (a ``str`` names a
+            column of a polars ``X``). Omitted, rows score on a zero offset.
 
         Returns
         -------
@@ -6706,6 +7342,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             ``float32`` accumulation error in downstream metrics).
         """
         check_is_fitted(self, "_model")
+        if offset is not None:
+            return _inverse_link(self.predict_raw(X, offset=offset), self.link)
         x32, cat_kw = self._serve_kwargs(X, self._model)
         # Return float64 (the core scores in f32): sklearn's convention, and it avoids f32
         # accumulation error in downstream metrics.
@@ -6715,7 +7353,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             self._model.predict(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64
         )
 
-    def predict_raw(self, X: Any) -> np.ndarray:
+    def predict_raw(self, X: Any, *, offset: Any | None = None) -> np.ndarray:
         """Predict on the link scale, before the objective's inverse link is applied.
 
         For ``objective="squared_error"`` this is identical to :meth:`predict`. For the
@@ -6730,6 +7368,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             ``LazyFrame`` collects only the needed columns. Array-likes (and a model fitted
             without column names) must instead have the same number and layout of features
             as the data passed to ``fit``.
+        offset : array-like of shape (n_samples,), or str, optional
+            The link-scale offset to add, as passed to ``fit(offset=...)`` (a ``str`` names a
+            column of a polars ``X``). Omitted, rows score on a zero offset.
 
         Returns
         -------
@@ -6737,11 +7378,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             Link-scale predictions as ``float64``.
         """
         check_is_fitted(self, "_model")
+        X, extra = self._resolve_offset(X, offset)
         x32, cat_kw = self._serve_kwargs(X, self._model)
-        return np.asarray(
+        raw = np.asarray(
             self._model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()),
             dtype=np.float64,
         )
+        return raw if extra is None else raw + _offset_array(extra, raw.shape[0])
 
     def to_bytes(self) -> bytes:
         """Serialize the fitted estimator to a compact binary wire format.
@@ -6867,6 +7510,26 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             relativity is ``values``/``relativities`` at that ``cell`` index; levels the
             model cannot distinguish correctly share one ``cell``. ``None`` for a purely
             numeric axis.
+
+        Notes
+        -----
+        How a row finds its cell (:meth:`cell_indices` returns them):
+
+        - ``values``, ``relativities`` and ``support`` are flattened row-major (C order) over
+          ``shape``, one dimension per entry of ``axes``.
+        - A numeric axis with borders ``b[0] < ... < b[m-1]`` has ``m + 2`` cells. Cell 0
+          holds missing values (NaN or null). A value ``v`` lands in cell
+          ``1 + #{i : b[i] < v}``: cells are right-closed, ``(b[i-1], b[i]]``, so a value
+          equal to a border lands in the lower cell.
+        - Values are converted to float32 before the comparison, and ``borders`` are exported
+          as exactly the float32 values compared against. A float64 value that rounds onto a
+          border therefore lands in the lower cell.
+        - A categorical axis maps each fitted level, including the members pooled into
+          ``"<rare>"`` (listed under ``members``) and the missing level, to a cell through
+          ``levels``. A level the fit never saw scores in ``default_cell``. Cells that hold
+          no level can exist (their ``support`` is 0).
+        - On a banded table an axis's borders are the band edges, which is why two tables on
+          the same feature may list different borders.
         """
         check_is_fitted(self, "_model")
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
@@ -7265,6 +7928,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
+    unknown_category : {"default_cell", "error"}, default="default_cell"
+        What scoring does with a categorical value the fit never saw. ``"default_cell"``
+        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
+        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+        ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
+        feature and up to five unseen values. A null is never unknown: it scores in the
+        missing level. The fitted levels are listed in ``categories_``.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -7705,6 +8375,17 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostClassifier
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         # The TBP1 envelope carries the estimator metadata; inner is a binary Model blob or a
@@ -7736,6 +8417,17 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostClassifier
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_json(data)
@@ -7874,6 +8566,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
+        unknown_category: str = "default_cell",
     ) -> None:
         super().__init__(
             n_trees=n_trees,
@@ -7899,6 +8592,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             early_stopping_adaptive=early_stopping_adaptive,
             prune_size_penalty=prune_size_penalty,
             early_stopping=early_stopping,
+            unknown_category=unknown_category,
             early_stopping_min_delta=early_stopping_min_delta,
             interaction_gain_hurdle=interaction_gain_hurdle,
             interaction_gain_hurdle_mode=interaction_gain_hurdle_mode,
@@ -8002,6 +8696,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         sample_weight: Any | None = None,
         exposure: Any | None = None,
         groups: Any | None = None,
+        *,
+        offset: Any | None = None,
+        eval_set: tuple[Any, Any] | None = None,
+        eval_sample_weight: Any | None = None,
+        eval_exposure: Any | None = None,
+        eval_offset: Any | None = None,
+        callbacks: Any | None = None,
     ) -> "TBoostClassifier":
         """Fit the boosted ensemble.
 
@@ -8045,6 +8746,48 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             Supported only for binary (K=2) fits; passing a non-``None`` value together
             with three or more classes raises ``ValueError``.
 
+        offset : array-like of shape (n_samples,), or str, optional
+            A link-scale offset added to every row's raw score and never learned (XGBoost's
+            ``base_margin``, LightGBM's ``init_score``); a ``str`` names a column of the polars
+            ``X``. Under ``squared_error`` the fit is exactly the fit of ``y - offset``. Under
+            the log and logit links it joins the exposure offset (``log(exposure) + offset``),
+            and like exposure there it also scales the row's mass in the tables' reference
+            measure and ``support``. Scoring adds it only when passed again (``offset=`` on
+            the ``predict*`` methods); omitted, a row scores on a zero offset.
+        eval_set : (X_val, y_val), optional
+            Rows that only score early stopping: every bag stops at its own best round on
+            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
+            they never reach training, the intercept, the cell refit, the tables or pruning.
+            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
+            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
+        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
+            The evaluation rows' weight, exposure and offset (``str`` names a column of
+            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
+            ``eval_offset`` when ``offset`` is.
+        callbacks : callable or list of callables, optional
+            Each called after every boosting round of the deployed fit with a dict:
+            ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
+            ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
+            rows and its early-stopping rows; ``None`` without the latter). Bags run in
+            parallel, so calls for different bags interleave; each bag's rounds arrive in
+            order, all on the calling thread. A truthy return stops every bag after its
+            current round (``stopping_reason_ == "callback"``); an exception stops the fit
+            and propagates. The per-round history is kept in ``evals_result_``.
+
+        Notes
+        -----
+        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
+        ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
+        ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
+        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
+        boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
+        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
+        ``evals_result_`` holds each bag's per-round mean deviances:
+        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
+        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
+        is an extra pass per round, so it is computed only when ``callbacks`` are given.
+
         Returns
         -------
         TBoostClassifier
@@ -8066,10 +8809,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 "sample_weight": sample_weight,
                 "exposure": exposure,
                 "groups": groups,
+                "offset": offset,
             },
         )
         self._record_column_specs(y, sample_weight, exposure, groups)
         y = resolved["y"]
+        offset = resolved["offset"]
         sample_weight = resolved["sample_weight"]
         exposure = resolved["exposure"]
         groups = resolved["groups"]
@@ -8093,16 +8838,29 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             # Binary stays on the exact logistic single-model path (unchanged wire format/behavior).
             self._multi_model = None
             y01 = (y_arr == classes[1]).astype(np.float32, copy=False)
-            self._fit_model(
-                X,
-                y01,
-                sample_weight=sample_weight,
-                exposure=exposure,
-                class_labels=[str(c) for c in classes],
-                groups=groups,
+            self._stage_fit_extras(
+                eval_set, eval_sample_weight, eval_exposure, callbacks,
+                has_exposure=exposure is not None,
+                eval_offset=eval_offset, has_offset=offset is not None,
             )
+            try:
+                self._fit_model(
+                    X,
+                    y01,
+                    sample_weight=sample_weight,
+                    exposure=exposure,
+                    class_labels=[str(c) for c in classes],
+                    groups=groups,
+                    offset=offset,
+                )
+            finally:
+                self.__dict__.pop("_fit_extras_", None)
             return self
         # K >= 3: native-softmax (multinomial) multiclass path.
+        if eval_set is not None or callbacks is not None or offset is not None:
+            raise ValueError(
+                "eval_set, callbacks and offset support regression and binary classification only"
+            )
         if exposure is not None:
             raise ValueError("exposure is not supported for multiclass (K >= 3) classification")
         self._fit_multiclass(X, y_arr, classes, sample_weight=sample_weight, groups=groups)
@@ -8111,6 +8869,14 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # the prune report and the deployed artifact. OVERRIDDEN only — see the method.
         self._warn_voided_params()
         return self
+
+    def _eval_target(self, y: Any) -> np.ndarray:
+        labels = np.asarray(y)
+        if labels.ndim == 2 and labels.shape[1] == 1:
+            labels = labels[:, 0]
+        if labels.ndim != 1 or not np.all(np.isin(labels, self.classes_)):
+            raise ValueError("eval_set y must hold only the class labels seen in y")
+        return cast(np.ndarray, (labels == self.classes_[1]).astype(np.float32))
 
     def _fit_multiclass(
         self,
@@ -8122,6 +8888,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
     ) -> _MultiClassModel | _MultiClassTableModel:
         self._clear_stale_fit_state()
+        self._clear_fit_counts()  # the boosting report covers regression and binary fits
         # No silent no-op: there is no graduation path for multiclass (K>=3) at all, prune or
         # not, so an explicit graduate=True can never be honored here.
         if self.graduate:
@@ -8378,7 +9145,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             self.feature_names_in_ = np.asarray(feature_names, dtype=object)
         return model
 
-    def predict_proba(self, X: Any) -> np.ndarray:
+    def predict_proba(self, X: Any, *, offset: Any | None = None) -> np.ndarray:
         """Predict class probabilities.
 
         Parameters
@@ -8389,6 +9156,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             ``LazyFrame`` collects only the needed columns. Array-likes (and a model fitted
             without column names) must instead have the same number and layout of features
             as the data passed to ``fit``.
+        offset : array-like of shape (n_samples,), or str, optional
+            The link-scale offset to add, as passed to ``fit(offset=...)`` (a ``str`` names a
+            column of a polars ``X``). Omitted, rows score on a zero offset.
 
         Returns
         -------
@@ -8401,6 +9171,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         """
         check_is_fitted(self)
         mm = self._multi_model
+        if offset is not None:
+            p1 = _inverse_link(self.decision_function(X, offset=offset), "logit")
+            return np.column_stack([1.0 - p1, p1])
         x32, cat_kw = self._serve_kwargs(X, mm if mm is not None else self._model)
         # float64 outputs (the core scores in f32): sklearn convention; avoids f32 error in
         # downstream log-loss / Brier / AUROC.
@@ -8411,7 +9184,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             dtype=np.float64,
         )
 
-    def decision_function(self, X: Any) -> np.ndarray:
+    def decision_function(self, X: Any, *, offset: Any | None = None) -> np.ndarray:
         """Predict on the link (logit) scale, before the sigmoid/softmax is applied.
 
         Parameters
@@ -8422,6 +9195,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             ``LazyFrame`` collects only the needed columns. Array-likes (and a model fitted
             without column names) must instead have the same number and layout of features
             as the data passed to ``fit``.
+        offset : array-like of shape (n_samples,), or str, optional
+            The link-scale offset to add, as passed to ``fit(offset=...)`` (a ``str`` names a
+            column of a polars ``X``). Omitted, rows score on a zero offset.
 
         Returns
         -------
@@ -8434,16 +9210,18 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         """
         check_is_fitted(self)
         mm = self._multi_model
+        X, extra = self._resolve_offset(X, offset)
         x32, cat_kw = self._serve_kwargs(X, mm if mm is not None else self._model)
         if mm is not None:
             # Multiclass: (n_samples, n_classes) raw logits, per sklearn's OvR-shaped convention.
             return np.asarray(mm.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()), dtype=np.float64)
-        return np.asarray(
+        raw = np.asarray(
             self._model.predict_raw(x32, **cat_kw, n_jobs=self._resolve_n_jobs()),
             dtype=np.float64,
         )
+        return raw if extra is None else raw + _offset_array(extra, raw.shape[0])
 
-    def predict(self, X: Any) -> np.ndarray:
+    def predict(self, X: Any, *, offset: Any | None = None) -> np.ndarray:
         """Predict class labels.
 
         Parameters
@@ -8454,6 +9232,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             ``LazyFrame`` collects only the needed columns. Array-likes (and a model fitted
             without column names) must instead have the same number and layout of features
             as the data passed to ``fit``.
+        offset : array-like of shape (n_samples,), or str, optional
+            The link-scale offset to add, as passed to ``fit(offset=...)`` (a ``str`` names a
+            column of a polars ``X``). Omitted, rows score on a zero offset.
 
         Returns
         -------
@@ -8462,7 +9243,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             wherever ``predict_proba(X)[:, 1] >= 0.5`` else ``classes_[0]``; for multiclass
             (K>=3) fits, the highest-probability class.
         """
-        proba = self.predict_proba(X)
+        proba = self.predict_proba(X, offset=offset)
         if self._multi_model is not None:
             return np.asarray(self.classes_[np.argmax(proba, axis=1)])
         return self.classes_[(proba[:, 1] >= 0.5).astype(np.intp)]
@@ -8597,6 +9378,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             A JSON document describing every exported effect table (features, shape,
             values, per-cell support, and standard-error band), one bank per class for
             multiclass fits.
+
+        Notes
+        -----
+        Cell lookup follows :meth:`TBoostRegressor.tables`: row-major ``values``; numeric
+        cell 0 is missing and cells are right-closed, ``(b[i-1], b[i]]``, compared in float32
+        against the exported float32 ``borders``; categorical levels (pooled members under
+        ``"<rare>"``) map to cells through ``levels``, unseen levels to ``default_cell``.
         """
         check_is_fitted(self)
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)

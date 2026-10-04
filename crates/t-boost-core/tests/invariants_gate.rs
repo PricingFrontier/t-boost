@@ -71,6 +71,7 @@ fn fit_additive() -> (Model, ServeBinnedMatrix) {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     })
     .fit(&x, &y, &spec)
     .unwrap();

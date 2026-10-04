@@ -323,6 +323,43 @@ impl TableModel {
         Ok(out)
     }
 
+    /// Each dense table's own cell of every row: one row-major `n_rows × order` `u32` block per
+    /// table, in `bank.tables` order (the factored effects have no cells). A banded axis
+    /// reports its band, so the coordinates index the table's `values` tensor directly — the
+    /// cells [`TableModel::effect_contributions`] reads.
+    ///
+    /// # Errors
+    /// Propagates the cell-map build and the per-row cell fill;
+    /// [`PbError::Internal`] for a merged cell outside a table's band map.
+    pub fn table_cells(&self, x: &BinnedMatrix) -> Result<Vec<Vec<u32>>, PbError> {
+        self.validate_binned_matrix(x)?;
+        let merged = self.row_cells(x)?;
+        self.bank
+            .tables
+            .iter()
+            .map(|table| {
+                let mut out = Vec::with_capacity(merged.len().saturating_mul(table.axes.len()));
+                for row in &merged {
+                    for axis in &table.axes {
+                        let cell = row.get(axis.raw.0 as usize).copied().ok_or_else(|| {
+                            PbError::ShapeMismatch {
+                                what: format!("row cells missing raw feature {}", axis.raw.0),
+                            }
+                        })?;
+                        let coord = axis
+                            .coord(cell)
+                            .and_then(|c| u32::try_from(c).ok())
+                            .ok_or_else(|| PbError::Internal {
+                                what: "effect-table merged cell outside its band map".into(),
+                            })?;
+                        out.push(coord);
+                    }
+                }
+                Ok(out)
+            })
+            .collect()
+    }
+
     /// This model's bank re-centred on the rows of `x`, weighted by `mass` (per row; `None`
     /// counts rows), under `w` — see [`TableBank::recentre_on`]. The same function, so the same
     /// predictions; only how it is shared between tables changes.

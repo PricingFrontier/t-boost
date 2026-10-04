@@ -41,9 +41,9 @@ use crate::engine::split::{
 };
 use crate::engine::{
     softmax_in_place, tree_leaf_index_for_row_with_columns, tree_split_columns,
-    tree_value_for_row_with_columns, Config, CorrectionBank, DeltaStepGateReport, ExactnessMode,
-    FitSpec, GatedStepPolicy, Model, ModelSchema, MultiClassCellRefitReport, MultiClassModel,
-    ObliviousTree, Sampling, LEGACY_MAX_DEPTH, MAX_LEAVES,
+    tree_value_for_row_with_columns, BagFitReport, Config, CorrectionBank, DeltaStepGateReport,
+    ExactnessMode, FitSpec, GatedStepPolicy, Model, ModelSchema, MultiClassCellRefitReport,
+    MultiClassModel, ObliviousTree, RoundEvent, Sampling, StopReason, LEGACY_MAX_DEPTH, MAX_LEAVES,
 };
 use crate::error::PbError;
 use crate::loss::{GradHess, Link, Loss, LossId, ObjectiveTag};
@@ -881,6 +881,35 @@ fn fit_single(
         .as_ref()
         .map(|(y_sub, w_sub)| (y_sub.as_slice(), w_sub.as_slice()));
 
+    // Run-time controls (R2/R3): the per-round history and observer read deviances only, so a
+    // fit without them takes none of the branches below and stays bit-identical. The stopping
+    // deviance is computed for early stopping anyway; the training deviance is an extra O(n)
+    // pass per round (~10-20% of a fit), so only an observer pays for it.
+    let control = &config.fit_control;
+    let track_rounds = control.record_history || control.observer.is_some();
+    let track_train = control.observer.is_some();
+    let mut history_train: Vec<f64> = Vec::new();
+    let mut history_eval: Vec<f64> = Vec::new();
+    let (mut tr_y_sub, mut tr_raw_sub, mut tr_weight_sub) = (Vec::new(), Vec::new(), Vec::new());
+    let mut rounds_trained: u32 = 0;
+    let mut stop_reason = StopReason::MaxTrees;
+    // Reported deviances are means: the summed deviance over each row set's total weight.
+    let mass_of = |rows: &[usize]| -> f64 {
+        rows.iter()
+            .filter_map(|&r| weight.get(r))
+            .map(|&w| f64::from(w))
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE)
+    };
+    let (train_mass, eval_mass) = if track_rounds {
+        (
+            mass_of(&train_rows_usize),
+            validation_rows.as_deref().map_or(1.0, mass_of),
+        )
+    } else {
+        (1.0, 1.0)
+    };
+
     prof::reset();
     for t in 0..config.n_trees {
         // §05.6 addendum (av35) rate-collapse gate. Read `raw` — the model's REAL accumulated
@@ -1235,6 +1264,9 @@ fn fit_single(
                     // same accumulated score as the retained ensemble.
                     raw = raw_from_tree_alphas(f0_f32, offset.as_deref(), x, &trees)?;
                 }
+                rounds_trained = rounds_trained.saturating_add(1);
+                let mut eval_deviance = None;
+                let mut patience_spent = false;
                 if let Some(val_rows) = validation_rows.as_deref() {
                     let deviance = prof::timed("earlystop_eval", || {
                         deviance_for_rows_scratch(
@@ -1248,6 +1280,7 @@ fn fit_single(
                             &mut es_weight_sub,
                         )
                     })?;
+                    eval_deviance = Some(deviance);
                     let improved = match best_validation_deviance {
                         Some(best) => config.is_material_improvement(best, deviance),
                         None => true,
@@ -1264,8 +1297,48 @@ fn fit_single(
                     } else if trees.len().saturating_sub(best_validation_tree_count)
                         >= config.effective_patience(best_validation_tree_count)
                     {
-                        break;
+                        patience_spent = true;
                     }
+                }
+                if track_rounds {
+                    let train_deviance = if track_train {
+                        deviance_for_rows_scratch(
+                            spec.loss,
+                            y,
+                            &raw,
+                            weight,
+                            &train_rows_usize,
+                            &mut tr_y_sub,
+                            &mut tr_raw_sub,
+                            &mut tr_weight_sub,
+                        )? / train_mass
+                    } else {
+                        f64::NAN
+                    };
+                    let eval_deviance = eval_deviance.map(|d| d / eval_mass);
+                    if control.record_history {
+                        if track_train {
+                            history_train.push(train_deviance);
+                        }
+                        history_eval.extend(eval_deviance);
+                    }
+                    if let Some(observer) = &control.observer {
+                        let event = RoundEvent {
+                            bag: control.bag,
+                            round: rounds_trained,
+                            n_trees: config.n_trees,
+                            train_deviance,
+                            eval_deviance,
+                        };
+                        if (observer.0)(&event) {
+                            stop_reason = StopReason::Callback;
+                            break;
+                        }
+                    }
+                }
+                if patience_spent {
+                    stop_reason = StopReason::EarlyStopping;
+                    break;
                 }
             }
             // No admissible split clears the floor (e.g. converged / constant target):
@@ -1274,6 +1347,7 @@ fn fit_single(
                 if agbm.is_some() {
                     set_tree_alphas(&mut trees, &current_alphas)?;
                 }
+                stop_reason = StopReason::NoSplit;
                 break;
             }
         }
@@ -1323,7 +1397,8 @@ fn fit_single(
     }
 
     let mut f0_eff = f64::from(f0_f32);
-    if config.boosters.reanchor_slope {
+    // An external evaluation holdout only scores early stopping: it never fits the slope.
+    if config.boosters.reanchor_slope && !control.external_holdout {
         if let Some(val_rows) = validation_rows.as_deref() {
             if let Some((a, b)) =
                 fit_affine_reanchor(spec.loss, y, &raw, weight, offset.as_deref(), val_rows)?
@@ -1365,7 +1440,14 @@ fn fit_single(
         }
     }
     let f0_model = {
-        let shifted = if config.boosters.reanchor {
+        let shifted = if config.boosters.reanchor && control.external_holdout {
+            // The intercept re-anchors on the training rows only: an external evaluation
+            // holdout's targets must not reach the model.
+            let train_y = gather_rows(y, &train_rows)?;
+            let train_w = gather_rows(weight, &train_rows)?;
+            let train_raw = gather_rows(&raw, &train_rows)?;
+            f0_eff + reanchor_delta(spec.loss.link(), &train_y, &train_w, &train_raw, None)?
+        } else if config.boosters.reanchor {
             f0_eff + reanchor_delta(spec.loss.link(), y, weight, &raw, None)?
         } else {
             f0_eff
@@ -1389,6 +1471,7 @@ fn fit_single(
         class_labels: None,
         objective: spec.loss.objective_tag(),
     };
+    let trees_kept = trees.len();
     let mut model = Model {
         f0: f0_model,
         trees,
@@ -1403,6 +1486,13 @@ fn fit_single(
         bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: gate_state.report(),
+        fit_report: Some(vec![BagFitReport {
+            trees_kept: u32::try_from(trees_kept).unwrap_or(u32::MAX),
+            rounds_trained,
+            reason: stop_reason,
+            train_deviance: history_train,
+            eval_deviance: history_eval,
+        }]),
     };
     // The stamp is the MINIMUM a reader needs: `SCHEMA_VERSION_UNLIFTED` unless this fit
     // actually grew a tree past the legacy depth cap (see `serialize::SCHEMA_VERSION`).
@@ -2464,6 +2554,7 @@ fn fit_multiclass_single(
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         model.schema_version = model.required_schema_version();
         model.validate()?;
@@ -3123,7 +3214,9 @@ fn fit_outer_bag(
                     bag_groups: None,
                     seed: bag_seed,
                 };
-                let model = fit_single(&base_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
+                let mut bag_config = base_config.clone();
+                bag_config.fit_control.bag = bag_round;
+                let model = fit_single(&bag_config, &data.x, &data.y, &bag_spec, cat_encoders)?;
                 // Membership over the FIT rows, recorded for EVERY bagged fit (not just the
                 // cell-refit path that used to build it): `Model::bag_in_bag` publishes it so the
                 // post-fit prune guard can use each bag's OUT-OF-BAG complement as honest evidence
@@ -4539,6 +4632,12 @@ fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
             .iter()
             .filter_map(|m| m.model.delta_step_gate)
             .reduce(DeltaStepGateReport::merge),
+        // Each bag's own report, in bag order (`None` if any member carries none).
+        fit_report: members
+            .iter()
+            .map(|m| m.model.fit_report.clone())
+            .collect::<Option<Vec<_>>>()
+            .map(|reports| reports.into_iter().flatten().collect()),
     };
     model.schema_version = model.required_schema_version();
     model.validate()?;
@@ -8117,6 +8216,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -8165,6 +8265,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -8212,6 +8313,7 @@ mod tests {
                     refine_closed_form_tier2: false,
                     incremental_mu: false,
                     boosters: Default::default(),
+                    fit_control: Default::default(),
                 });
                 let sqe = SquaredError;
                 let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -9205,6 +9307,7 @@ mod tests {
                 random_strength: 0.35,
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -9367,6 +9470,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let fit = |floor: CredibilityFloor| -> Model {
@@ -9457,6 +9561,7 @@ mod tests {
                 refine_closed_form_tier2: false,
                 incremental_mu: false,
                 boosters: Default::default(),
+                fit_control: Default::default(),
             };
             let mut s = spec(&sqe);
             s.credibility = CredibilityFloor {
@@ -9554,6 +9659,7 @@ mod tests {
                 refine_closed_form_tier2: true,
                 incremental_mu: false,
                 boosters: Default::default(),
+                fit_control: Default::default(),
             };
             let mut s = spec(&poisson);
             s.credibility = CredibilityFloor {
@@ -9640,6 +9746,7 @@ mod tests {
             refine_closed_form_tier2: true,
             incremental_mu,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let poisson = Poisson;
         let fit = |inc: bool| -> Model {
@@ -9711,6 +9818,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let refit_cfg = Config {
             boosters: BoosterConfig {
@@ -9824,6 +9932,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
 
         let full = Booster::with_config(cfg(90))
@@ -9886,6 +9995,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let refit_cfg = Config {
             boosters: BoosterConfig {
@@ -9959,6 +10069,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &seed_y, &spec(&sqe))
         .unwrap();
@@ -10047,6 +10158,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -10115,6 +10227,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -10189,6 +10302,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
 
         let full = Booster::with_config(cfg(80))
@@ -10247,6 +10361,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let dart_cfg = Config {
             boosters: BoosterConfig {
@@ -10315,6 +10430,7 @@ mod tests {
                 }),
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -10543,6 +10659,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -10757,6 +10874,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let model = Booster::with_config(cfg.clone())
@@ -10842,6 +10960,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let fit_with = |threads: usize| {
@@ -10955,6 +11074,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -11041,6 +11161,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &seed_y, &spec(&sqe))
         .unwrap();
@@ -11122,6 +11243,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         };
         let mut bag_cfg = base_cfg.clone();
         bag_cfg.boosters.ensemble = EnsembleSpec::OuterBag {
@@ -11195,6 +11317,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let poisson = Poisson;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -11291,6 +11414,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         };
         let cat_encoders = CatEncoderStore::new();
         let params = GreedyParams {
@@ -11457,6 +11581,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         };
         let cat_encoders = CatEncoderStore::new();
         let params = GreedyParams {
@@ -11613,6 +11738,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         };
         let cat_encoders = CatEncoderStore::new();
         let params = GreedyParams {
@@ -11798,6 +11924,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let a = Booster::with_config(cfg.clone())
@@ -11955,6 +12082,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&logistic))
         .unwrap();
@@ -12031,6 +12159,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: BoosterConfig::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&poisson))
         .unwrap();
@@ -12082,6 +12211,7 @@ mod tests {
                 },
                 ..BoosterConfig::default()
             },
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         assert!(matches!(
@@ -12123,6 +12253,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         let sqe = SquaredError;
         let model = booster.fit(&x, &y, &spec(&sqe)).unwrap();
@@ -12167,6 +12298,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
 
         // (1) Constant target ⇒ no split ⇒ 0 trees ⇒ every prediction == f0 == mean.
@@ -12231,6 +12363,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         assert!(matches!(
             bad.fit(&x, &[1.0, 2.0], &spec(&sqe)),
@@ -12365,6 +12498,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         let sqe = SquaredError;
 
@@ -12425,6 +12559,7 @@ mod tests {
                 },
                 ..Default::default()
             },
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &sp)
         .unwrap();
@@ -12477,6 +12612,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &sp)
         .unwrap();
@@ -12599,6 +12735,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         });
         let model = booster
             .fit_train(&fitted.train, &y, &spec(&sqe), fitted.cat_encoders.clone())
@@ -12659,6 +12796,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -12706,6 +12844,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -12759,6 +12898,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -12801,6 +12941,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &s)
         .unwrap();
@@ -12841,6 +12982,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let anchored_cfg = Config {
             boosters: BoosterConfig {
@@ -12914,6 +13056,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         })
         .fit(&x, &y, &spec(&sqe))
         .unwrap();
@@ -13136,6 +13279,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {
@@ -13336,6 +13480,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         };
         let sqe = SquaredError;
         let bytes = |nt: usize| -> Vec<u8> {

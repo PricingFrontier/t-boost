@@ -621,6 +621,7 @@ fn accuracy_config(boosters: BoosterConfig) -> Config {
         incremental_mu: false,
         hist_precision: HistPrecision::QuantizedI32,
         boosters,
+        fit_control: Default::default(),
     }
 }
 

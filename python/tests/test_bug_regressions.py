@@ -689,7 +689,9 @@ def test_bug064_joint_exports_preserve_fit_mass_and_require_it_after_loading(cla
     key = "exposure" if exposure else "sample_weight"
     kind = TBoostClassifier if classifier else TBoostRegressor
     y = x[:, 0] if classifier else x[:, 0] + 2 * x[:, 1]
-    model = kind(**OPTIONS).fit(x, y, **{key: mass})
+    # Exposure is refused under squared_error (R8), so the exposure regressor is a rate model.
+    options = {**OPTIONS, "objective": "poisson"} if exposure and not classifier else OPTIONS
+    model = kind(**options).fit(x, y, **{key: mass})
     expected = json.loads(model.tables(x, ref_measure="joint", **{key: mass}))
     assert json.loads(model.tables(x, ref_measure="joint")) == expected
     for table in expected["tables"]:

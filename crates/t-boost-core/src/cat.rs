@@ -453,6 +453,34 @@ impl CatEncoderStore {
         &self.encoders
     }
 
+    /// Every training label each categorical raw feature knows, in serve/export order: each
+    /// level's members (a rare bucket contributes the labels it pooled, never its reserved
+    /// label). A feature with several encoders (multi-channel) lists each label once. A label
+    /// absent from its feature's list scores at the encoder base — an unseen level.
+    #[must_use]
+    pub fn known_labels(&self) -> BTreeMap<u32, Vec<String>> {
+        let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        let mut seen: BTreeMap<u32, BTreeSet<&str>> = BTreeMap::new();
+        for encoder in &self.encoders {
+            let labels = out.entry(encoder.raw.0).or_default();
+            let known = seen.entry(encoder.raw.0).or_default();
+            for level in &encoder.levels {
+                let own = std::slice::from_ref(&level.label);
+                let members = if level.members.is_empty() {
+                    own
+                } else {
+                    &level.members
+                };
+                for label in members {
+                    if label != RARE_LEVEL_LABEL && known.insert(label.as_str()) {
+                        labels.push(label.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// `true` if no categorical encoders are registered.
     #[must_use]
     pub fn is_empty(&self) -> bool {

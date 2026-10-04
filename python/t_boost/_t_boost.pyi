@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Sequence, final
+from typing import Any, Callable, Sequence, final
 
 import numpy as np
 
@@ -115,6 +115,13 @@ class _Booster:
         cat_x: Sequence[Sequence[str]] | None = None,
         es_holdout: Sequence[bool] | None = None,
         bag_groups: np.ndarray | None = None,
+        eval_x: np.ndarray | None = None,
+        eval_y: np.ndarray | None = None,
+        eval_cat_x: Sequence[Sequence[str]] | None = None,
+        eval_weight: np.ndarray | None = None,
+        eval_exposure: np.ndarray | None = None,
+        observer: Callable[[int, int, int, float, float | None], Any] | None = None,
+        record_history: bool = False,
     ) -> _Model: ...
 
     def fit_multiclass(
@@ -367,12 +374,14 @@ class _Model:
         with_full: bool = True,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]: ...
 
+    def fit_report(self) -> list[tuple[int, int, str, list[float], list[float]]] | None: ...
     @property
     def delta_step_gate(self) -> dict[str, Any] | None: ...
 
     def to_json(self) -> str: ...
 
     def to_bytes(self) -> bytes: ...
+    def categorical_labels(self) -> list[tuple[int, list[str]]]: ...
 
     def prune_to_tables(
         self,
@@ -450,6 +459,13 @@ class _TableModel:
         self, x: np.ndarray, cat_x: Sequence[Sequence[str]] | None = None
     ) -> np.ndarray: ...
     def raw_feature_names(self) -> list[str]: ...
+    def table_cell_indices(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
+    ) -> list[tuple[list[int], np.ndarray]]: ...
     def effect_contributions(
         self,
         x: np.ndarray,
@@ -559,6 +575,7 @@ class _TableModel:
     def to_json(self) -> str: ...
 
     def to_bytes(self) -> bytes: ...
+    def categorical_labels(self) -> list[tuple[int, list[str]]]: ...
 
 
 @final
@@ -668,6 +685,7 @@ class _MultiClassModel:
     def to_json(self) -> str: ...
 
     def to_bytes(self) -> bytes: ...
+    def categorical_labels(self) -> list[tuple[int, list[str]]]: ...
 
     def prune_to_tables(
         self,
@@ -749,6 +767,7 @@ class _MultiClassTableModel:
     def to_json(self) -> str: ...
 
     def to_bytes(self) -> bytes: ...
+    def categorical_labels(self) -> list[tuple[int, list[str]]]: ...
 
 
 @final

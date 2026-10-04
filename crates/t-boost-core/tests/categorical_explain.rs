@@ -97,6 +97,7 @@ fn categorical_model_explains_and_passes_all_five_gates() {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     })
     .fit_train(&fitted.train, &y, &spec, fitted.cat_encoders.clone())
     .unwrap();
@@ -247,6 +248,7 @@ fn two_channel_categorical_explains_and_passes_all_five_gates() {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     })
     .fit_train(&fitted.train, &y, &spec, fitted.cat_encoders.clone())
     .unwrap();

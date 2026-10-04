@@ -71,6 +71,7 @@ fn base_config(n_trees: u32) -> Config {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     }
 }
 

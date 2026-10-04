@@ -1010,11 +1010,11 @@ def test_tables_defaults_to_fit_time_sample_weight() -> None:
 
 def test_tables_defaults_to_fit_time_exposure() -> None:
     x, y = regression_fixture()
+    y = np.abs(y)  # exposure needs a rate objective (it is refused under squared_error)
     heavy = np.where(x[:, 1] <= 2.0, 10.0, 1.0).astype(np.float32)
-    fit_weighted = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(
-        x, y, exposure=heavy
-    )
-    fit_plain = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(x, y)
+    options = dict(n_trees=30, learning_rate=0.3, seed=0, prune=False, objective="poisson")
+    fit_weighted = TBoostRegressor(**options).fit(x, y, exposure=heavy)
+    fit_plain = TBoostRegressor(**options).fit(x, y)
     assert_exports_close(fit_weighted.tables(x), fit_weighted.tables(x, exposure=heavy))
     assert fit_weighted.tables(x) != fit_plain.tables(x)
 
@@ -1108,9 +1108,9 @@ def test_tables_sample_weight_and_exposure_default_independently() -> None:
     fit_weight = np.where(x[:, 0] <= 2.0, 25.0, 1.0).astype(np.float32)
     fit_exposure = np.where(x[:, 1] <= 2.0, 10.0, 1.0).astype(np.float32)
     call_weight = np.where(x[:, 1] <= 2.0, 3.0, 1.0).astype(np.float32)
-    est = TBoostRegressor(n_trees=30, learning_rate=0.3, seed=0, prune=False).fit(
-        x, y, sample_weight=fit_weight, exposure=fit_exposure
-    )
+    est = TBoostRegressor(
+        n_trees=30, learning_rate=0.3, seed=0, prune=False, objective="poisson"
+    ).fit(x, np.abs(y), sample_weight=fit_weight, exposure=fit_exposure)
     # Override only sample_weight; exposure must still come from the fit-time default.
     mixed = est.tables(x, sample_weight=call_weight)
     explicit_both = est.tables(x, sample_weight=call_weight, exposure=fit_exposure)

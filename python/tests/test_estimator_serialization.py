@@ -268,7 +268,7 @@ def test_header_records_version_estimator_and_params() -> None:
     x, y = _small_regression_fixture()
     reg = _small_regressor(n_trees=12).fit(x, y)
     header = _header(reg.to_bytes())
-    assert header["schema_version"] == 4
+    assert header["schema_version"] == 5
     assert header["t_boost_version"] == t_boost.__version__
     assert header["estimator"] == "TBoostRegressor"
     assert header["params"]["n_trees"] == 12

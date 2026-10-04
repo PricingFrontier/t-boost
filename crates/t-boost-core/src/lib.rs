@@ -80,9 +80,10 @@ pub use loss::{
 };
 
 pub use engine::{
-    Booster, Config, DeltaStepGateReport, ExactnessMode, FitSpec, GatedStepPolicy, GradScale, Hist,
-    HistPrecision, InteractionGainHurdleMode, Model, ModelSchema, MultiClassModel, ObliviousTree,
-    QuantGradHess, Sampling, Split,
+    BagFitReport, Booster, Config, DeltaStepGateReport, ExactnessMode, FitControl, FitSpec,
+    GatedStepPolicy, GradScale, Hist, HistPrecision, InteractionGainHurdleMode, Model, ModelSchema,
+    MultiClassModel, ObliviousTree, QuantGradHess, RoundEvent, RoundObserver, Sampling, Split,
+    StopReason,
 };
 
 pub use constraints::{

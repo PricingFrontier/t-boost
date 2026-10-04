@@ -6303,6 +6303,7 @@ pub fn fixture_model() -> Model {
         bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
+        fit_report: None,
     }
 }
 
@@ -6443,6 +6444,7 @@ pub fn fixture_multichannel_model() -> Model {
         bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
+        fit_report: None,
     }
 }
 
@@ -6521,6 +6523,7 @@ pub fn fixture_over_budget_model() -> Model {
         bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
+        fit_report: None,
     }
 }
 
@@ -6682,6 +6685,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         }
     }
 
@@ -9173,6 +9177,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![0, 1, 2, 1, 2]], // a genuine missing (bin 0) row at index 0
@@ -9249,6 +9254,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![0, 1, 2, 3]],
@@ -9356,6 +9362,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let grids = MergedGrids::from_model(&model).unwrap();
         let u_ids = [FeatureId(0), FeatureId(1), FeatureId(2)];
@@ -9541,6 +9548,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let serve = ServeBinnedMatrix(crate::data::BinnedMatrix {
             data: vec![

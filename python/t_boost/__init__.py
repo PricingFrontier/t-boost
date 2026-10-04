@@ -17,6 +17,8 @@ expressible and not readable. Choose accordingly.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ._t_boost import (
     _Booster,
     _Model,
@@ -29,7 +31,19 @@ from ._t_boost import (
     TBoostError,
 )
 
+if TYPE_CHECKING:
+    # The estimators load lazily through `__getattr__` below (keeping `import t_boost` cheap);
+    # these imports give type checkers their real types instead of `object`.
+    from .sklearn import (
+        ContributionMatrix,
+        PrecisionWarning,
+        TBoostClassifier,
+        TBoostRegressor,
+        recommended_recipe,
+    )
+
 __all__ = [
+    "ContributionMatrix",
     "TBoostClassifier",
     "TBoostRegressor",
     "PrecisionWarning",
@@ -56,6 +70,7 @@ except PackageNotFoundError:  # not installed as a distribution (e.g. a bare sou
 
 def __getattr__(name: str) -> object:
     if name in {
+        "ContributionMatrix",
         "TBoostClassifier",
         "TBoostRegressor",
         "PrecisionWarning",
@@ -64,6 +79,7 @@ def __getattr__(name: str) -> object:
         # scikit-learn is NOT required here: the estimators run standalone via the
         # `_compat` shims, and become genuine sklearn estimators when sklearn is installed.
         from .sklearn import (
+            ContributionMatrix,
             PrecisionWarning,
             TBoostClassifier,
             TBoostRegressor,
@@ -71,6 +87,7 @@ def __getattr__(name: str) -> object:
         )
 
         return {
+            "ContributionMatrix": ContributionMatrix,
             "TBoostClassifier": TBoostClassifier,
             "TBoostRegressor": TBoostRegressor,
             "PrecisionWarning": PrecisionWarning,
