@@ -487,3 +487,153 @@ def test_eval_set_unknown_levels_follow_the_policy(split) -> None:
 
 def test_contribution_matrix_is_exported() -> None:
     assert t_boost.ContributionMatrix is ContributionMatrix
+
+
+# --- R13: unseen categories score as the rare level ----------------------------------------
+
+
+def _rare_fixture(n: int = 12000, seed: int = 0) -> tuple[pl.DataFrame, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    makes = [f"m{i}" for i in range(40)]
+    p = np.r_[np.full(10, 0.099), np.full(30, 0.01 / 30)]
+    d = rng.choice(makes, n, p=p / p.sum()).tolist()
+    d[:5] = [None] * 5
+    frame = pl.DataFrame({"a": rng.normal(size=n), "d": d})
+    level = {m: (0.5 if i < 10 else 2.0) for i, m in enumerate(makes)}
+    y = np.array([level.get(m, 1.0) for m in d]) * (1 + frame["a"].to_numpy())
+    return frame, y + rng.normal(size=n) * 0.5
+
+
+@pytest.fixture(scope="module")
+def rare_model() -> tuple[TBoostRegressor, pl.DataFrame, str]:
+    warnings.simplefilter("ignore")
+    frame, y = _rare_fixture()
+    model = TBoostRegressor(n_trees=200, n_bags=2, seed=1).fit(frame, y)
+    pooled = dict(model._model.rare_labels())
+    assert pooled, "the fixture must pool a rare level"
+    member = next(m for m in next(iter(pooled.values())) if not m.startswith("__t_boost"))
+    return model, frame, member
+
+
+def _probe(values: list) -> pl.DataFrame:
+    return pl.DataFrame(
+        {"a": np.linspace(-1, 1, len(values)), "d": pl.Series(values, dtype=pl.String)}
+    )
+
+
+def test_rare_is_the_default_and_unseen_scores_as_a_rare_level(rare_model) -> None:
+    model, _, member = rare_model
+    assert model.unknown_category == "rare"
+    unseen, pooled = _probe(["NEW", "other"]), _probe([member, member])
+    np.testing.assert_array_equal(model.predict(unseen), model.predict(pooled))
+    np.testing.assert_array_equal(model.predict_raw(unseen), model.predict_raw(pooled))
+    a = model.predict_contributions(unseen, return_format="matrix")
+    b = model.predict_contributions(pooled, return_format="matrix")
+    assert any(len(t) > 1 for t in a.terms), "an interaction must use the feature"
+    np.testing.assert_array_equal(a.values, b.values)
+    cu, cp = model.cell_indices(unseen), model.cell_indices(pooled)
+    for key in cu:
+        np.testing.assert_array_equal(cu[key], cp[key])
+
+
+def test_rare_policy_reaches_tables_and_actual_vs_expected(rare_model) -> None:
+    model, _, member = rare_model
+    unseen = _probe(["NEW"] * 4)
+    pooled = _probe([member] * 4)
+    y = np.ones(4)
+    # json.dumps: the empty cells' A/E is NaN on both sides, and NaN != NaN.
+    assert json.dumps(model.actual_vs_expected(unseen, y)) == json.dumps(
+        model.actual_vs_expected(pooled, y)
+    )
+    export = json.loads(model.tables(unseen))
+    cells = model.cell_indices(unseen)
+    for table in export["tables"]:
+        for k, axis in enumerate(table["axes"]):
+            if axis["levels"] is None:
+                continue
+            rare_cell = next(lv["cell"] for lv in axis["levels"] if lv["label"] == "<rare>")
+            assert axis["rare_pooled"] and axis["unseen_cell"] == rare_cell
+            assert set(cells[tuple(table["feature_names"])][:, k]) == {rare_cell}
+
+
+def test_default_cell_and_error_policies_still_apply(rare_model) -> None:
+    model, _, member = rare_model
+    unseen = _probe(["NEW", "NEW"])
+    model.set_params(unknown_category="default_cell")
+    try:
+        assert not np.array_equal(model.predict(unseen), model.predict(_probe([member, member])))
+        axis = next(a for t in json.loads(model.tables(unseen))["tables"] for a in t["axes"]
+                    if a["levels"] is not None)
+        assert axis["unseen_cell"] == axis["default_cell"]
+        model.set_params(unknown_category="error")
+        with pytest.raises(ValueError, match="NEW"):
+            model.predict(unseen)
+    finally:
+        model.set_params(unknown_category="rare")
+
+
+def test_null_is_never_unseen(rare_model) -> None:
+    model, frame, _ = rare_model
+    nulls = _probe([None, None])
+    for policy in ("rare", "error"):
+        model.set_params(unknown_category=policy)
+        assert np.isfinite(model.predict(nulls)).all()
+    model.set_params(unknown_category="rare")
+    assert model.unseen_values(nulls).height == 0
+
+
+def test_without_a_pooled_level_rare_falls_back_to_default_cell() -> None:
+    frame, y = _frame(3000)
+    frame, y = frame[3:], y[3:]  # drop the rare levels and the null
+    model = TBoostRegressor(n_trees=60, n_bags=1, seed=0).fit(frame, y)
+    assert not dict(model._model.rare_labels())
+    probe = pl.DataFrame({"a:b": [0.0], "c": [0.0], "d": ["NEW"]})
+    before = model.predict(probe)
+    model.set_params(unknown_category="default_cell")
+    np.testing.assert_array_equal(model.predict(probe), before)
+    model.set_params(unknown_category="rare")
+    axis = next(a for t in json.loads(model.tables(frame))["tables"] for a in t["axes"]
+                if a["levels"] is not None)
+    assert axis["rare_pooled"] is False and axis["unseen_cell"] == axis["default_cell"]
+
+
+def test_unseen_values_counts(rare_model) -> None:
+    model, _, member = rare_model
+    probe = pl.DataFrame({
+        "a": np.zeros(6), "d": ["NEW", "NEW", "x", member, None, "m0"],
+        "w": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    })
+    counts = model.unseen_values(probe.drop("w"))
+    assert counts.to_dicts() == [
+        {"feature": "d", "value": "NEW", "rows": 2},
+        {"feature": "d", "value": "x", "rows": 1},
+    ]
+    weighted = model.unseen_values(probe, sample_weight="w")
+    assert weighted["mass"].to_list() == [3.0, 3.0]
+
+
+def test_eval_set_unseen_levels_score_as_rare() -> None:
+    frame, y = _rare_fixture(seed=2)
+    val, yv = _rare_fixture(3000, seed=3)
+    member = None
+    models = {}
+    for name, d in (("unseen", ["NEW"] * val.height), ("pooled", None)):
+        model = TBoostRegressor(**ES)
+        if d is None:
+            probe = TBoostRegressor(**ES).fit(frame, y)
+            member = next(m for m in dict(probe._model.rare_labels())[1]
+                          if not m.startswith("__t_boost"))
+            d = [member] * val.height
+        models[name] = model.fit(frame, y, eval_set=(val.with_columns(pl.Series("d", d)), yv))
+    assert models["unseen"].n_trees_per_bag_ == models["pooled"].n_trees_per_bag_
+
+
+def test_rare_policy_holds_across_categorical_channels() -> None:
+    frame, y = _rare_fixture(seed=4)
+    model = TBoostRegressor(
+        n_trees=100, n_bags=1, seed=0, cat_channels=["mean", "count"], cat_count_min_levels=2
+    ).fit(frame, y)
+    member = next(m for m in dict(model._model.rare_labels())[1] if not m.startswith("__t_boost"))
+    np.testing.assert_array_equal(
+        model.predict(_probe(["NEW", "zzz"])), model.predict(_probe([member, member]))
+    )

@@ -15,4 +15,4 @@ publish = false
 rayon.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-t-boost-core = { path = "../crates/t-boost-core", version = "0.7.0" }
+t-boost-core = { path = "../crates/t-boost-core", version = "0.8.0" }

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 import numpy as np
@@ -46,5 +47,38 @@ def annotate_joint_export(payload: str, measure: str | None) -> str:
             else:
                 for item in value.values():
                     visit(item)
+    visit(export)
+    return json.dumps(export, allow_nan=False)
+
+
+def annotate_unseen_cells(payload: str, policy: str) -> str:
+    """Mark, on every categorical axis, the cell an unseen value scores in under the
+    estimator's ``unknown_category`` policy (``unseen_cell``; ``None`` under ``"error"``), and
+    whether the fit pooled a ``"<rare>"`` level for it (``rare_pooled``)."""
+    if not re.search(r'"levels":\s*\[', payload):  # no categorical axis: skip the parse
+        return payload
+    export = json.loads(payload)
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+        elif isinstance(value, dict):
+            if isinstance(value.get("axes"), list):
+                for axis in value["axes"]:
+                    levels = axis.get("levels") if isinstance(axis, dict) else None
+                    if levels is None:
+                        continue
+                    rare = next((lv["cell"] for lv in levels if lv.get("label") == "<rare>"), None)
+                    axis["rare_pooled"] = rare is not None
+                    if policy == "error":
+                        axis["unseen_cell"] = None
+                    elif policy == "rare" and rare is not None:
+                        axis["unseen_cell"] = rare
+                    else:
+                        axis["unseen_cell"] = axis.get("default_cell")
+            for item in value.values():
+                visit(item)
+
     visit(export)
     return json.dumps(export, allow_nan=False)
