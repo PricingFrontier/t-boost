@@ -96,8 +96,8 @@ the training of a log-link model.
 ### [path_smooth](common.md#path_smooth)
 
 Path smoothing. The value of a leaf is shrunk toward the value of its parent node with the
-credibility weight $Z = \frac{n}{n + path\_smooth}$, where $n$ is the number of objects in the
-leaf, so leaves with little data stay close to the path above them. 0 turns it off.
+credibility weight $Z = \frac{n}{n + path\_smooth}$, so leaves with little data stay close to the
+path above them. 0 turns it off.
 
 ### [colsample_bytree](common.md#colsample_bytree)
 

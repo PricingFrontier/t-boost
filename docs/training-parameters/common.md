@@ -346,8 +346,12 @@ None (the objective's default)
 #### Description
 
 Path smoothing. The value of a leaf is shrunk toward the value of its parent node with the
-credibility weight $Z = \frac{n}{n + path\_smooth}$, where $n$ is the number of objects in the
-leaf, so leaves with little data stay close to the path above them. 0 turns it off.
+credibility weight $Z = \frac{n}{n + path\_smooth}$, so leaves with little data stay close to the
+path above them. 0 turns it off.
+
+$n$ is the number of objects in the leaf. For the `poisson` and `tweedie` objectives it is an
+effective number instead: the sum of the Hessians of the leaf divided by the tree's mean Hessian
+per object, so a leaf with many objects but few claims counts as little evidence.
 
 **Type**
 
