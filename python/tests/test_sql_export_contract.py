@@ -75,11 +75,19 @@ def test_categorical_missing_rare_and_unseen_are_not_interchangeable():
     import polars as pl
     x = pl.DataFrame({'cat': ['a'] * 100 + ['b'] * 100 + ['rare'] * 2 + [None] * 20})
     y = np.array([0] * 100 + [2] * 100 + [4] * 2 + [6] * 20, dtype=np.float32)
-    model = TBoostRegressor(n_trees=30, n_bags=1, graduate=False).fit(x, y)
+    model = TBoostRegressor(
+        n_trees=30, n_bags=1, graduate=False, unknown_category='default_cell'
+    ).fit(x, y)
     bank = json.loads(model.tables(x))
     levels = {v['label']: v['cell'] for v in bank['tables'][0]['axes'][0]['levels']}
-    nx, cats = model._serve_design(pl.DataFrame({'cat': ['rare', 'never-seen', None]}))
+    probe = pl.DataFrame({'cat': ['rare', 'never-seen', None]})
+    nx, cats = model._serve_design(probe)
     cells = np.asarray(model._model.cell_indices(nx, cat_x=cats))[:, 0]
     assert cells[0] == levels['<rare>']
     assert cells[2] == levels['__t_boost_missing__'] and cells[2] != 0
-    assert cells[1] != cells[0], 'unseen uses encoder base, not the rare bucket'
+    assert cells[1] != cells[0], 'default_cell: unseen uses encoder base, not the rare bucket'
+    # The default policy routes an unseen level to the rare bucket instead (R13).
+    model.set_params(unknown_category='rare')
+    nx, cats = model._serve_design(probe)
+    cells = np.asarray(model._model.cell_indices(nx, cat_x=cats))[:, 0]
+    assert cells[1] == cells[0] == levels['<rare>']

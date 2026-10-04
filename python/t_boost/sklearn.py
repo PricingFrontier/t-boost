@@ -19,7 +19,7 @@ from typing import Any, Callable, TypeVar, cast
 
 import numpy as np
 
-from ._pricing import annotate_joint_export
+from ._pricing import annotate_joint_export, annotate_unseen_cells
 
 from ._compat import (
     BaseEstimator,
@@ -113,6 +113,7 @@ def _round_observer(callbacks: list[Callable[..., Any]], n_bags: int) -> Callabl
 # Constructor parameters that only steer scoring, never the fit: changing them through
 # `set_params` keeps the fitted model.
 _SERVE_ONLY_PARAMS = frozenset({"unknown_category"})
+_UNKNOWN_POLICIES = ("rare", "default_cell", "error")
 
 
 def _canonical_objective(name: str) -> str:
@@ -2187,7 +2188,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
-        unknown_category: str = "default_cell",
+        unknown_category: str = "rare",
     ) -> None:
         self.n_trees = n_trees
         self.learning_rate = learning_rate
@@ -2483,7 +2484,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_size_penalty = prune_size_penalty
         self.early_stopping = early_stopping
         self._resolve_merged_aliases()
-        # Scoring-time policy for a categorical level the fit never saw (see `_check_unknown`).
+        # Scoring-time policy for a categorical level the fit never saw (see `_apply_unknown_policy`).
         self.unknown_category = unknown_category
 
     def _resolve_merged_aliases(self) -> None:
@@ -3441,7 +3442,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         numeric_x, cat_x, _ = self._split_columns(
             X, list(cat_idx), _feature_names_from_x(X), coded=coded
         )
-        self._check_unknown(cat_x)
+        cat_x = self._apply_unknown_policy(cat_x)
         return numeric_x, cat_x
 
     def _resolve_offset(self, X: Any, offset: Any | None) -> tuple[Any, Any]:
@@ -3456,38 +3457,62 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             return X, resolve_vector(X if is_polars_eager(X) else None, offset, "offset")
         return X, offset
 
-    def _check_unknown(self, cat_x: Any) -> None:
-        """Enforce `unknown_category` on a serve design's categorical columns (per-row labels,
-        or `(codes, distinct labels)` pairs), in `_cat_indices_` order."""
-        policy = getattr(self, "unknown_category", "default_cell")
-        if policy not in ("default_cell", "error"):
+    def _apply_unknown_policy(self, cat_x: Any) -> Any:
+        """Apply `unknown_category` to a serve design's categorical columns (per-row labels, or
+        `(codes, distinct labels)` pairs, in `_cat_indices_` order).
+
+        ``"rare"`` rewrites a label the fit never saw to one of the labels the fit pooled into
+        that feature's rare level, so it scores exactly as a rare level does in every table and
+        every channel. A feature that pooled nothing keeps the label, which then scores at the
+        encoder base (the ``default_cell``). A null (the missing level) is never unknown.
+        """
+        policy = getattr(self, "unknown_category", "rare")
+        if policy not in _UNKNOWN_POLICIES:
             raise ValueError(
-                f"unknown_category must be 'default_cell' or 'error', got {policy!r}"
+                f"unknown_category must be one of {', '.join(map(repr, _UNKNOWN_POLICIES))}, "
+                f"got {policy!r}"
             )
         if policy == "default_cell" or not cat_x:
-            return
-        known = self._known_labels()
+            return cat_x
+        known, rare = self._level_sets()
         names = self._input_feature_names()
+        out = []
         for pos, column in zip(getattr(self, "_cat_indices_", None) or [], cat_x):
             labels = column[1] if isinstance(column, tuple) else column
             fitted = known.get(int(pos), set())
-            unseen: list[str] = []
-            for label in dict.fromkeys(labels):
-                if label != _CAT_MISSING and label not in fitted:
-                    unseen.append(label)
-                    if len(unseen) == 5:
-                        break
-            if unseen:
+            unseen = [v for v in dict.fromkeys(labels) if v != _CAT_MISSING and v not in fitted]
+            if not unseen:
+                out.append(column)
+            elif policy == "error":
                 raise ValueError(
                     f"feature {names[int(pos)]!r} has categorical value(s) the fit never saw: "
-                    f"{', '.join(map(repr, unseen))} (unknown_category='error')"
+                    f"{', '.join(map(repr, unseen[:5]))} (unknown_category='error')"
                 )
+            elif int(pos) not in rare:
+                out.append(column)
+            else:
+                target, unseen_set = rare[int(pos)], set(unseen)
+                routed = [target if v in unseen_set else v for v in labels]
+                out.append((column[0], routed) if isinstance(column, tuple) else routed)
+        return out
 
-    def _known_labels(self) -> dict[int, set[str]]:
-        """Each categorical input column's fitted labels, keyed by input position."""
+    def _level_sets(self) -> tuple[dict[int, set[str]], dict[int, str]]:
+        """Per categorical input position: the fitted labels, and (for features whose fit
+        pooled a rare level) one label of that level. Cached per fitted model."""
         model = getattr(self, "_multi_model", None) or self._model
+        cache = self.__dict__.get("_level_cache")
+        if cache is not None and cache[0] is model:
+            return cache[1], cache[2]
         to_input = self._raw_to_input_column()
-        return {to_input[raw]: set(labels) for raw, labels in model.categorical_labels()}
+        known = {to_input[raw]: set(labels) for raw, labels in model.categorical_labels()}
+        # Route to a real pooled label: the missing level may itself be pooled into the rare
+        # level, but a null is never what an unseen value should be rewritten to.
+        rare = {
+            to_input[raw]: next((m for m in members if m != _CAT_MISSING), members[0])
+            for raw, members in model.rare_labels() if members
+        }
+        self._level_cache = (model, known, rare)
+        return known, rare
 
     @property
     def categories_(self) -> dict[str, list[str | None]]:
@@ -3919,7 +3944,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 f"eval_set X has {_n_columns(x_val)} features but X has {n_features}"
             )
         xv32, cat_v, _ = self._split_columns(x_val, cat_idx, feature_names)
-        if getattr(self, "unknown_category", "default_cell") == "error" and cat_v:
+        if getattr(self, "unknown_category", "rare") == "error" and cat_v:
             # The model does not exist yet, so the fit rows' own labels are the known set.
             for pos, fit_col, val_col in zip(cat_idx, fit_cats or [], cat_v):
                 known = set(fit_col)
@@ -4077,6 +4102,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             deploy.update(
                 self._eval_design(extras["eval"], cat_idx, feature_names, n_features, cat_x)
             )
+            if getattr(self, "unknown_category", "rare") == "rare":
+                deploy["eval_unseen_rare"] = True
         if "callbacks" in extras:
             deploy["observer"] = _round_observer(extras["callbacks"], int(self.n_bags))
         if deploy:
@@ -6218,6 +6245,73 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 records.append({**head, **per_class[0]})
         return records
 
+    def unseen_values(
+        self, X: Any, *, sample_weight: Any | None = None, exposure: Any | None = None
+    ) -> Any:
+        """Count the categorical values in ``X`` that the fit never saw.
+
+        One row per ``(feature, value)``: ``rows`` is how many rows of ``X`` hold the value,
+        and ``mass`` (only when ``sample_weight`` or ``exposure`` is given) their total
+        ``sample_weight * exposure``. Values are the canonical strings t-boost matches on; a
+        null is never unseen. Sorted by feature (input order), then by ``rows`` descending.
+        ``sample_weight``/``exposure`` may name columns of a polars ``X``. These are the rows
+        ``unknown_category`` acts on.
+
+        Returns
+        -------
+        polars.DataFrame
+            Columns ``feature``, ``value``, ``rows`` and, with a mass, ``mass``.
+        """
+        import polars as pl
+
+        check_is_fitted(self)
+        X, vectors = self._resolve_fit_vectors(
+            X, {"sample_weight": sample_weight, "exposure": exposure}
+        )
+        names = getattr(self, "feature_names_in_", None)
+        if is_polars_eager(X) and names is not None:
+            X = select_feature_columns(X, [str(n) for n in names])
+        n_features = _n_columns(X)
+        if n_features != int(self.n_features_in_):
+            raise ValueError(f"X has {n_features} features but model expects {self.n_features_in_}")
+        cat_idx = list(getattr(self, "_cat_indices_", None) or [])
+        has_mass = vectors["sample_weight"] is not None or vectors["exposure"] is not None
+        schema = {"feature": pl.String, "value": pl.String, "rows": pl.Int64, "mass": pl.Float64}
+        if not cat_idx:  # no categorical feature, so nothing can be unseen
+            empty = pl.DataFrame({k: [] for k in schema}, schema=schema)
+            return empty if has_mass else empty.drop("mass")
+        _, cat_x, _ = self._split_columns(X, cat_idx, _feature_names_from_x(X), coded=True)
+        n = len(cat_x[0][0])
+        mass = None
+        if has_mass:
+            mass = np.ones(n, dtype=np.float64)
+            for key in ("sample_weight", "exposure"):
+                if vectors[key] is not None:
+                    mass = mass * _offset_array(vectors[key], n, key)
+        known, _ = self._level_sets()
+        feature_names = self._input_feature_names()
+        rows: dict[str, list[Any]] = {"feature": [], "value": [], "rows": [], "mass": []}
+        for pos, (codes, labels) in zip(cat_idx, cat_x or []):
+            fitted = known.get(int(pos), set())
+            codes = np.asarray(codes, dtype=np.int64)
+            counts = np.bincount(codes, minlength=len(labels))
+            masses = (np.bincount(codes, weights=mass, minlength=len(labels))
+                      if mass is not None else None)
+            # Coded labels may repeat (each code is encoded independently), so total by value.
+            totals: dict[str, list[float]] = {}
+            for k, v in enumerate(labels):
+                if v != _CAT_MISSING and v not in fitted and counts[k]:
+                    entry = totals.setdefault(str(v), [0, 0.0])
+                    entry[0] += int(counts[k])
+                    entry[1] += float(masses[k]) if masses is not None else 0.0
+            for value, (count, total) in sorted(totals.items(), key=lambda kv: (-kv[1][0], kv[0])):
+                rows["feature"].append(feature_names[int(pos)])
+                rows["value"].append(value)
+                rows["rows"].append(int(count))
+                rows["mass"].append(total if masses is not None else None)
+        frame = pl.DataFrame(rows, schema=schema)
+        return frame if mass is not None else frame.drop("mass")
+
     def cell_indices(self, X: Any) -> dict[tuple[str, ...], np.ndarray]:
         """The rating-table cell every row of ``X`` scores in, per deployed table.
 
@@ -6297,6 +6391,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # wire format). Everything else on __dict__ (params, classes_, n_features_in_, …) pickles
         # normally. This is what lets joblib.Memory / pickle cache a fitted estimator.
         state = self.__dict__.copy()
+        state.pop("_level_cache", None)
         model = state.pop("_model", None)
         multi = state.pop("_multi_model", None)
         if multi is not None:
@@ -6685,13 +6780,18 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
-    unknown_category : {"default_cell", "error"}, default="default_cell"
-        What scoring does with a categorical value the fit never saw. ``"default_cell"``
-        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
-        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+    unknown_category : {"rare", "default_cell", "error"}, default="rare"
+        What scoring does with a categorical value the fit never saw. ``"rare"`` scores it
+        exactly as a level the fit pooled into ``"<rare>"`` (a new level most resembles the
+        thin ones, whose relativity is learned), in every table that uses the feature; a
+        feature whose fit pooled nothing falls back to its ``default_cell``.
+        ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
+        level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. A null is never unknown: it scores in the
-        missing level. The fitted levels are listed in ``categories_``.
+        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
+        value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
+        :meth:`unseen_values` counts the unseen ones.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -7526,8 +7626,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
           border therefore lands in the lower cell.
         - A categorical axis maps each fitted level, including the members pooled into
           ``"<rare>"`` (listed under ``members``) and the missing level, to a cell through
-          ``levels``. A level the fit never saw scores in ``default_cell``. Cells that hold
-          no level can exist (their ``support`` is 0).
+          ``levels``. A level the fit never saw scores in the axis's ``unseen_cell``: the
+          ``"<rare>"`` level's cell under ``unknown_category="rare"`` when the fit pooled one
+          (``rare_pooled``), else ``default_cell``; ``null`` under ``"error"``. Cells that
+          hold no level can exist (their ``support`` is 0).
         - On a banded table an axis's borders are the band edges, which is why two tables on
           the same feature may list different borders.
         """
@@ -7544,7 +7646,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             weight=weight32,
             exposure=exposure32,
         )
-        return annotate_joint_export(payload, ref_measure)
+        return annotate_unseen_cells(
+            annotate_joint_export(payload, ref_measure),
+            getattr(self, "unknown_category", "rare"),
+        )
 
 
 class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
@@ -7928,13 +8033,18 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
-    unknown_category : {"default_cell", "error"}, default="default_cell"
-        What scoring does with a categorical value the fit never saw. ``"default_cell"``
-        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
-        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+    unknown_category : {"rare", "default_cell", "error"}, default="rare"
+        What scoring does with a categorical value the fit never saw. ``"rare"`` scores it
+        exactly as a level the fit pooled into ``"<rare>"`` (a new level most resembles the
+        thin ones, whose relativity is learned), in every table that uses the feature; a
+        feature whose fit pooled nothing falls back to its ``default_cell``.
+        ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
+        level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. A null is never unknown: it scores in the
-        missing level. The fitted levels are listed in ``categories_``.
+        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
+        value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
+        :meth:`unseen_values` counts the unseen ones.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -8566,7 +8676,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
-        unknown_category: str = "default_cell",
+        unknown_category: str = "rare",
     ) -> None:
         super().__init__(
             n_trees=n_trees,
@@ -9384,7 +9494,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Cell lookup follows :meth:`TBoostRegressor.tables`: row-major ``values``; numeric
         cell 0 is missing and cells are right-closed, ``(b[i-1], b[i]]``, compared in float32
         against the exported float32 ``borders``; categorical levels (pooled members under
-        ``"<rare>"``) map to cells through ``levels``, unseen levels to ``default_cell``.
+        ``"<rare>"``) map to cells through ``levels``, unseen levels to ``unseen_cell``.
         """
         check_is_fitted(self)
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
@@ -9403,7 +9513,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             weight=weight32,
             exposure=exposure32,
         )
-        return annotate_joint_export(payload, ref_measure)
+        return annotate_unseen_cells(
+            annotate_joint_export(payload, ref_measure),
+            getattr(self, "unknown_category", "rare"),
+        )
 
     def _attach_classifier_model(self, model: _Model | _TableModel) -> None:
         labels = model.class_labels

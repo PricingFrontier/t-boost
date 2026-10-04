@@ -4128,7 +4128,7 @@ impl PyBooster {
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, eval_x=None, eval_y=None, eval_cat_x=None, eval_weight=None, eval_exposure=None, observer=None, record_history=false))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, eval_x=None, eval_y=None, eval_cat_x=None, eval_weight=None, eval_exposure=None, observer=None, record_history=false, eval_unseen_rare=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -4162,6 +4162,9 @@ impl PyBooster {
         observer: Option<Py<PyAny>>,
         // Keep each bag's per-round deviances for `fit_report`.
         record_history: bool,
+        // Score evaluation-set categorical labels the fit never saw as a level pooled into the
+        // rare bucket (`unknown_category="rare"`), as scoring will; `false` keeps the base value.
+        eval_unseen_rare: bool,
     ) -> PyResult<PyModel> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4187,6 +4190,7 @@ impl PyBooster {
                 exposure: eval_exposure
                     .map(|e| array1_to_vec(e, "eval_exposure"))
                     .transpose()?,
+                unseen_rare: eval_unseen_rare,
             }),
             (None, None) => None,
             _ => {
@@ -4754,6 +4758,17 @@ impl PyModel {
             .schema
             .cat_encoders
             .known_labels()
+            .into_iter()
+            .collect()
+    }
+
+    /// The labels each categorical raw feature pooled into its rare level, as `(raw id,
+    /// members)` (see `CatEncoderStore::rare_members`).
+    fn rare_labels(&self) -> Vec<(u32, Vec<String>)> {
+        self.model
+            .schema
+            .cat_encoders
+            .rare_members()
             .into_iter()
             .collect()
     }
@@ -6211,6 +6226,17 @@ impl PyTableModel {
             .collect()
     }
 
+    /// The labels each categorical raw feature pooled into its rare level, as `(raw id,
+    /// members)` (see `CatEncoderStore::rare_members`).
+    fn rare_labels(&self) -> Vec<(u32, Vec<String>)> {
+        self.model
+            .schema
+            .cat_encoders
+            .rare_members()
+            .into_iter()
+            .collect()
+    }
+
     /// One display name per raw feature, in the raw-feature order `cell_indices` uses.
     fn raw_feature_names(&self) -> PyResult<Vec<String>> {
         let m = &self.model;
@@ -6325,6 +6351,17 @@ impl PyMultiClassModel {
     /// `categorical_labels` merged over every class's encoders (each label once per feature).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
         merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
+    }
+
+    /// `rare_labels` of the first class that pooled each feature (classes share the levels).
+    fn rare_labels(&self) -> Vec<(u32, Vec<String>)> {
+        let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for class in &self.model.classes {
+            for (raw, members) in class.schema.cat_encoders.rare_members() {
+                out.entry(raw).or_insert(members);
+            }
+        }
+        out.into_iter().collect()
     }
 
     #[staticmethod]
@@ -6849,6 +6886,17 @@ impl PyMultiClassTableModel {
     /// `categorical_labels` merged over every class's encoders (each label once per feature).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
         merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
+    }
+
+    /// `rare_labels` of the first class that pooled each feature (classes share the levels).
+    fn rare_labels(&self) -> Vec<(u32, Vec<String>)> {
+        let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for class in &self.model.classes {
+            for (raw, members) in class.schema.cat_encoders.rare_members() {
+                out.entry(raw).or_insert(members);
+            }
+        }
+        out.into_iter().collect()
     }
 
     #[staticmethod]
@@ -7444,6 +7492,51 @@ struct EvalRows {
     y: Vec<f32>,
     weight: Option<Vec<f32>>,
     exposure: Option<Vec<f32>>,
+    unseen_rare: bool,
+}
+
+/// The reserved label the Python layer gives a null categorical value. A null is never an
+/// unseen level: it keeps its own (missing) level.
+const CAT_MISSING_LABEL: &str = "__t_boost_missing__";
+
+/// `eval_cats` with every label its feature never saw replaced by one of the labels the fit
+/// pooled into that feature's rare level, so it scores exactly as a rare level does. A feature
+/// that pooled nothing keeps its labels (they fall back to the encoder base).
+fn route_unseen_to_rare(
+    eval_cats: &[Vec<String>],
+    n_numeric: usize,
+    encoders: &t_boost_core::cat::CatEncoderStore,
+) -> Result<Vec<Vec<String>>, PbError> {
+    let known = encoders.known_labels();
+    let rare = encoders.rare_members();
+    eval_cats
+        .iter()
+        .enumerate()
+        .map(|(j, column)| {
+            let raw = raw_id(n_numeric + j)?;
+            // A real pooled label, not the missing level (which can itself be pooled).
+            let target = rare.get(&raw).and_then(|members| {
+                members
+                    .iter()
+                    .find(|m| m.as_str() != CAT_MISSING_LABEL)
+                    .or_else(|| members.first())
+            });
+            let (Some(known), Some(target)) = (known.get(&raw), target) else {
+                return Ok(column.clone());
+            };
+            let known: BTreeSet<&str> = known.iter().map(String::as_str).collect();
+            Ok(column
+                .iter()
+                .map(|label| {
+                    if label == CAT_MISSING_LABEL || known.contains(label.as_str()) {
+                        label.clone()
+                    } else {
+                        target.clone()
+                    }
+                })
+                .collect())
+        })
+        .collect()
 }
 
 /// Run `fit` on a worker thread while this (the calling) thread serves `observer`: each round
@@ -7718,6 +7811,13 @@ fn fit_with_eval_rows(
                 state.seed,
                 None,
             )?;
+            let routed;
+            let eval_cats = if eval.unseen_rare {
+                routed = route_unseen_to_rare(eval_cats, n_numeric, &fitted.cat_encoders)?;
+                routed.as_slice()
+            } else {
+                eval_cats
+            };
             let eval_numeric = eval
                 .columns
                 .iter()

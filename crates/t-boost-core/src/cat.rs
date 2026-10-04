@@ -453,6 +453,28 @@ impl CatEncoderStore {
         &self.encoders
     }
 
+    /// The training labels each categorical raw feature pooled into its rare level, keyed by
+    /// raw id (the first encoder of a feature decides; every channel shares one partition).
+    /// A feature that pooled nothing is absent. Scoring any of these labels lands in the rare
+    /// cell of every table that uses the feature.
+    #[must_use]
+    pub fn rare_members(&self) -> BTreeMap<u32, Vec<String>> {
+        let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        for encoder in &self.encoders {
+            if out.contains_key(&encoder.raw.0) {
+                continue;
+            }
+            if let Some(rare) = encoder
+                .levels
+                .iter()
+                .find(|level| level.label == RARE_LEVEL_LABEL && !level.members.is_empty())
+            {
+                out.insert(encoder.raw.0, rare.members.clone());
+            }
+        }
+        out
+    }
+
     /// Every training label each categorical raw feature knows, in serve/export order: each
     /// level's members (a rare bucket contributes the labels it pooled, never its reserved
     /// label). A feature with several encoders (multi-channel) lists each label once. A label
