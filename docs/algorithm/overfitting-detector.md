@@ -22,8 +22,9 @@ where $r$ is [`early_stopping_adaptive`](../training-parameters/overfitting-dete
 [`early_stopping_rounds`](../training-parameters/overfitting-detection.md#early_stopping_rounds).
 When the training stops, the trees built after the best iteration are discarded.
 
-With bagging, every bag has its own validation dataset and its own overfitting detector, and
-keeps its trees up to its own best iteration.
+With bagging, every bag has its own overfitting detector and keeps its trees up to its own best
+iteration. Each bag sets aside its own validation objects, unless `groups` or an `eval_set` is
+given: the bags then share one validation dataset.
 
 ## Validation dataset {#validation-dataset}
 
@@ -33,7 +34,8 @@ The validation dataset is one of the following:
   [`validation_fraction`](../training-parameters/overfitting-detection.md#validation_fraction)
   (10% by default). It is stratified by class for classification and by zero versus non-zero
   target for the `poisson` and `tweedie` objectives. When `groups` is passed to `fit`, whole
-  groups are set aside, so near-duplicate objects of the same entity cannot fall on both sides.
+  groups are set aside (once, shared by the bags), so near-duplicate objects of the same entity
+  cannot fall on both sides.
 - The `eval_set` passed to `fit`. No objects are set aside from the training dataset, and the
   evaluation objects are used only by the overfitting detector: they never reach the training,
   the tables or pruning.

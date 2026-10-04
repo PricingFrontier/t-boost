@@ -15,7 +15,7 @@ detector. Each bag sets aside its own validation objects from its own sample.
 
 The validation objects are stratified for classification (by class) and for the `poisson` and
 `tweedie` objectives (zero versus non-zero target). When `groups` is passed to `fit`, whole
-groups are set aside instead of single objects.
+groups are set aside instead of single objects, once, and the bags share them.
 
 `None` turns the overfitting detector off, so every bag builds [`n_trees`](common.md#n_trees)
 trees. The value is ignored when an `eval_set` is passed to `fit`.

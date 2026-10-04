@@ -69,8 +69,8 @@ Each entry of `tables` contains:
     multiplicative relativities. `null` for other links.
 
 `support`
-:   The weight of the training objects in each cell (the exposure-weighted count when an
-    exposure is given).
+:   The weight of the training objects in each cell: their number, or the sum of sample weight
+    times exposure when either was given.
 
 `variance`, `sobol`
 :   The variance of the table under the reference measure, and its share of the model's

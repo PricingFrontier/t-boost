@@ -28,7 +28,8 @@ to `fit`, whole groups are sampled, so the out-of-bag objects never include an o
 was in the bag.
 
 Each bag then sets aside its own validation objects for the
-[overfitting detector](overfitting-detector.md) and stops at its own best iteration.
+[overfitting detector](overfitting-detector.md), unless `groups` or an `eval_set` is given (the
+bags then share one validation dataset), and stops at its own best iteration.
 
 ## Averaging the bags {#averaging}
 
