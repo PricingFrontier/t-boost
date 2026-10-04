@@ -238,9 +238,11 @@ def test_native_multiclass_fit_prune_matches_two_call_path() -> None:
     # `serde_json::Value` to attach it also normalizes key order. Neither is a selection change.
     actual_doc = json.loads(actual_report)
     assert actual_doc.pop("guard") == {"enabled": False, "fired": False}
-    # The binding also names the selection regime it ran (`sel_rows` given, no `fold_of`).
+    # The binding also names the selection regime it ran (`sel_rows` given, no `fold_of`),
+    # and whether main effects were pruning candidates (the default keeps them all).
     assert actual_doc.pop("selector") == "single_split_walk"
     assert actual_doc.pop("cv_folds") == 0
+    assert actual_doc.pop("main_effect_policy") == "sticky"
     assert actual_doc == json.loads(expected_report)
     # The DEPLOYED model contract changed (2026-07-14): the keep-set is applied to a fit on
     # ALL rows (the old design withheld the sel slice from the deployed model), so the table

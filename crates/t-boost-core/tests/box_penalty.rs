@@ -124,6 +124,7 @@ fn prune_at(f: &Fixture, lambda_boxes: f64) -> PruneReport {
         lambda_boxes,
         lambda_tables: 0.0,
         table_price_min_arity: 3,
+        prune_main_effects: false,
     };
     let (_bank, report) = prune_bank(
         &f.bank,
@@ -401,6 +402,7 @@ fn multiclass_box_accounting_matches_the_model_that_ships() {
             lambda_boxes: 0.0,
             lambda_tables: 0.0,
             table_price_min_arity: 3,
+            prune_main_effects: false,
         },
     )
     .unwrap();

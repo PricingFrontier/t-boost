@@ -184,6 +184,7 @@ class _Booster:
         band_tolerance: float | None = None,
         band_deviance_cap: float = 0.001,
         path_tolerance: float = 0.0,
+        prune_main_effects: bool = False,
     ) -> tuple[_MultiClassTableModel, str]: ...
 
     def fit_prune_folds(
@@ -238,6 +239,7 @@ class _Booster:
         lambda_tables: float = 0.0,
         table_min_arity: int = 3,
         fold_fidelity: bool = False,
+        prune_main_effects: bool = False,
     ) -> tuple[list[list[int]], str]: ...
 
 
