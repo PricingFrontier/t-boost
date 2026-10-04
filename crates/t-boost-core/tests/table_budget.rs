@@ -396,6 +396,7 @@ fn a_zero_table_price_selects_exactly_what_the_unpenalized_selector_selected() {
             lambda_boxes: 0.0,
             lambda_tables: 0.0,
             table_price_min_arity: 3,
+            prune_main_effects: false,
         },
         // A floor set to something exotic must ALSO be inert while the price is off — the floor
         // is only ever consulted behind the armed check, and that is worth pinning because it is
@@ -405,6 +406,7 @@ fn a_zero_table_price_selects_exactly_what_the_unpenalized_selector_selected() {
             lambda_boxes: 0.0,
             lambda_tables: 0.0,
             table_price_min_arity: 1,
+            prune_main_effects: false,
         },
         // A malformed price degrades to FREE, never to a NaN that would poison `total_cmp`.
         PruneConfig {
@@ -412,12 +414,14 @@ fn a_zero_table_price_selects_exactly_what_the_unpenalized_selector_selected() {
             lambda_boxes: 0.0,
             lambda_tables: f64::NAN,
             table_price_min_arity: 3,
+            prune_main_effects: false,
         },
         PruneConfig {
             se_rule: 1.0,
             lambda_boxes: 0.0,
             lambda_tables: -1.0,
             table_price_min_arity: 3,
+            prune_main_effects: false,
         },
     ] {
         let got = prune_at(&f, cfg);
@@ -493,6 +497,7 @@ fn raising_the_table_price_moves_the_priced_count_monotonically_down_but_saturat
             lambda_boxes: 0.0,
             lambda_tables: mult * unit,
             table_price_min_arity: 3,
+            prune_main_effects: false,
         };
         let got = prune_at(&f, cfg);
         let n3 = got.kept.iter().filter(|u| u.order() >= 3).count();

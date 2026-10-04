@@ -757,6 +757,19 @@ _PRUNE_PATH_FRACTION_DEFAULT = 0.995
 # +0.78%); this bound caps that at 0.1% of deviance, the same figure as banding's deviance cap.
 # Measured offline (35 datasets): Elo 1427 vs 1424 (fraction alone), 1428 (the minimum).
 _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
+# Main-effect pruning (2026-10-04, `prune_main_effects`). Off by default: every main effect the fit
+# realized is deployed, and pruning only ever simplifies interactions. On, the main effects are
+# candidates in every selector, under hierarchy -- a main effect leaves only when it does not earn
+# its place AND no kept interaction contains it; a kept interaction never goes because its main was
+# weak. On the ranked path the mains are ranked by purified variance with the interactions, each
+# entering at its own rank or just before the first interaction that needs it, so the interactions
+# enter in the same order either way. The path then starts from the intercept-only model, so
+# `prune_path_fraction` is measured against that rather than the mains-only model. That loosens it
+# (`prune_path_tolerance` binds more often), so the deployed interactions can differ too.
+# The fold vote judges mains with the interactions' keep rule and its downward closure brings back
+# the mains of kept interactions; the guard ladders re-admit a dropped main ahead of the first
+# interaction that needs it.
+_PRUNE_MAIN_EFFECTS_DEFAULT = False
 # Banding (2026-09-26): after the prune, every interaction table becomes a small product grid of
 # bands whose change to predictions is held within (tolerance * sigma)^2, sigma = the soup's bag
 # noise (see `t_boost_core::banding`). 0.75 measured (arena, 31 datasets): 3-way cells 274M -> 84k,
@@ -828,10 +841,16 @@ def _heredity_sequence(mains: list[Any], inter: list[Any]) -> list[Any]:
     whose subsets are all in, until a pass admits nothing: a table readied by an admission earlier
     in the pending list than itself enters in the same pass, one readied by a later table waits
     for the next pass.
+
+    Main effects in `inter` (`prune_main_effects`; `mains` is then empty) enter at their own rank,
+    or just before the first interaction that contains them if that comes first, so a kept
+    interaction keeps its main effects and the interactions enter in the same order as with
+    sticky mains. Mirrors the native `ranked_path_sequence`.
     """
     import heapq
 
     admitted = set(mains)
+    ranked_mains = {u for u in inter if len(u) == 1}
     missing: dict[int, int] = {}
     waiters: dict[Any, list[int]] = {}
     seq: list[Any] = []
@@ -852,6 +871,13 @@ def _heredity_sequence(mains: list[Any], inter: list[Any]) -> list[Any]:
             while this_pass:
                 cur = heapq.heappop(this_pass)
                 v = inter[cur]
+                if v in admitted:  # a main an earlier interaction already brought in
+                    continue
+                if len(v) > 1:
+                    for i in v:
+                        if (i,) in ranked_mains and (i,) not in admitted:
+                            admitted.add((i,))
+                            seq.append((i,))
                 admitted.add(v)
                 seq.append(v)
                 for q in waiters.pop(v, ()):
@@ -862,6 +888,30 @@ def _heredity_sequence(mains: list[Any], inter: list[Any]) -> list[Any]:
                         else:
                             ready.append(q)
     return seq
+
+
+def _mains_before_their_interactions(ranked: list[Any]) -> list[Any]:
+    """`ranked` with each main effect in it moved to just before the first interaction in it that
+    contains that feature (or left where it is if it already comes first), so a re-admission
+    ladder cut from it never re-admits an interaction without its main effects. The identity when
+    `ranked` holds no main effect, which is every ladder over sticky mains. Mirrors the native
+    guard ladder's `mains_before_their_interactions`."""
+    mains = {u[0]: u for u in ranked if len(u) == 1}
+    if not mains:
+        return ranked
+    placed: set[Any] = set()
+    out: list[Any] = []
+    for u in ranked:
+        if len(u) > 1:
+            for i in u:
+                main = mains.get(i)
+                if main is not None and main not in placed:
+                    placed.add(main)
+                    out.append(main)
+        if u not in placed:
+            placed.add(u)
+            out.append(u)
+    return out
 
 
 def _band_curvature(
@@ -2179,6 +2229,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_path_steps: int = _PRUNE_PATH_STEPS_DEFAULT,
         prune_path_fraction: float = _PRUNE_PATH_FRACTION_DEFAULT,
         prune_path_tolerance: float = _PRUNE_PATH_TOLERANCE_DEFAULT,
+        prune_main_effects: bool = _PRUNE_MAIN_EFFECTS_DEFAULT,
         band_tolerance: float | None = _BAND_TOLERANCE_DEFAULT,
         band_deviance_cap: float = _BAND_DEVIANCE_CAP_DEFAULT,
         prune_fold_min_rows: int = _MIN_PRUNE_FOLD_ROWS,
@@ -2461,6 +2512,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_path_steps = prune_path_steps
         self.prune_path_fraction = prune_path_fraction
         self.prune_path_tolerance = prune_path_tolerance
+        # See `_PRUNE_MAIN_EFFECTS_DEFAULT`.
+        self.prune_main_effects = prune_main_effects
         # See `_BAND_TOLERANCE_DEFAULT`.
         self.band_tolerance = band_tolerance
         self.band_deviance_cap = band_deviance_cap
@@ -2606,7 +2659,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     def _validate_box_budget_reachable(self) -> None:
         """No silent no-op: the deployed-box budget lives inside the prune's keep-set
         application, so it is uninterpretable on an unpruned fit — an unpruned model has no
-        keep-set to trim and deploys the whole ensemble. Raise rather than ignore."""
+        keep-set to trim and deploys the whole ensemble. Raise rather than ignore. The table
+        budget and main-effect pruning are refused on an unpruned fit for the same reason."""
         if int(getattr(self, "prune_box_budget", 0) or 0) > 0 and not self.prune:
             raise ValueError(
                 "prune_box_budget has no effect with prune=False and cannot be honored: the "
@@ -2618,6 +2672,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 "prune_table_budget has no effect with prune=False and cannot be honored: the "
                 "deployed multi-way table budget trims the prune's keep-set, and an unpruned fit "
                 "has no keep-set. Enable prune, or leave prune_table_budget at its default (0)."
+            )
+        if bool(getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)) and not self.prune:
+            raise ValueError(
+                "prune_main_effects has no effect with prune=False and cannot be honored: main "
+                "effects are dropped by the prune's table selection, and an unpruned fit deploys "
+                "every table. Enable prune, or leave prune_main_effects at its default (False)."
             )
 
     # ---------------------------------------------------------------- deprecation registry ----
@@ -4188,6 +4248,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         if monotone is not None and any(monotone) and self.cell_refit_base is not None:
             raise ValueError("cell_refit_base cannot preserve monotone_constraints; leave it unset")
+        if (monotone is not None and any(monotone) and self.prune
+                and bool(getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT))):
+            raise ValueError(
+                "prune_main_effects cannot be honored with monotone_constraints: a monotone fit "
+                "deploys its full table bank without selection. Leave it at its default (False)."
+            )
         booster = self._new_booster(
             fit_pool_width=self._default_fit_pool(n_features), external_eval="eval_x" in deploy
         )
@@ -4328,8 +4394,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         or None when the out-of-bag jury has fewer than `prune_guard_min_rows` rows."""
         n_jobs = self._resolve_n_jobs()
         supports = sorted({tuple(sorted(int(i) for i in u)) for u in full_supports})
-        mains = [u for u in supports if len(u) == 1]
-        inter = sorted((u for u in supports if len(u) > 1), key=lambda u: (-share.get(u, 0.0), u))
+        # With `prune_main_effects` the mains are ranked candidates and the path starts from the
+        # intercept; otherwise they are all in before it starts (see `_PRUNE_MAIN_EFFECTS_DEFAULT`).
+        prune_mains = bool(getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT))
+        mains = [] if prune_mains else [u for u in supports if len(u) == 1]
+        inter = sorted((u for u in supports if len(u) > 1 or prune_mains),
+                       key=lambda u: (-share.get(u, 0.0), u))
         seq = _heredity_sequence(mains, inter)
         n = len(seq)
         steps = max(2, int(getattr(self, "prune_path_steps", _PRUNE_PATH_STEPS_DEFAULT)))
@@ -4378,14 +4448,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "selector": "ranked_path",
             "kept": keep,
             "effective_order": max((len(u) for u in keep_t), default=0),
-            "main_effect_policy": "sticky",
+            "main_effect_policy": "prunable" if prune_mains else "sticky",
             "n_candidates": len(supports),
             "path": {"sizes": sizes, "oob_deviance": devs, "best": best, "oob_rows": n_val,
                      "fraction": frac, "tolerance": tol},
             "table_scores": [
                 {"u": list(u), "order": len(u), "mean_gain": share.get(u, 0.0),
                  "variance_share": share.get(u, 0.0), "selected": u in kept_set,
-                 "sticky": len(u) == 1}
+                 "sticky": len(u) == 1 and not prune_mains}
                 for u in supports
             ],
             "guard": {"enabled": False, "skipped": "ranked_path selector"},
@@ -4451,7 +4521,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # Contribution-stability pruning: fit the deployed model on all rows, fit honest fold
         # models to estimate which table supports survive held-out deviance pruning, aggregate those
         # supports by stability/contribution, then apply the selected keep-set to the full-data fit.
-        # Main effects are sticky by design; interactions must earn survival on validation folds.
+        # Main effects are sticky unless `prune_main_effects` is set (see
+        # `_PRUNE_MAIN_EFFECTS_DEFAULT`); interactions must earn survival on validation folds.
         self._validate_dead_prune_params(multiclass=False)
         import os as _os
         import time as _time
@@ -4701,6 +4772,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 fold_fidelity=bool(
                     getattr(self, "prune_fold_fidelity", _PRUNE_FOLD_FIDELITY_DEFAULT)
                 ),
+                prune_main_effects=bool(
+                    getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)
+                ),
             )
             self.pruning_report_ = json.loads(report_json)
             _lap(f"(2) CV contribution scan ({self.pruning_report_['cv_folds']}/{k_folds} folds)")
@@ -4922,6 +4996,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 if u not in kept_set and u not in _seen:
                     _seen.add(u)
                     ranked.append(u)
+            ranked = _mains_before_their_interactions(ranked)
             chunks: list[list[tuple[int, ...]]] = []
             _grown, _rest = len(keep), list(ranked)
             while _rest:
@@ -6882,6 +6957,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fold fits. ``False`` deploys the full, unpruned table bank instead (fitted faster, but
         a much larger artifact than the pruned bank or the trees it is built from). Either
         way the model is stored as rating tables.
+    prune_main_effects : bool, default=False
+        Whether pruning may drop main effects too. ``False`` deploys every main effect the fit
+        built and prunes interactions only. ``True`` makes the main effects candidates in every
+        selector, under hierarchy: a main effect is dropped only when it does not earn its
+        place and no kept interaction contains it, so a feature leaves the model entirely only
+        when nothing kept uses it. On the ranked path the main effects are ranked by purified
+        variance with the interactions, each entering at its own rank or just before the first
+        interaction that needs it, and the path starts from the intercept-only model. So
+        ``prune_path_fraction`` is then measured against the intercept-only model rather than
+        the main-effects-only one, which can change the interactions kept as well. Requires
+        ``prune=True`` and refuses ``monotone_constraints`` (raises otherwise).
     prune_validation_fraction : float, default=0.15
         Train/select split fraction of the LEGACY multiclass (K>=3) prune
         (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
@@ -8149,6 +8235,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         (neutral-or-better by construction). ``False`` deploys the full, unpruned table bank
         instead (fitted faster, but a much larger artifact). Either way the model is stored
         as rating tables. Available on both the binary and multiclass (K>=3) paths.
+    prune_main_effects : bool, default=False
+        Whether pruning may drop main effects too; see :class:`TBoostRegressor`. Honored by
+        every selector on the binary and multiclass (K>=3) paths.
     prune_validation_fraction : float, default=0.15
         Train/select split fraction of the LEGACY multiclass (K>=3) prune
         (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
@@ -8667,6 +8756,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_path_steps: int = _PRUNE_PATH_STEPS_DEFAULT,
         prune_path_fraction: float = _PRUNE_PATH_FRACTION_DEFAULT,
         prune_path_tolerance: float = _PRUNE_PATH_TOLERANCE_DEFAULT,
+        prune_main_effects: bool = _PRUNE_MAIN_EFFECTS_DEFAULT,
         band_tolerance: float | None = _BAND_TOLERANCE_DEFAULT,
         band_deviance_cap: float = _BAND_DEVIANCE_CAP_DEFAULT,
         prune_fold_min_rows: int = _MIN_PRUNE_FOLD_ROWS,
@@ -8775,6 +8865,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             prune_path_steps=prune_path_steps,
             prune_path_fraction=prune_path_fraction,
             prune_path_tolerance=prune_path_tolerance,
+            prune_main_effects=prune_main_effects,
             band_tolerance=band_tolerance,
             band_deviance_cap=band_deviance_cap,
             prune_fold_min_rows=prune_fold_min_rows,
@@ -9116,6 +9207,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 path_steps=int(getattr(self, "prune_path_steps", _PRUNE_PATH_STEPS_DEFAULT)),
                 path_fraction=float(getattr(self, "prune_path_fraction", _PRUNE_PATH_FRACTION_DEFAULT)),
                 path_tolerance=float(getattr(self, "prune_path_tolerance", _PRUNE_PATH_TOLERANCE_DEFAULT)),
+                # See `_PRUNE_MAIN_EFFECTS_DEFAULT`: every multiclass selector honors it.
+                prune_main_effects=bool(
+                    getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)
+                ),
                 # See `_BAND_TOLERANCE_DEFAULT`: every class bank is banded after the keep-set.
                 band_tolerance=(
                     None if (bt := getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)) is None

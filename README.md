@@ -36,6 +36,7 @@ TBoostRegressor(
     interaction_gain_hurdle=2.0,            # 1. interaction hurdle (0.0 = off)
     interaction_gain_hurdle_mode="adaptive",
     prune=True,                             # 2. pruning
+    prune_main_effects=False,               #    (True = main effects can be dropped too)
     band_tolerance=0.75,                    # 3. banding (None = off)
     band_deviance_cap=0.001,
     graduate=None,                          # 4. graduation (False = off)
@@ -59,11 +60,18 @@ After the fit, the interaction tables are ranked by their purified variance and 
 order, subject to heredity: a k-way table enters only once all its (k-1)-way sub-tables are in.
 Each prefix is scored on the bags' out-of-bag rows. The deployed set is the smallest prefix that
 captures 99.5% of the available improvement over the main-effects-only model and is within 0.1% of
-the best out-of-bag deviance. Main effects are always kept.
+the best out-of-bag deviance. Main effects are kept by default.
+
+`prune_main_effects=True` puts the main effects on the path too. The path then starts from the
+intercept-only model, so the 99.5% is measured from there. A main effect enters at its own rank, or
+just before the first interaction that contains it, so a kept interaction always keeps its main
+effects. A feature whose main effect is dropped, and which no kept interaction uses, no longer
+affects predictions.
 
 A fit without out-of-bag rows (for example `n_bags=1`) falls back to a K-fold cross-validated
-vote (`prune_n_folds`). The selection is recorded in `pruning_report_`. `prune=False` deploys the
-full, unpruned table bank instead.
+vote (`prune_n_folds`), which judges main effects the same way when `prune_main_effects=True`. The
+selection is recorded in `pruning_report_`. `prune=False` deploys the full, unpruned table bank
+instead.
 
 #### 3. Banding
 

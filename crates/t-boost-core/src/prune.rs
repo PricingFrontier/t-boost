@@ -10,7 +10,8 @@
 //! removing a real one raises it. So candidate drops are ranked by the proper validation loss they
 //! produce, not by a marginal energy proxy. Main effects are sticky by default: whole-table pruning
 //! may simplify interactions, but it should not erase a low-variance rating factor that carries rare
-//! held-out signal.
+//! held-out signal. [`PruneConfig::prune_main_effects`] makes them candidates too, still under
+//! heredity: a main effect leaves only once no kept table contains it.
 //!
 //! **Downward closure.** Only a *maximal* table (one with no kept proper superset) may be dropped,
 //! so the keep-set stays a downward-closed order ideal (heredity): we never drop `{i,j}` while
@@ -35,8 +36,6 @@ use crate::table_model::{MultiClassTableModel, TableModel};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
-
-const STICKY_MAIN_EFFECTS: bool = true;
 
 /// One held-out fold used to score candidate prunings (e.g. one bag's out-of-bag rows). Borrows
 /// its data so the caller can carve folds from the training design without copying.
@@ -109,6 +108,11 @@ pub struct PruneConfig {
     /// so the default is inert regardless of its value. `3` is Ralph's bar: mains and pairs are
     /// what a filing reads, three-way tables are what inflates it.
     pub table_price_min_arity: u8,
+    /// Whether main effects are pruning candidates. `false` (the default) keeps every main effect,
+    /// so whole-table pruning only ever simplifies interactions. `true` lets the walk drop a main
+    /// effect like any other table, which it can only do once every table containing it is gone
+    /// (only a maximal table is ever dropped), so the keep-set stays downward-closed.
+    pub prune_main_effects: bool,
 }
 
 impl Default for PruneConfig {
@@ -118,6 +122,7 @@ impl Default for PruneConfig {
             lambda_boxes: 0.0,
             lambda_tables: 0.0,
             table_price_min_arity: DEFAULT_TABLE_MIN_ARITY,
+            prune_main_effects: false,
         }
     }
 }
@@ -202,6 +207,13 @@ pub fn n_tables_at_or_above(counts: &ArityCounts, min_arity: u8) -> usize {
 }
 
 impl PruneConfig {
+    /// Whether `u` is protected from whole-table deletion: a main effect, unless main effects
+    /// are pruning candidates.
+    #[must_use]
+    pub fn is_sticky(&self, u: &FeatureSet) -> bool {
+        !self.prune_main_effects && u.order() == 1
+    }
+
     /// Is the selection-time box price armed at all?
     ///
     /// Anything non-finite or `<= 0` is treated as OFF rather than rejected: this is a price,
@@ -330,7 +342,8 @@ pub struct PruneReport {
     pub dropped: Vec<FeatureSet>,
     /// Highest interaction order still present (`0` = intercept only, `1` = additive, up to `3`).
     pub effective_order: u8,
-    /// The full backward path (index 0 = full model, last = intercept only).
+    /// The full backward path (index 0 = full model, last = the main effects alone, or the
+    /// intercept alone when main effects are pruning candidates).
     pub path: Vec<PrunePoint>,
     /// Per-table held-out contribution diagnostics.
     pub table_scores: Vec<PruneTableScore>,
@@ -851,8 +864,9 @@ fn superset_frontier(ids: &[FeatureSet]) -> (Vec<u32>, Vec<Vec<u32>>) {
 /// Walks the backward path by repeatedly dropping the maximal table whose removal gives the best
 /// held-out deviance, scores mean ± SE held-out deviance across `folds` at every waypoint, then
 /// selects the simplest keep-set within `cfg.se_rule` SEs of the path minimum. Main effects are
-/// sticky: they remain in the deployed model unless a caller explicitly omits them from a supplied
-/// keep-set.
+/// sticky unless `cfg.prune_main_effects` is set: they remain in the deployed model unless a caller
+/// explicitly omits them from a supplied keep-set. With it set, a main effect is dropped like any
+/// other maximal table.
 ///
 /// # Errors
 /// [`PbError::ShapeMismatch`] if a fold's `y`/`w` length disagrees with its matrix; propagated
@@ -1025,7 +1039,7 @@ pub fn prune_bank(
                     mean_gain: drop_m - m0,
                     se_gain,
                     variance: variance[i],
-                    sticky: STICKY_MAIN_EFFECTS && ids[i].order() == 1,
+                    sticky: cfg.is_sticky(&ids[i]),
                     selected: true,
                 },
                 drop_m,
@@ -1078,11 +1092,7 @@ pub fn prune_bank(
     let (mut kept_superset_count, proper_subsets_of) = superset_frontier(&ids);
     loop {
         let candidates: Vec<usize> = (0..n_tables)
-            .filter(|&i| {
-                kept[i]
-                    && !(STICKY_MAIN_EFFECTS && ids[i].order() == 1)
-                    && kept_superset_count[i] == 0
-            })
+            .filter(|&i| kept[i] && !cfg.is_sticky(&ids[i]) && kept_superset_count[i] == 0)
             .collect();
         let best: Option<(usize, f64, f64)> = if lazy_walk {
             let mut order = candidates.clone();
@@ -1339,7 +1349,8 @@ impl Default for FoldFidelitySpec {
 /// Pin a fold model's bank to the deploy bank's candidate supports (see the module note above).
 pub struct FoldFidelity<'a> {
     /// The candidate supports the SELECTION must judge — the deploy fit's realized supports,
-    /// as raw feature ids. Order-1 entries are ignored (mains are sticky and never judged).
+    /// as raw feature ids. Order-1 entries are ignored: mains are sticky by default, and a
+    /// prunable main a fold never realized keeps the aggregator's no-evidence verdict.
     pub candidate_supports: &'a [Vec<u32>],
     /// Per-`serve`-row mask of rows this fold may FIT on. Its held-out scoring rows MUST be
     /// `false` or the evidence is self-scored.
@@ -3089,7 +3100,7 @@ pub fn prune_multiclass_to_tables(
                     mean_gain: drop_m - m0,
                     se_gain,
                     variance: variance[i],
-                    sticky: STICKY_MAIN_EFFECTS && ids[i].order() == 1,
+                    sticky: cfg.is_sticky(&ids[i]),
                     selected: true,
                 },
                 drop_m,
@@ -3126,11 +3137,7 @@ pub fn prune_multiclass_to_tables(
     };
     loop {
         let candidates: Vec<usize> = (0..n_ids)
-            .filter(|&i| {
-                kept[i]
-                    && !(STICKY_MAIN_EFFECTS && ids[i].order() == 1)
-                    && kept_superset_count[i] == 0
-            })
+            .filter(|&i| kept[i] && !cfg.is_sticky(&ids[i]) && kept_superset_count[i] == 0)
             .collect();
         let best: Option<(usize, f64, f64)> = if lazy_walk {
             let mut order = candidates.clone();
@@ -3490,7 +3497,9 @@ pub fn multiclass_bag_oob_group_sums_with(
 
 /// The report-ranked re-admission ladder: dropped tables ordered by `mean_gain` descending and
 /// cut into DOUBLING chunks (the first chunk is at most `|keep|` tables, then the grown keep-set
-/// is the next chunk's cap, and so on).
+/// is the next chunk's cap, and so on). A dropped main effect (main-effect pruning) moves up to
+/// just before the first dropped interaction that contains it, so no rung re-admits an
+/// interaction without its main effects.
 ///
 /// Fixing the ladder BEFORE any evidence is scored is what lets the guard price every rung from
 /// a single pass over the per-bag banks: rung `k` is the prefix union of chunks `0..k`, and
@@ -3555,6 +3564,7 @@ fn guard_readmission_chunks_ranked(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     ranked.dedup();
+    let ranked = mains_before_their_interactions(ranked);
     let mut chunks: Vec<Vec<FeatureSet>> = Vec::new();
     let mut grown = keep.len();
     let mut rest: &[&FeatureSet] = &ranked;
@@ -3568,6 +3578,37 @@ fn guard_readmission_chunks_ranked(
         grown += take;
     }
     chunks
+}
+
+/// `ranked` with each main effect in it moved to just before the first interaction in it that
+/// contains that feature (or left where it is if it already comes first). The identity when
+/// `ranked` holds no main effect, which is every ladder over sticky mains.
+fn mains_before_their_interactions(ranked: Vec<&FeatureSet>) -> Vec<&FeatureSet> {
+    let mains: BTreeMap<u32, &FeatureSet> = ranked
+        .iter()
+        .filter(|u| u.order() == 1)
+        .filter_map(|u| u.0.first().map(|f| (f.0, *u)))
+        .collect();
+    if mains.is_empty() {
+        return ranked;
+    }
+    let mut placed: std::collections::BTreeSet<&FeatureSet> = std::collections::BTreeSet::new();
+    let mut out: Vec<&FeatureSet> = Vec::with_capacity(ranked.len());
+    for u in ranked {
+        if u.order() > 1 {
+            for f in &u.0 {
+                if let Some(&main) = mains.get(&f.0) {
+                    if placed.insert(main) {
+                        out.push(main);
+                    }
+                }
+            }
+        }
+        if placed.insert(u) {
+            out.push(u);
+        }
+    }
+    out
 }
 
 /// Rung growth of the K>=3 guard's re-admission ladder (see
@@ -3784,10 +3825,16 @@ pub struct GuardArms {
 /// so pairs are unconditioned); a deferred support enters as soon as it qualifies. Supports whose
 /// subsets never enter are never admitted. Returns `(mains, sequence, sizes)` where `sizes` is a
 /// geometric grid of prefix lengths over `sequence` including 0 and the full length.
+///
+/// With `prune_main_effects` the mains are ranked too, so the path starts from the intercept and
+/// the returned `mains` is empty. A main enters at its own rank, or just before the first
+/// interaction that contains it if that comes first: a kept interaction keeps its main effects,
+/// and the interactions enter in exactly the order they do with sticky mains.
 #[must_use]
 pub fn ranked_path_sequence(
     supports: &[(FeatureSet, f64)],
     steps: usize,
+    prune_main_effects: bool,
 ) -> (Vec<FeatureSet>, Vec<FeatureSet>, Vec<usize>) {
     let mut mains: Vec<FeatureSet> = supports
         .iter()
@@ -3798,7 +3845,7 @@ pub fn ranked_path_sequence(
     mains.dedup();
     let mut inter: Vec<(FeatureSet, f64)> = supports
         .iter()
-        .filter(|(u, _)| u.order() > 1)
+        .filter(|(u, _)| u.order() > 1 || (prune_main_effects && u.order() == 1))
         .cloned()
         .collect();
     inter.sort_by(|a, b| {
@@ -3807,7 +3854,14 @@ pub fn ranked_path_sequence(
             .then_with(|| a.0.cmp(&b.0))
     });
     inter.dedup_by(|a, b| a.0 == b.0);
-    let mut admitted: std::collections::BTreeSet<FeatureSet> = mains.iter().cloned().collect();
+    // Sticky mains are in before the path starts; prunable ones are ranked candidates on it.
+    let (sticky, ranked_mains): (Vec<FeatureSet>, std::collections::BTreeSet<FeatureSet>) =
+        if prune_main_effects {
+            (Vec::new(), mains.into_iter().collect())
+        } else {
+            (mains, std::collections::BTreeSet::new())
+        };
+    let mut admitted: std::collections::BTreeSet<FeatureSet> = sticky.iter().cloned().collect();
     let mut seq: Vec<FeatureSet> = Vec::new();
     let mut pending: Vec<FeatureSet> = Vec::new();
     let qualifies = |v: &FeatureSet, admitted: &std::collections::BTreeSet<FeatureSet>| -> bool {
@@ -3833,6 +3887,17 @@ pub fn ranked_path_sequence(
             while i < pending.len() {
                 if qualifies(&pending[i], &admitted) {
                     let v = pending.remove(i);
+                    if admitted.contains(&v) {
+                        continue; // a main an earlier interaction already brought in
+                    }
+                    if v.order() > 1 {
+                        for f in &v.0 {
+                            let main = FeatureSet::new(&[f.0]);
+                            if ranked_mains.contains(&main) && admitted.insert(main.clone()) {
+                                seq.push(main);
+                            }
+                        }
+                    }
                     admitted.insert(v.clone());
                     seq.push(v);
                     moved = true;
@@ -3852,7 +3917,7 @@ pub fn ranked_path_sequence(
             sizes.insert((x.round() as usize).min(n));
         }
     }
-    (mains, seq, sizes.into_iter().collect())
+    (sticky, seq, sizes.into_iter().collect())
 }
 
 /// What the multiclass ranked path chose, serialized into `pruning_report_["path"]`.
@@ -3872,7 +3937,9 @@ pub struct RankedPathReport {
 /// the soup's per-class out-of-bag juries (softmax deviance), deploying the larger of the smallest
 /// prefix capturing `fraction` of the out-of-bag improvement over the mains-only model and the
 /// smallest prefix within `tolerance` of the best out-of-bag deviance (fraction 1.0 = the minimum). `None` when
-/// the fit has no out-of-bag evidence or fewer than `min_rows` jury rows.
+/// the fit has no out-of-bag evidence or fewer than `min_rows` jury rows. With
+/// `prune_main_effects` the mains are on the path too and it starts from the intercept-only model,
+/// so `fraction` is measured against that.
 pub fn multiclass_ranked_path(
     mc: &MultiClassModel,
     serve: &ServeBinnedMatrix,
@@ -3884,11 +3951,12 @@ pub fn multiclass_ranked_path(
     fraction: f64,
     tolerance: f64,
     min_rows: usize,
+    prune_main_effects: bool,
 ) -> Result<Option<(Vec<FeatureSet>, RankedPathReport)>, PbError> {
     if !multiclass_bag_oob_evidence_available(mc) {
         return Ok(None);
     }
-    let (mains, seq, sizes) = ranked_path_sequence(supports, steps);
+    let (mains, seq, sizes) = ranked_path_sequence(supports, steps, prune_main_effects);
     let mut groups: Vec<Vec<FeatureSet>> = vec![mains.clone()];
     for pair in sizes.windows(2) {
         groups.push(seq[pair[0]..pair[1]].to_vec());
@@ -3916,7 +3984,8 @@ pub fn multiclass_ranked_path(
         .enumerate()
         .min_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
         .map_or(0, |(i, _)| i);
-    // Smallest prefix capturing `fraction` of the out-of-bag improvement over the mains-only model.
+    // Smallest prefix capturing `fraction` of the out-of-bag improvement over the path's first
+    // point (the mains-only model, or the intercept when the mains are on the path).
     let gain = devs[0] - devs[best];
     let best = if gain > 0.0 && fraction < 1.0 {
         let first = devs.first().copied().unwrap_or(0.0);
@@ -4584,6 +4653,77 @@ mod tests {
         let keep: Vec<FeatureSet> = vec![score(&[0], 0.0).u, score(&[1], 0.0).u];
         let scores = vec![score(&[0], 1.0), score(&[1], 2.0)];
         assert!(guard_readmission_chunks(&keep, &scores).is_empty());
+    }
+
+    #[test]
+    fn readmission_ladder_puts_a_dropped_main_ahead_of_its_interactions() {
+        // Main-effect pruning can drop a main with the interactions that contain it. A rung that
+        // re-admitted (0, 3) without (3) would break hierarchy, so (3) moves up to just before
+        // the first interaction that needs it; everything else keeps its gain rank.
+        let keep: Vec<FeatureSet> = vec![FeatureSet::new(&[0]), FeatureSet::new(&[1])];
+        let scores = vec![
+            score(&[0, 3], 0.9),
+            score(&[1], 0.8), // kept: never a candidate
+            score(&[2], 0.7),
+            score(&[3], 0.1),
+            score(&[2, 3], 0.05),
+        ];
+        let flat: Vec<FeatureSet> = guard_readmission_chunks(&keep, &scores)
+            .into_iter()
+            .flatten()
+            .collect();
+        let want: Vec<FeatureSet> = [&[3][..], &[0, 3], &[2], &[2, 3]]
+            .iter()
+            .map(|u| FeatureSet::new(u))
+            .collect();
+        assert_eq!(flat, want);
+    }
+
+    #[test]
+    fn ranked_path_with_prunable_mains_admits_each_main_with_its_first_interaction() {
+        // By variance, (1, 2) outranks both mains it needs and (0, 1, 2) waits for (0, 1) and
+        // (0, 2). Mains (1) and (2) enter with (1, 2), ahead of their own ranks; (0) and (3)
+        // enter at theirs.
+        let supports: Vec<(FeatureSet, f64)> = [
+            (&[0][..], 9.0),
+            (&[1, 2], 8.0),
+            (&[0, 1, 2], 7.0),
+            (&[1], 6.0),
+            (&[0, 1], 5.0),
+            (&[3], 4.0),
+            (&[0, 2], 3.0),
+            (&[2], 2.0),
+        ]
+        .iter()
+        .map(|(u, v)| (FeatureSet::new(u), *v))
+        .collect();
+        let (sticky, seq, sizes) = ranked_path_sequence(&supports, 32, true);
+        assert!(
+            sticky.is_empty(),
+            "prunable mains are on the path, not ahead of it"
+        );
+        let ids: Vec<Vec<u32>> = seq
+            .iter()
+            .map(|u| u.0.iter().map(|f| f.0).collect())
+            .collect();
+        let want: Vec<Vec<u32>> = vec![
+            vec![0],
+            vec![1],
+            vec![2],
+            vec![1, 2],
+            vec![0, 1],
+            vec![3],
+            vec![0, 2],
+            vec![0, 1, 2],
+        ];
+        assert_eq!(ids, want);
+        assert_eq!(sizes.first(), Some(&0));
+        assert_eq!(sizes.last(), Some(&seq.len()));
+        // The interactions enter in exactly the order they do with sticky mains.
+        let (mains, sticky_seq, _) = ranked_path_sequence(&supports, 32, false);
+        assert_eq!(mains.len(), 4);
+        let interactions: Vec<FeatureSet> = seq.into_iter().filter(|u| u.order() > 1).collect();
+        assert_eq!(interactions, sticky_seq);
     }
 
     #[test]
@@ -5549,6 +5689,51 @@ mod tests {
             "pruning overfit interactions must improve held-out deviance, got {}",
             report.delta_vs_full
         );
+    }
+
+    #[test]
+    fn prunable_mains_are_dropped_too_and_only_after_every_table_containing_them() {
+        // The test above with main effects as candidates: against a pure-intercept target every
+        // table is noise, so the walk goes down to the intercept.
+        let model = fixture_model();
+        let x = fixture_serve();
+        let bank = model.explain(&x, RefMeasure::Uniform).unwrap();
+        let n = x.0.n_rows as usize;
+        let y = vec![bank.f0 as f32; n];
+        let w = vec![1.0_f32; n];
+        let folds = [HoldoutFold {
+            x: &x.0,
+            y: &y,
+            w: &w,
+            offset: None,
+        }];
+        let cfg = PruneConfig {
+            prune_main_effects: true,
+            ..PruneConfig::default()
+        };
+        let (pruned, report) = prune_bank(
+            &bank,
+            &crate::cat::CatEncoderStore::new(),
+            &folds,
+            &SquaredError,
+            &cfg,
+        )
+        .unwrap();
+        assert!(pruned.tables.is_empty() && pruned.factored.is_empty());
+        assert!(report.kept.is_empty());
+        assert_eq!(report.effective_order, 0);
+        assert!(report.dropped.iter().any(|u| u.order() == 1));
+        assert!(report.table_scores.iter().all(|t| !t.sticky));
+        assert_eq!(report.path.last().map(|p| p.n_tables), Some(0));
+        for (i, sub) in report.dropped.iter().enumerate() {
+            assert!(
+                report.dropped[i + 1..]
+                    .iter()
+                    .all(|sup| !is_proper_subset(sub, sup)),
+                "{sub:?} was dropped before a table that contains it"
+            );
+        }
+        assert!(report.delta_vs_full > 0.0);
     }
 
     #[test]

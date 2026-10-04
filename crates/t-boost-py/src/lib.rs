@@ -1722,6 +1722,7 @@ mod cat_channels_fit_path_tests {
             None,
             // pinned-bank fold fidelity off: these gates pin the HISTORICAL selection path.
             None,
+            false,
         )
         .expect(
             "CV-pruning must succeed once an unseen level resolves to the base cell instead \
@@ -2018,6 +2019,7 @@ mod cat_channels_fit_path_tests {
             None,
             // pinned-bank fold fidelity off: these gates pin the HISTORICAL selection path.
             None,
+            false,
         )
         .expect(
             "fit_prune_selection's underlying CV-pruning path must succeed on the >255-cell \
@@ -2121,6 +2123,7 @@ mod cat_channels_fit_path_tests {
             None,
             // pinned-bank fold fidelity off: these gates pin the HISTORICAL selection path.
             None,
+            false,
         )
         .expect("CV prune-select must succeed on the overflowing feature");
         assert!(reports.iter().any(Option::is_some));
@@ -3427,6 +3430,16 @@ fn mean_se_of(xs: &[f64]) -> (f64, Option<f64>) {
     (m, Some((var / n as f64).sqrt()))
 }
 
+/// `pruning_report_["main_effect_policy"]`: whether main effects were pruning candidates.
+fn main_effect_policy(prune_main_effects: bool) -> &'static str {
+    if prune_main_effects {
+        "prunable"
+    } else {
+        "sticky"
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // JUSTIFIED: each argument is an independent selection knob.
 fn aggregate_prune_selection(
     full_supports_raw: Vec<Vec<u32>>,
     reports: &[Option<PruneReport>],
@@ -3448,6 +3461,10 @@ fn aggregate_prune_selection(
     // Provenance only: which fold fidelity produced the evidence below. Recorded so a stored
     // selection says how its keep-set was chosen; the aggregation itself is unchanged.
     fold_fidelity: bool,
+    // Main effects go through the same keep rule as interactions instead of being kept outright.
+    // A refused main still comes back through the downward closure below whenever a kept
+    // interaction contains it: hierarchy keeps the main rather than dropping the interaction.
+    prune_main_effects: bool,
 ) -> Result<(Vec<Vec<u32>>, String), PbError> {
     let full_supports: BTreeSet<FeatureSet> = full_supports_raw
         .iter()
@@ -3503,7 +3520,7 @@ fn aggregate_prune_selection(
 
     let mut selected: BTreeSet<FeatureSet> = full_supports
         .iter()
-        .filter(|u| u.order() == 1)
+        .filter(|u| !prune_main_effects && u.order() == 1)
         .cloned()
         .collect();
     // Candidate admissions the EVIDENCE gate wants but the legacy rule refuses. `(mean_gain,
@@ -3513,7 +3530,7 @@ fn aggregate_prune_selection(
     let mut evidence_extra: Vec<(f64, Vec<u32>, FeatureSet)> = Vec::new();
     let mut evidence_rows: Vec<serde_json::Value> = Vec::new();
     for fs in &full_supports_vec {
-        if fs.order() == 1 {
+        if fs.order() == 1 && !prune_main_effects {
             continue;
         }
         let kept_rate = *kept_counts.get(fs).unwrap_or(&0) as f64 / n_reports_f;
@@ -3608,8 +3625,9 @@ fn aggregate_prune_selection(
 
     // Heredity by cascade-removal, not closure-addition: a higher-order table stays only if every
     // immediate subset also earned its keep — otherwise a kept triple re-admits (via closure)
-    // exactly the negative-gain pairs the gate removed. Mains are sticky, so the cascade only
-    // travels upward from gated-out interactions.
+    // exactly the negative-gain pairs the gate removed. Mains never cascade: sticky ones are always
+    // in, and a prunable main the vote refused comes back through the closure below whenever a
+    // kept interaction contains it.
     let mut cascade_removed: Vec<FeatureSet> = Vec::new();
     loop {
         let doomed: Vec<FeatureSet> = selected
@@ -3650,7 +3668,7 @@ fn aggregate_prune_selection(
                 "positive_rate": *positive_counts.get(fs).unwrap_or(&0) as f64 / gn as f64,
                 "mean_gain": *gain_sum.get(fs).unwrap_or(&0.0) / gn as f64,
                 "selected": selected.contains(fs),
-                "sticky": fs.order() == 1,
+                "sticky": fs.order() == 1 && !prune_main_effects,
             })
         })
         .collect();
@@ -3659,7 +3677,7 @@ fn aggregate_prune_selection(
         "kept": keep,
         "effective_order": effective_order,
         "cv_folds": reports.iter().filter(|r| r.is_some()).count(),
-        "main_effect_policy": "sticky",
+        "main_effect_policy": main_effect_policy(prune_main_effects),
         "selector": "heldout_contribution_stability",
         "min_stability": min_stability,
         "min_mean_gain": min_mean_gain,
@@ -3683,6 +3701,63 @@ fn aggregate_prune_selection(
         PbError::Serialization(format!("could not serialize prune selection report: {err}"))
     })?;
     Ok((selected.iter().map(feature_set_ids).collect(), report_json))
+}
+
+#[cfg(test)]
+mod main_effect_vote_tests {
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+    use super::aggregate_prune_selection;
+    use t_boost_core::explain::FeatureSet;
+    use t_boost_core::prune::{PruneReport, PruneTableScore};
+
+    /// One fold's report: what its walk kept and each support's held-out drop-gain.
+    fn fold(kept: &[&[u32]], gains: &[(&[u32], f64)]) -> Option<PruneReport> {
+        Some(PruneReport {
+            kept: kept.iter().map(|u| FeatureSet::new(u)).collect(),
+            dropped: Vec::new(),
+            effective_order: 2,
+            path: Vec::new(),
+            table_scores: gains
+                .iter()
+                .map(|(u, gain)| PruneTableScore {
+                    u: FeatureSet::new(u),
+                    order: u8::try_from(u.len()).unwrap(),
+                    mean_gain: *gain,
+                    se_gain: 0.0,
+                    variance: 0.0,
+                    sticky: false,
+                    selected: true,
+                })
+                .collect(),
+            delta_vs_full: 0.0,
+        })
+    }
+
+    #[test]
+    fn the_vote_drops_a_useless_main_and_hierarchy_keeps_one_a_kept_pair_needs() {
+        // Mains (1) and (2) lose held-out deviance in every fold; the pair (0, 1) earns its keep.
+        // (2) goes. (1) is refused too, but comes back through the closure for the pair rather
+        // than taking the pair with it.
+        let supports: Vec<Vec<u32>> = vec![vec![0], vec![1], vec![2], vec![0, 1]];
+        let gains: &[(&[u32], f64)] = &[(&[0], 0.5), (&[1], -0.01), (&[2], -0.02), (&[0, 1], 0.3)];
+        let reports: Vec<Option<PruneReport>> = (0..3)
+            .map(|_| fold(&[&[0], &[1], &[0, 1]], gains))
+            .collect();
+        let (keep, json) =
+            aggregate_prune_selection(supports.clone(), &reports, 0.5, 0.0, None, 0, false, true)
+                .unwrap();
+        assert_eq!(keep, vec![vec![0], vec![0, 1], vec![1]]);
+        let rep: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rep["main_effect_policy"], "prunable");
+        assert_eq!(rep["closure_added"], serde_json::json!([[1]]));
+        // Sticky mains (the default) are all kept whatever the vote says about them.
+        let (keep, json) =
+            aggregate_prune_selection(supports, &reports, 0.5, 0.0, None, 0, false, false).unwrap();
+        assert_eq!(keep, vec![vec![0], vec![0, 1], vec![1], vec![2]]);
+        let rep: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(rep["main_effect_policy"], "sticky");
+        assert_eq!(rep["closure_added"], serde_json::json!([]));
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3719,6 +3794,8 @@ fn fit_prune_reports_owned(
     // candidate support it is MISSING, fit on that fold's TRAIN rows only, so the paired
     // per-fold statistic exists for the whole candidate set. See `prune::FoldFidelity`.
     fold_fidelity: Option<Vec<Vec<u32>>>,
+    // Main effects are walk candidates too (`PruneConfig::prune_main_effects`).
+    prune_main_effects: bool,
 ) -> Result<Vec<Option<PruneReport>>, PbError> {
     let n = y_vec.len();
     let w_full: Vec<f32> = match &weight_vec {
@@ -3787,6 +3864,7 @@ fn fit_prune_reports_owned(
             lambda_boxes,
             lambda_tables,
             table_price_min_arity: table_min_arity,
+            prune_main_effects,
         };
         // The fidelity augmentation may fit ONLY on this fold's train side: `held` is exactly
         // the rows its evidence is scored on, so they carry IRLS weight 0 in the solve.
@@ -4284,7 +4362,7 @@ impl PyBooster {
     /// Fit native-softmax on the complement of `sel_rows`, then prune the per-class banks with a
     /// shared keep-set selected on those held-out rows. The full design crosses the Python boundary
     /// once; row gathering, fitting, full-data serving, and pruning run on one bounded Rayon pool.
-    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0))]
+    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit_multiclass_pruned(
         &self,
@@ -4359,6 +4437,8 @@ impl PyBooster {
         band_tolerance: Option<f64>,
         band_deviance_cap: f64,
         path_tolerance: f64,
+        // Main effects are candidates in every selector (`PruneConfig::prune_main_effects`).
+        prune_main_effects: bool,
     ) -> PyResult<(PyMultiClassTableModel, String)> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4426,6 +4506,7 @@ impl PyBooster {
                     band_tolerance,
                     band_deviance_cap,
                     path_tolerance,
+                    prune_main_effects,
                 )
             })
             .map_err(py_err)?;
@@ -4572,6 +4653,9 @@ impl PyBooster {
                     // aggregator that has no candidate bank to pin against; fidelity is a
                     // `fit_prune_selection`-only feature.
                     None,
+                    // Sticky main effects: like fidelity, main-effect pruning is decided by
+                    // `fit_prune_selection`'s aggregator.
+                    false,
                 )
             })
             .map_err(py_err)?;
@@ -4592,7 +4676,7 @@ impl PyBooster {
     /// Like [`PyBooster::fit_prune_folds`], but aggregate the contribution/stability reports in
     /// Rust and return the final keep-set plus report JSON. This avoids per-fold JSON crossing into
     /// Python on the scalar sklearn prune path.
-    #[pyo3(signature = (x, y, fold_of, k_folds, full_supports, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=1, reanchor=true, min_stability=0.5, min_mean_gain=0.0, es_holdout=None, drop_z=None, keep_budget=0, lambda_tables=0.0, table_min_arity=3, fold_fidelity=false))]
+    #[pyo3(signature = (x, y, fold_of, k_folds, full_supports, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=1, reanchor=true, min_stability=0.5, min_mean_gain=0.0, es_holdout=None, drop_z=None, keep_budget=0, lambda_tables=0.0, table_min_arity=3, fold_fidelity=false, prune_main_effects=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit_prune_selection(
         &self,
@@ -4632,6 +4716,9 @@ impl PyBooster {
         // parameter existed. `true` pins each fold bank to `full_supports` — see
         // `prune::FoldFidelity` and `_PRUNE_FOLD_FIDELITY_DEFAULT` in the sklearn wrapper.
         fold_fidelity: bool,
+        // Main effects are candidates in the fold walks and the vote. `false` (the default)
+        // keeps every main effect, as before this parameter existed.
+        prune_main_effects: bool,
     ) -> PyResult<(Vec<Vec<u32>>, String)> {
         let columns = raw_columns_from_array(x)?;
         let y_vec = array1_to_vec(y, "y")?;
@@ -4709,6 +4796,7 @@ impl PyBooster {
                 reanchor,
                 es_holdout,
                 fold_fidelity.then(|| full_supports.clone()),
+                prune_main_effects,
             )?;
             aggregate_prune_selection(
                 full_supports,
@@ -4718,6 +4806,7 @@ impl PyBooster {
                 drop_z,
                 keep_budget,
                 fold_fidelity,
+                prune_main_effects,
             )
         })
         .map_err(py_err)
@@ -5200,6 +5289,7 @@ impl PyModel {
                     lambda_boxes,
                     lambda_tables: 0.0,
                     table_price_min_arity: DEFAULT_TABLE_MIN_ARITY,
+                    prune_main_effects: false,
                 };
                 let (tm, report) = prune_model_to_tables(
                     &model,
@@ -6834,6 +6924,7 @@ impl PyMultiClassModel {
                         lambda_boxes,
                         lambda_tables: 0.0,
                         table_price_min_arity: DEFAULT_TABLE_MIN_ARITY,
+                        prune_main_effects: false,
                     };
                     let (mct, report) = prune_multiclass_to_tables(
                         &model,
@@ -8442,6 +8533,7 @@ fn fit_multiclass_pruned_owned(
     band_tolerance: Option<f64>,
     band_deviance_cap: f64,
     path_tolerance: f64,
+    prune_main_effects: bool,
 ) -> Result<(MultiClassTableModel, String), PbError> {
     let n = y.len();
     if n == 0 {
@@ -8553,6 +8645,7 @@ fn fit_multiclass_pruned_owned(
             lambda_boxes,
             lambda_tables,
             table_price_min_arity: table_min_arity,
+            prune_main_effects,
         };
         // The selection fits share the deploy recipe minus its ensemble: unbagged (or
         // `sel_bags` bags) and without the out-of-bag cell refit, which needs a bag partition.
@@ -8624,6 +8717,7 @@ fn fit_multiclass_pruned_owned(
                     path_fraction,
                     path_tolerance,
                     prune_guard_min_rows,
+                    prune_main_effects,
                 )
             })?;
             drop(serve);
@@ -8649,7 +8743,7 @@ fn fit_multiclass_pruned_owned(
                     mean_gain: *v,
                     se_gain: 0.0,
                     variance: *v,
-                    sticky: u.order() == 1,
+                    sticky: cfg.is_sticky(u),
                     selected: kept_set.contains(u),
                 })
                 .collect();
@@ -8801,6 +8895,7 @@ fn fit_multiclass_pruned_owned(
                 drop_z,
                 keep_budget,
                 false,
+                prune_main_effects,
             )?;
             let kept: Vec<FeatureSet> = keep_ids
                 .iter()
@@ -8826,7 +8921,7 @@ fn fit_multiclass_pruned_owned(
                         mean_gain: m,
                         se_gain: se.unwrap_or(f64::NAN),
                         variance: *variance,
-                        sticky: u.order() == 1,
+                        sticky: cfg.is_sticky(u),
                         selected: kept_set.contains(u),
                     }
                 })
@@ -9032,6 +9127,10 @@ fn fit_multiclass_pruned_owned(
             obj.insert(
                 "cv_folds".into(),
                 serde_json::json!(if cv { k_folds } else { 0 }),
+            );
+            obj.insert(
+                "main_effect_policy".into(),
+                serde_json::Value::String(main_effect_policy(prune_main_effects).into()),
             );
             if let Some(sel) = selection_json {
                 obj.insert("selection".into(), sel);
