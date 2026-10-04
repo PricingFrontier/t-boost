@@ -149,7 +149,7 @@ def _reject_sparse(x: Any) -> None:
 # NUMERIC regressor with no envelope at all; both still load. A header from a NEWER schema is
 # refused rather than half-read (rustystats' fail-loud rule).
 _ESTIMATOR_MAGIC = b"TBP1"
-# 5 (0.6.3): the caller's `metadata` slot and the fit report (`n_trees_per_bag_`, ...). A 0.6.2
+# 5 (0.7.0): the caller's `metadata` slot and the fit report (`n_trees_per_bag_`, ...). A 0.6.2
 # loader would silently drop both, so it refuses these headers instead.
 _ENVELOPE_SCHEMA_VERSION = 5
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
@@ -3999,7 +3999,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self.__dict__.pop("evals_result_", None)
 
     def _clear_fit_counts(self) -> None:
-        """No boosting report (a multiclass fit, or a model saved before 0.6.3)."""
+        """No boosting report (a multiclass fit, or a model saved before 0.7.0)."""
         self.n_trees_per_bag_ = self.stopping_reason_per_bag_ = None
         self.n_trees_ = self.stopping_reason_ = None
         self.__dict__.pop("evals_result_", None)
@@ -7108,7 +7108,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Notes
         -----
         Compatibility rule: a release reads every document whose envelope ``schema_version``
-        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
         its supported range, plus the bare native blobs written before the envelope existed.
         Any document it reads predicts identically to the release that wrote it. A newer
         document raises ``SerializationError`` naming both versions, never a partial load.
@@ -7144,7 +7144,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Notes
         -----
         Compatibility rule: a release reads every document whose envelope ``schema_version``
-        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
         its supported range, plus the bare native blobs written before the envelope existed.
         Any document it reads predicts identically to the release that wrote it. A newer
         document raises ``SerializationError`` naming both versions, never a partial load.
@@ -7264,7 +7264,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
         ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
         boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.6.3. With ``eval_set`` or ``callbacks``,
+        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
         ``evals_result_`` holds each bag's per-round mean deviances:
         ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
         ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
@@ -8379,7 +8379,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Notes
         -----
         Compatibility rule: a release reads every document whose envelope ``schema_version``
-        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
         its supported range, plus the bare native blobs written before the envelope existed.
         Any document it reads predicts identically to the release that wrote it. A newer
         document raises ``SerializationError`` naming both versions, never a partial load.
@@ -8421,7 +8421,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Notes
         -----
         Compatibility rule: a release reads every document whose envelope ``schema_version``
-        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        is at most its own (``5`` since 0.7.0) and whose native model ``schema_version`` lies in
         its supported range, plus the bare native blobs written before the envelope existed.
         Any document it reads predicts identically to the release that wrote it. A newer
         document raises ``SerializationError`` naming both versions, never a partial load.
@@ -8782,7 +8782,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
         ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
         boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.6.3. With ``eval_set`` or ``callbacks``,
+        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
         ``evals_result_`` holds each bag's per-round mean deviances:
         ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
         ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
