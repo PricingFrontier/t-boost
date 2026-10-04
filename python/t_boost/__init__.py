@@ -17,6 +17,8 @@ expressible and not readable. Choose accordingly.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from ._t_boost import (
     _Booster,
     _Model,
@@ -28,6 +30,16 @@ from ._t_boost import (
     SerializationError,
     TBoostError,
 )
+
+if TYPE_CHECKING:
+    # The estimators load lazily through `__getattr__` below (keeping `import t_boost` cheap);
+    # these imports give type checkers their real types instead of `object`.
+    from .sklearn import (
+        PrecisionWarning,
+        TBoostClassifier,
+        TBoostRegressor,
+        recommended_recipe,
+    )
 
 __all__ = [
     "TBoostClassifier",

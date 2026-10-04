@@ -9,6 +9,7 @@ external benchmarking harnesses.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache as _lru_cache, wraps
 
 import json
@@ -72,6 +73,11 @@ def _atomic_fit(method: _FitMethod) -> _FitMethod:
     return cast(_FitMethod, fit)
 
 
+# Constructor parameters that only steer scoring, never the fit: changing them through
+# `set_params` keeps the fitted model.
+_SERVE_ONLY_PARAMS = frozenset({"unknown_category"})
+
+
 def _canonical_objective(name: str) -> str:
     normalized = str(name).replace("-", "_").lower()
     return {
@@ -106,7 +112,9 @@ def _reject_sparse(x: Any) -> None:
 # NUMERIC regressor with no envelope at all; both still load. A header from a NEWER schema is
 # refused rather than half-read (rustystats' fail-loud rule).
 _ESTIMATOR_MAGIC = b"TBP1"
-_ENVELOPE_SCHEMA_VERSION = 4
+# 5 (0.6.3): the caller's `metadata` slot and the fit report (`n_trees_per_bag_`, ...). A 0.6.2
+# loader would silently drop both, so it refuses these headers instead.
+_ENVELOPE_SCHEMA_VERSION = 5
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
 _TABLES_MAGIC = b"TBTM"  # the Rust tables-only (pruned) container prefix (see serialize.rs)
 _MULTICLASS_TABLES_MAGIC = b"TBMT"  # the Rust pruned-multiclass tables container prefix
@@ -1319,7 +1327,22 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     for key in ("_ae_requires_weight_", "_ae_requires_exposure_"):
         if getattr(est, key, False):
             md[key] = True
+    user = getattr(est, "_metadata", None)
+    if user:
+        md["metadata"] = _checked_user_metadata(user)
     return md
+
+
+def _checked_user_metadata(value: Any) -> dict[str, Any]:
+    """The caller's `metadata` slot as plain JSON, or `SerializationError`. Round-tripping
+    through strict JSON (no NaN/inf) here means a document that saves always loads back."""
+    if not isinstance(value, dict) or not all(isinstance(k, str) for k in value):
+        raise SerializationError("metadata must be a dict with str keys")
+    try:
+        checked: dict[str, Any] = json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        raise SerializationError(f"metadata is not JSON-serializable: {exc}") from exc
+    return checked
 
 
 def _check_envelope(cls: type, md: dict[str, Any]) -> None:
@@ -1462,6 +1485,8 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
     # `_estimator_metadata`); older blobs without the key keep whatever `_attach_model` set.
     if md.get("n_features_in_") is not None:
         est.n_features_in_ = int(md["n_features_in_"])
+    if "metadata" in md:
+        est._metadata = _checked_user_metadata(md["metadata"])
 
 
 def _pack_bytes(est: "_BaseTBoost", inner: bytes) -> bytes:
@@ -1530,11 +1555,46 @@ def _native_json_kind(text: str) -> str | None:
     return marker if isinstance(marker, str) else None
 
 __all__ = [
+    "ContributionMatrix",
     "PrecisionWarning",
     "TBoostRegressor",
     "TBoostClassifier",
     "recommended_recipe",
 ]
+
+
+@dataclass(frozen=True)
+class ContributionMatrix:
+    """``predict_contributions(..., return_format="matrix")``: every row's raw score as a
+    dense ``rows x terms`` matrix.
+
+    ``base_value + values.sum(axis=-1)`` equals the raw (link-scale) score, including any
+    ``exposure`` or ``offset`` passed, which appear as their own columns.
+
+    Attributes
+    ----------
+    base_value : numpy.ndarray
+        The intercept for each row (float64, link scale): shape ``(n_rows,)``, or
+        ``(n_classes, n_rows)`` for a multiclass model.
+    values : numpy.ndarray
+        The contributions (float64): shape ``(n_rows, n_terms)``, or
+        ``(n_classes, n_rows, n_terms)`` for a multiclass model.
+    terms : list[tuple[str, ...]]
+        Each column's feature names: one name for a main effect (or, with
+        ``split_interactions=True``, a feature), several for an interaction. The ``exposure``
+        and ``offset`` columns carry their argument's name alone.
+    term_types : list[str]
+        Each column's kind: ``"main"``, ``"interaction"``, ``"feature"``, ``"exposure"`` or
+        ``"offset"``. A feature that happens to be named ``"exposure"`` stays ``"main"``.
+    classes : list or None
+        The class labels along the leading axis of a multiclass result, else ``None``.
+    """
+
+    base_value: np.ndarray
+    values: np.ndarray
+    terms: list[tuple[str, ...]]
+    term_types: list[str]
+    classes: list[Any] | None = None
 
 
 class PrecisionWarning(UserWarning):
@@ -1667,6 +1727,52 @@ def _contribution_terms(
             joint = [{names[j]: columns[j][i] for j in cols} for i in range(n_rows)]
             terms.append((":".join(names[j] for j in cols), "interaction", joint))
     return np.asarray(values, dtype=np.float64), terms
+
+
+def _contribution_matrix(
+    ladders: list[tuple[float, "np.ndarray", list[list[int]]]],
+    names: list[str],
+    to_input: list[int],
+    split_interactions: bool,
+    has_exposure: bool,
+    classes: list[Any] | None,
+) -> ContributionMatrix:
+    """The ``return_format="matrix"`` result from each bank's ``(f0, matrix, feature sets)``
+    as `_contribution_terms` laid it out. A multiclass model's classes may keep different
+    effects, so their columns are scattered onto the union of effects (zero where a class has
+    none)."""
+    terms: list[tuple[str, ...]]
+    if split_interactions:
+        terms = [(name,) for name in names]
+        term_types = ["feature"] * len(names)
+        placed = [np.asarray(m, dtype=np.float64) for _, m, _ in ladders]
+    else:
+        index: dict[tuple[str, ...], int] = {}
+        bank_terms = [
+            [tuple(names[to_input[raw]] for raw in raws) for raws in sets]
+            for _, _, sets in ladders
+        ]
+        for keys in bank_terms:
+            for key in keys:
+                index.setdefault(key, len(index))
+        terms = list(index)
+        term_types = ["main" if len(t) == 1 else "interaction" for t in terms]
+        placed = []
+        for (_, m, _), keys in zip(ladders, bank_terms):
+            full = np.zeros((m.shape[0], len(terms)), dtype=np.float64)
+            for col, key in enumerate(keys):
+                full[:, index[key]] = m[:, col]
+            if has_exposure:
+                full = np.column_stack([full, m[:, -1]])
+            placed.append(full)
+    if has_exposure:
+        terms.append(("exposure",))
+        term_types.append("exposure")
+    base = np.stack([np.full(m.shape[0], f0, dtype=np.float64) for (f0, _, _), m in zip(ladders, placed)])
+    values = np.stack(placed)
+    if classes is None:
+        return ContributionMatrix(base[0], values[0], terms, term_types)
+    return ContributionMatrix(base, values, terms, term_types, classes)
 
 
 def _ladder_parts(
@@ -1833,6 +1939,27 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     _model: _Model | _TableModel
     _multi_model: _MultiClassModel | _MultiClassTableModel | None
 
+    @property
+    def metadata(self) -> dict[str, Any]:
+        """Caller-owned JSON metadata, saved with the model by :meth:`to_bytes` /
+        :meth:`to_json` and returned unchanged by ``from_bytes`` / ``from_json``.
+
+        t-boost never reads it: it has no effect on fitting, predictions or ``tables()``, and a
+        refit keeps it. Keys must be strings and values JSON-serializable (no NaN or infinity);
+        anything else raises ``SerializationError`` when the model is saved.
+        """
+        value: dict[str, Any] | None = self.__dict__.get("_metadata")
+        if value is None:
+            value = {}
+            self._metadata = value
+        return value
+
+    @metadata.setter
+    def metadata(self, value: dict[str, Any]) -> None:
+        if not isinstance(value, dict):
+            raise TypeError(f"metadata must be a dict, got {type(value).__name__}")
+        self._metadata = value
+
     # NOTE: constructor defaults deliberately embed the recommended recipe so a bare estimator
     # performs well without tuning (see `recommended_recipe`) — and, since 2026-07-15, they match
     # the insur-arena benchmark deployment exactly (Ralph: "i want the library to match what was
@@ -1992,6 +2119,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
+        unknown_category: str = "default_cell",
     ) -> None:
         self.n_trees = n_trees
         self.learning_rate = learning_rate
@@ -2287,6 +2415,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_size_penalty = prune_size_penalty
         self.early_stopping = early_stopping
         self._resolve_merged_aliases()
+        # Scoring-time policy for a categorical level the fit never saw (see `_check_unknown`).
+        self.unknown_category = unknown_category
 
     def _resolve_merged_aliases(self) -> None:
         prune_size_penalty = self.prune_size_penalty
@@ -2351,6 +2481,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self.__dict__.clear()
             self.__dict__.update(previous)
             raise
+        if set(params) <= _SERVE_ONLY_PARAMS:
+            # Scoring-time policy only: the fitted model is still the model these params describe.
+            return result
         for name in (
             "_model",
             "_multi_model",
@@ -3234,7 +3367,56 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         numeric_x, cat_x, _ = self._split_columns(
             X, list(cat_idx), _feature_names_from_x(X), coded=coded
         )
+        self._check_unknown(cat_x)
         return numeric_x, cat_x
+
+    def _check_unknown(self, cat_x: Any) -> None:
+        """Enforce `unknown_category` on a serve design's categorical columns (per-row labels,
+        or `(codes, distinct labels)` pairs), in `_cat_indices_` order."""
+        policy = getattr(self, "unknown_category", "default_cell")
+        if policy not in ("default_cell", "error"):
+            raise ValueError(
+                f"unknown_category must be 'default_cell' or 'error', got {policy!r}"
+            )
+        if policy == "default_cell" or not cat_x:
+            return
+        known = self._known_labels()
+        names = self._input_feature_names()
+        for pos, column in zip(getattr(self, "_cat_indices_", None) or [], cat_x):
+            labels = column[1] if isinstance(column, tuple) else column
+            fitted = known.get(int(pos), set())
+            unseen: list[str] = []
+            for label in dict.fromkeys(labels):
+                if label != _CAT_MISSING and label not in fitted:
+                    unseen.append(label)
+                    if len(unseen) == 5:
+                        break
+            if unseen:
+                raise ValueError(
+                    f"feature {names[int(pos)]!r} has categorical value(s) the fit never saw: "
+                    f"{', '.join(map(repr, unseen))} (unknown_category='error')"
+                )
+
+    def _known_labels(self) -> dict[int, set[str]]:
+        """Each categorical input column's fitted labels, keyed by input position."""
+        model = getattr(self, "_multi_model", None) or self._model
+        to_input = self._raw_to_input_column()
+        return {to_input[raw]: set(labels) for raw, labels in model.categorical_labels()}
+
+    @property
+    def categories_(self) -> dict[str, list[str | None]]:
+        """The fitted levels of each categorical feature, keyed by feature name: every value
+        the fit saw, including those pooled into the ``"<rare>"`` level, with ``None`` for the
+        missing level when the fit saw nulls. Values are listed as the canonical strings
+        t-boost matches on (a numeric category ``1`` is ``"1"``)."""
+        check_is_fitted(self)
+        model = getattr(self, "_multi_model", None) or self._model
+        names = self._input_feature_names()
+        to_input = self._raw_to_input_column()
+        return {
+            names[to_input[raw]]: [None if label == _CAT_MISSING else label for label in labels]
+            for raw, labels in model.categorical_labels()
+        }
 
     def _default_fit_pool(self, n_features: int) -> int | None:
         """Fit-pool width when ``n_jobs=None`` (P1.1 diagnosis, plan/speed-campaign-2.md).
@@ -3647,6 +3829,16 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 raise ValueError("sample_weight sums to zero; no effective samples to fit")
         exposure32 = None
         if exposure is not None:
+            # Exposure enters as a log(exposure) offset on the raw score: a rate model under a
+            # log link, and the rare-event approximation under the logit link (BUG-056). Under
+            # the identity link it would add log(exposure) to a mean, which models nothing.
+            if _canonical_objective(self.objective) == "squared_error":
+                raise ValueError(
+                    "exposure is not supported with objective='squared_error': it enters as a "
+                    "log(exposure) offset, which has no meaning under the identity link. Use "
+                    "objective='poisson', 'gamma' or 'tweedie' for a rate model, or "
+                    "sample_weight to weight rows"
+                )
             exposure32 = _as_float32_1d(exposure, "exposure")
             if exposure32.shape[0] != y32.shape[0]:
                 raise ValueError(
@@ -5549,10 +5741,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             interactions (``"interaction"``, named ``"a:b"``) alike. ``True``: one contribution
             per input feature (``term_type="feature"``), each interaction shared equally among
             its features. These are exact interventional Shapley values.
-        return_format : {"records", "dataframe"}, default "records"
+        return_format : {"records", "dataframe", "matrix"}, default "records"
             ``"records"``: one dict per row with a nested ``contributions`` list.
             ``"dataframe"``: a long polars DataFrame, one row per ``(row_index, term)`` (per
             ``(row_index, class, term)`` for a multiclass model).
+            ``"matrix"``: a :class:`ContributionMatrix` holding a dense ``rows x terms``
+            float64 matrix whose terms are tuples of feature names, so feature names may
+            contain ``:``. An intercept-only model gives zero columns. With
+            ``split_interactions=True`` the columns are the fitted features in input order, a
+            feature no table uses being a zero column. The fastest format.
         validate : bool, default True
             Check both identities above against the model's own raw score and prediction (the
             class probabilities for a classifier), raising ``ValueError`` on a breach.
@@ -5579,8 +5776,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             For exposure on a non-log-link model, non-positive exposure, or a model saved by
             an older t-boost without its rating tables.
         """
-        if return_format not in ("records", "dataframe"):
-            raise ValueError(f"return_format must be 'records' or 'dataframe', got {return_format!r}")
+        if return_format not in ("records", "dataframe", "matrix"):
+            raise ValueError(
+                "return_format must be 'records', 'dataframe' or 'matrix', "
+                f"got {return_format!r}"
+            )
         model = self._deployed_tables()
         if is_polars_frame(X):
             names = getattr(self, "feature_names_in_", None)
@@ -5605,8 +5805,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         names = self._input_feature_names()
         to_input = self._raw_to_input_column()
         named = getattr(self, "feature_names_in_", None) is not None
+        matrix_format = return_format == "matrix"
+        # The matrix format names terms by tuple and never reads the per-row feature values.
         columns = [
-            _input_column_values(X, j, names[j] if named else None) for j in range(len(names))
+            [] if matrix_format else _input_column_values(X, j, names[j] if named else None)
+            for j in range(len(names))
         ]
 
         log_exposure = None
@@ -5623,9 +5826,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # One ladder per bank: a single-output model has one, a multiclass model one per class.
         ladders = []
         for f0, values, feature_sets in banks:
-            matrix, terms = _contribution_terms(
-                values, feature_sets, names, to_input, columns, split_interactions, n_rows
-            )
+            terms: list[tuple[str, str, list[Any]]]
+            if matrix_format and not split_interactions:
+                matrix, terms = np.asarray(values, dtype=np.float64), []
+            else:
+                matrix, terms = _contribution_terms(
+                    values, feature_sets, names, to_input, columns, split_interactions, n_rows
+                )
             # Summed left to right from f0, exactly as the native scorer sums, so the raw score
             # is reproduced to the last float64 bit before its float32 rounding.
             eta = np.cumsum(np.column_stack([np.full(n_rows, f0), values]), axis=1)[:, -1]
@@ -5646,6 +5853,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             mus = _inverse_link(etas, link)
         if validate:
             self._validate_contributions(X, etas, mus, log_exposure, atol, rtol)
+        if matrix_format:
+            return _contribution_matrix(
+                [(f0, matrix, sets) for (f0, matrix, _, _), (_, _, sets) in zip(ladders, banks)],
+                names, to_input, split_interactions, log_exposure is not None,
+                [_label_value(c) for c in self.classes_] if multiclass else None,
+            )
 
         family = "multinomial" if multiclass else _canonical_objective(self.objective)
         output_space = "response" if link == "identity" else "linear_predictor"
@@ -5707,6 +5920,39 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             else:
                 records.append({**head, **per_class[0]})
         return records
+
+    def cell_indices(self, X: Any) -> dict[tuple[str, ...], np.ndarray]:
+        """The rating-table cell every row of ``X`` scores in, per deployed table.
+
+        Keyed like :meth:`predict_contributions` ``return_format="matrix"`` terms and the
+        ``feature_names`` of :meth:`tables`: one entry per dense table, holding an
+        ``(n_rows, order)`` uint32 array with the row's cell on each of the table's axes, in
+        that table's axis order. ``values[numpy.ravel_multi_index(tuple(cells.T), shape)]``
+        of the exported table is the row's contribution from it. Over-budget effects kept in
+        factored form (``tables()["factored"]``) have no cells and are not listed.
+
+        The cells follow the rules documented under :meth:`tables`: numeric values compare
+        in float32, cell 0 is missing, and a value equal to a border lands in the lower cell.
+
+        Raises
+        ------
+        ValueError
+            For a multiclass model (one table bank per class), or a model saved by an older
+            t-boost without its rating tables.
+        """
+        model = self._deployed_tables()
+        if isinstance(model, _MultiClassTableModel):
+            raise ValueError("cell_indices supports regression and binary models only")
+        if is_polars_frame(X):
+            names = getattr(self, "feature_names_in_", None)
+            X = collect_frame(X, None if names is None else [str(n) for n in names])
+        x32, cat_kw = self._serve_kwargs(X, model)
+        names = self._input_feature_names()
+        to_input = self._raw_to_input_column()
+        out: dict[tuple[str, ...], np.ndarray] = {}
+        for raws, cells in model.table_cell_indices(x32, **cat_kw, n_jobs=self._resolve_n_jobs()):
+            out[tuple(names[to_input[raw]] for raw in raws)] = np.asarray(cells, dtype=np.uint32)
+        return out
 
     def _validate_contributions(
         self,
@@ -6139,6 +6385,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
+    unknown_category : {"default_cell", "error"}, default="default_cell"
+        What scoring does with a categorical value the fit never saw. ``"default_cell"``
+        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
+        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+        ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
+        feature and up to five unseen values. A null is never unknown: it scores in the
+        missing level. The fitted levels are listed in ``categories_``.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -6551,6 +6804,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostRegressor
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_bytes(data)
@@ -6576,6 +6840,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostRegressor
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_json(data)
@@ -6867,6 +7142,26 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             relativity is ``values``/``relativities`` at that ``cell`` index; levels the
             model cannot distinguish correctly share one ``cell``. ``None`` for a purely
             numeric axis.
+
+        Notes
+        -----
+        How a row finds its cell (:meth:`cell_indices` returns them):
+
+        - ``values``, ``relativities`` and ``support`` are flattened row-major (C order) over
+          ``shape``, one dimension per entry of ``axes``.
+        - A numeric axis with borders ``b[0] < ... < b[m-1]`` has ``m + 2`` cells. Cell 0
+          holds missing values (NaN or null). A value ``v`` lands in cell
+          ``1 + #{i : b[i] < v}``: cells are right-closed, ``(b[i-1], b[i]]``, so a value
+          equal to a border lands in the lower cell.
+        - Values are converted to float32 before the comparison, and ``borders`` are exported
+          as exactly the float32 values compared against. A float64 value that rounds onto a
+          border therefore lands in the lower cell.
+        - A categorical axis maps each fitted level, including the members pooled into
+          ``"<rare>"`` (listed under ``members``) and the missing level, to a cell through
+          ``levels``. A level the fit never saw scores in ``default_cell``. Cells that hold
+          no level can exist (their ``support`` is 0).
+        - On a banded table an axis's borders are the band edges, which is why two tables on
+          the same feature may list different borders.
         """
         check_is_fitted(self, "_model")
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
@@ -7265,6 +7560,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Number of threads used for fitting and prediction, following the joblib/sklearn
         convention: ``None`` uses the native default (all cores), ``-1`` means all cores,
         and a negative ``n`` means ``cpu_count + 1 + n`` (so ``-2`` is all-but-one core).
+    unknown_category : {"default_cell", "error"}, default="default_cell"
+        What scoring does with a categorical value the fit never saw. ``"default_cell"``
+        scores it in the axis's ``default_cell`` (the encoder's base level), silently.
+        ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
+        ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
+        feature and up to five unseen values. A null is never unknown: it scores in the
+        missing level. The fitted levels are listed in ``categories_``.
     monotone_constraints : sequence, dict, or None, default=None
         Per-feature monotonicity constraints on the fitted function. ``None`` (the default)
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
@@ -7705,6 +8007,17 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostClassifier
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         # The TBP1 envelope carries the estimator metadata; inner is a binary Model blob or a
@@ -7736,6 +8049,17 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         -------
         TBoostClassifier
             A new, already-fitted estimator instance.
+
+        Notes
+        -----
+        Compatibility rule: a release reads every document whose envelope ``schema_version``
+        is at most its own (``5`` since 0.6.3) and whose native model ``schema_version`` lies in
+        its supported range, plus the bare native blobs written before the envelope existed.
+        Any document it reads predicts identically to the release that wrote it. A newer
+        document raises ``SerializationError`` naming both versions, never a partial load.
+        ``t_boost_version`` in the header records the writer and is informational: the schema
+        versions alone decide readability. A categorical model saved by 0.6.x (envelope
+        schema 1) is refused, because its missing-value level was labelled differently.
         """
         est = cls()
         md, inner = _unpack_json(data)
@@ -7874,6 +8198,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
+        unknown_category: str = "default_cell",
     ) -> None:
         super().__init__(
             n_trees=n_trees,
@@ -7899,6 +8224,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             early_stopping_adaptive=early_stopping_adaptive,
             prune_size_penalty=prune_size_penalty,
             early_stopping=early_stopping,
+            unknown_category=unknown_category,
             early_stopping_min_delta=early_stopping_min_delta,
             interaction_gain_hurdle=interaction_gain_hurdle,
             interaction_gain_hurdle_mode=interaction_gain_hurdle_mode,
@@ -8597,6 +8923,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             A JSON document describing every exported effect table (features, shape,
             values, per-cell support, and standard-error band), one bank per class for
             multiclass fits.
+
+        Notes
+        -----
+        Cell lookup follows :meth:`TBoostRegressor.tables`: row-major ``values``; numeric
+        cell 0 is missing and cells are right-closed, ``(b[i-1], b[i]]``, compared in float32
+        against the exported float32 ``borders``; categorical levels (pooled members under
+        ``"<rare>"``) map to cells through ``levels``, unseen levels to ``default_cell``.
         """
         check_is_fitted(self)
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)

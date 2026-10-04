@@ -4690,8 +4690,37 @@ struct PyModel {
     model: Arc<Model>,
 }
 
+/// Union of each class's `known_labels`, per raw feature, keeping first-seen order.
+fn merged_class_labels<'a>(
+    stores: impl Iterator<Item = &'a t_boost_core::cat::CatEncoderStore>,
+) -> Vec<(u32, Vec<String>)> {
+    let mut out: std::collections::BTreeMap<u32, Vec<String>> = std::collections::BTreeMap::new();
+    for store in stores {
+        for (raw, labels) in store.known_labels() {
+            let merged = out.entry(raw).or_default();
+            for label in labels {
+                if !merged.contains(&label) {
+                    merged.push(label);
+                }
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
 #[pymethods]
 impl PyModel {
+    /// Every training label of each categorical raw feature, as `(raw id, labels)` in raw
+    /// order (see `CatEncoderStore::known_labels`).
+    fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
+        self.model
+            .schema
+            .cat_encoders
+            .known_labels()
+            .into_iter()
+            .collect()
+    }
+
     /// The `max_delta_step_gated` rate-collapse detector's report for the fit that produced
     /// this model, or `None` when no gate was armed (or the model was loaded from disk — the
     /// report is runtime-only and never serialized).
@@ -5981,6 +6010,51 @@ impl PyTableModel {
         })
     }
 
+    /// Each dense table's cell of every row: one `(n_rows, order)` uint32 array per table,
+    /// paired with its raw feature ids, in table order. Banded axes report the band, so the
+    /// coordinates index the exported table's `values` (row-major) directly.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of (ids, array) Python tuples.
+    fn table_cell_indices<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
+    ) -> PyResult<Vec<(Vec<u32>, Bound<'py, PyArray2<u32>>)>> {
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let (blocks, n_rows) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    let ts = table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(&model, columns, cats, Some(&ts.cats))?;
+                    Ok((model.table_cells(&binned)?, binned.n_rows as usize))
+                })
+            })
+            .map_err(py_err)?;
+        self.model
+            .bank
+            .tables
+            .iter()
+            .zip(blocks)
+            .map(|(table, block)| {
+                let ids: Vec<u32> = table.u.0.iter().map(|f| f.0).collect();
+                let order = table.axes.len();
+                let array = block
+                    .into_pyarray(py)
+                    .reshape([n_rows, order])
+                    .map_err(|err| {
+                        InternalError::new_err(format!("could not reshape cell-index array: {err}"))
+                    })?;
+                Ok((ids, array))
+            })
+            .collect()
+    }
+
     /// Band every interaction table of this deployed model (see `t_boost_core::banding`): each
     /// becomes a small product grid of bands with the change to predictions held within
     /// `(tolerance · sigma)²` (cross-fitted, curvature-weighted mean squared move on the training
@@ -6067,6 +6141,17 @@ impl PyTableModel {
             },
             report,
         ))
+    }
+
+    /// Every training label of each categorical raw feature, as `(raw id, labels)` in raw
+    /// order (see `CatEncoderStore::known_labels`).
+    fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
+        self.model
+            .schema
+            .cat_encoders
+            .known_labels()
+            .into_iter()
+            .collect()
     }
 
     /// One display name per raw feature, in the raw-feature order `cell_indices` uses.
@@ -6180,6 +6265,11 @@ struct PyMultiClassModel {
 
 #[pymethods]
 impl PyMultiClassModel {
+    /// `categorical_labels` merged over every class's encoders (each label once per feature).
+    fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
+        merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
+    }
+
     #[staticmethod]
     fn from_json(s: &str) -> PyResult<Self> {
         Ok(Self {
@@ -6699,6 +6789,11 @@ struct PyMultiClassTableModel {
 
 #[pymethods]
 impl PyMultiClassTableModel {
+    /// `categorical_labels` merged over every class's encoders (each label once per feature).
+    fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
+        merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
+    }
+
     #[staticmethod]
     fn from_json(s: &str) -> PyResult<Self> {
         Ok(Self {
