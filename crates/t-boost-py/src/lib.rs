@@ -31,11 +31,11 @@ use t_boost_core::data::{
     bin, bin_columns, bin_serve_columns, bin_serve_columns_coded, bin_serve_columns_with,
     bin_train_columns_with_holdout, AxisKind, AxisProvenance, BinConfig, BinnedMatrix,
     CatServeMaps, CategoricalColumn, FeatureId, NumericColumn, ServeBinnedMatrix,
-    ServeCategoricalCodes, ServeCategoricalColumn,
+    ServeCategoricalCodes, ServeCategoricalColumn, TrainBinnedMatrix,
 };
 use t_boost_core::engine::{
     Booster, Config, FitSpec, GatedStepPolicy, HistPrecision, InteractionGainHurdleMode, Model,
-    MultiClassModel, Sampling,
+    MultiClassModel, RoundEvent, RoundObserver, Sampling,
 };
 use t_boost_core::error::{Invariant, PbError};
 use t_boost_core::explain::{
@@ -4037,6 +4037,7 @@ impl PyBooster {
             incremental_mu,
             hist_precision: parse_hist_precision(hist_precision.as_deref()).map_err(py_err)?,
             boosters,
+            fit_control: Default::default(),
         };
         config.validate().map_err(py_err)?;
         let bin_config = BinConfig {
@@ -4127,7 +4128,7 @@ impl PyBooster {
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, eval_x=None, eval_y=None, eval_cat_x=None, eval_weight=None, eval_exposure=None, observer=None, record_history=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -4148,6 +4149,19 @@ impl PyBooster {
         // the engine's own row-level carve, byte-identical to before this argument existed.
         es_holdout: Option<Vec<bool>>,
         bag_groups: Option<PyReadonlyArray1<'_, u32>>,
+        // External evaluation set (R1): rows laid out like `x`/`cat_x` that only score early
+        // stopping. Binned on the fit rows' grids and encoders, never trained on.
+        eval_x: Option<PyReadonlyArray2<'_, f32>>,
+        eval_y: Option<PyReadonlyArray1<'_, f32>>,
+        eval_cat_x: Option<Vec<Vec<String>>>,
+        eval_weight: Option<PyReadonlyArray1<'_, f32>>,
+        eval_exposure: Option<PyReadonlyArray1<'_, f32>>,
+        // `observer(bag, round, n_trees, train_deviance, eval_deviance) -> bool` after every
+        // boosting round, on this thread; truthy stops every bag. An exception stops the fit
+        // and propagates.
+        observer: Option<Py<PyAny>>,
+        // Keep each bag's per-round deviances for `fit_report`.
+        record_history: bool,
     ) -> PyResult<PyModel> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4162,24 +4176,47 @@ impl PyBooster {
         let y = array1_to_vec(y, "y")?;
         let weight = weight.map(|w| array1_to_vec(w, "weight")).transpose()?;
         let exposure = exposure.map(|e| array1_to_vec(e, "exposure")).transpose()?;
-        let state = self.clone();
-        let model = py
-            .detach(move || {
-                fit_owned(
-                    state,
-                    columns,
-                    y,
-                    weight,
-                    exposure,
-                    feature_names,
-                    class_labels,
-                    monotone,
-                    cat_x,
-                    es_holdout,
-                    bag_groups,
-                )
-            })
-            .map_err(py_err)?;
+        let eval = match (eval_x, eval_y) {
+            (Some(ex), Some(ey)) => Some(EvalRows {
+                columns: raw_columns_from_array(ex)?,
+                y: array1_to_vec(ey, "eval_y")?,
+                cat_x: eval_cat_x,
+                weight: eval_weight
+                    .map(|w| array1_to_vec(w, "eval_weight"))
+                    .transpose()?,
+                exposure: eval_exposure
+                    .map(|e| array1_to_vec(e, "eval_exposure"))
+                    .transpose()?,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(py_err(PbError::InvalidInput {
+                    what: "eval_x and eval_y must be given together".into(),
+                }))
+            }
+        };
+        let mut state = self.clone();
+        state.config.fit_control.record_history = record_history;
+        let run = move |state: PyBooster| {
+            fit_owned(
+                state,
+                columns,
+                y,
+                weight,
+                exposure,
+                feature_names,
+                class_labels,
+                monotone,
+                cat_x,
+                es_holdout,
+                bag_groups,
+                eval,
+            )
+        };
+        let model = match observer {
+            None => py.detach(move || run(state)).map_err(py_err)?,
+            Some(observer) => fit_with_observer(py, state, observer, run)?,
+        };
         Ok(PyModel {
             model: Arc::new(model),
         })
@@ -4728,6 +4765,26 @@ impl PyModel {
     /// Keys: `engaged`, `engaged_round`, `bags_engaged`, `bags_total`, `min_log_rate_ratio`
     /// (the most extreme `ln(mu / weighted mean rate)` seen — the calibration signal: how far
     /// a SILENT fit was from tripping), `log_threshold`, `capped_step`, `rounds_checked`.
+    /// Per-bag boosting report of a fresh fit, in bag order: `(trees_kept, rounds_trained,
+    /// stop_reason, train_deviance_history, eval_deviance_history)`. `None` on a loaded model.
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of Python tuples.
+    fn fit_report(&self) -> Option<Vec<(u32, u32, String, Vec<f64>, Vec<f64>)>> {
+        self.model.fit_report.as_ref().map(|reports| {
+            reports
+                .iter()
+                .map(|r| {
+                    (
+                        r.trees_kept,
+                        r.rounds_trained,
+                        r.reason.as_str().to_owned(),
+                        r.train_deviance.clone(),
+                        r.eval_deviance.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     #[getter]
     fn delta_step_gate<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyDict>>> {
         let Some(r) = self.model.delta_step_gate else {
@@ -7314,6 +7371,7 @@ fn fit_owned(
     cat_x: Option<Vec<Vec<String>>>,
     es_holdout: Option<Vec<bool>>,
     bag_groups: Option<Vec<u32>>,
+    eval: Option<EvalRows>,
 ) -> Result<Model, PbError> {
     let n_numeric = columns.len();
     let n_cat = cat_x.as_ref().map_or(0, Vec::len);
@@ -7332,6 +7390,7 @@ fn fit_owned(
     // leakage-free. Ordered/LeaveOneOut have subtler profiles (the LOO target-encoding
     // pathology), so keep them gated with internal early stopping for now.
     if cat_x.is_some()
+        && eval.is_none()
         && state.config.validation_fraction.is_some()
         && matches!(state.cat_config.leakage, LeakageScheme::LeaveOneOut)
     {
@@ -7346,8 +7405,8 @@ fn fit_owned(
     // on this ambient pool, so total worker threads stay at the resolved local width. Sized to
     // `state.fit_pool_width` (the scheduling heuristic) when set, else `state.n_jobs` — see
     // `run_fit_pool`'s doc for why the two are kept separate.
-    let run = || {
-        fit_model_ambient_bagged(
+    let run = || match &eval {
+        None => fit_model_ambient_bagged(
             &state,
             &columns,
             &y,
@@ -7359,9 +7418,369 @@ fn fit_owned(
             cat_x.as_deref(),
             es_holdout.as_deref(),
             bag_groups.as_deref(),
-        )
+        ),
+        Some(eval) => fit_with_eval_rows(
+            &state,
+            &columns,
+            &y,
+            weight.as_deref(),
+            exposure.as_deref(),
+            feature_names,
+            class_labels,
+            &monotone_map,
+            cat_x.as_deref(),
+            es_holdout.as_deref(),
+            bag_groups.as_deref(),
+            eval,
+        ),
     };
     run_fit_pool(state.n_jobs, state.fit_pool_width, run)
+}
+
+/// An external evaluation set for [`fit_with_eval_rows`]: rows laid out like the fit design.
+struct EvalRows {
+    columns: Vec<Vec<f32>>,
+    cat_x: Option<Vec<Vec<String>>>,
+    y: Vec<f32>,
+    weight: Option<Vec<f32>>,
+    exposure: Option<Vec<f32>>,
+}
+
+/// Run `fit` on a worker thread while this (the calling) thread serves `observer`: each round
+/// event is handed over a channel, the Python callable runs here with the GIL, and its verdict
+/// goes back to the waiting bag. Once it returns truthy or raises, every later event is told
+/// to stop, so all bags wind down; an exception is re-raised unchanged after the fit thread
+/// finishes (its model is discarded).
+fn fit_with_observer<F>(
+    py: Python<'_>,
+    mut state: PyBooster,
+    observer: Py<PyAny>,
+    fit: F,
+) -> PyResult<Model>
+where
+    F: FnOnce(PyBooster) -> Result<Model, PbError> + Send,
+{
+    type Pending = (RoundEvent, std::sync::mpsc::SyncSender<bool>);
+    let (tx, rx) = std::sync::mpsc::channel::<Pending>();
+    let tx = std::sync::Mutex::new(tx);
+    state.config.fit_control.observer = Some(RoundObserver(Arc::new(move |event: &RoundEvent| {
+        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+        let sent = tx
+            .lock()
+            .map(|sender| sender.send((*event, reply_tx)).is_ok())
+            .unwrap_or(false);
+        // No listener left (it stopped serving) means stop.
+        !sent || reply_rx.recv().unwrap_or(true)
+    })));
+    let (outcome, raised) = py.detach(move || {
+        std::thread::scope(|scope| {
+            let worker = scope.spawn(move || fit(state));
+            let mut raised: Option<PyErr> = None;
+            let mut stop = false;
+            for (event, reply) in rx.iter() {
+                if !stop {
+                    let verdict = Python::attach(|py| -> PyResult<bool> {
+                        observer
+                            .bind(py)
+                            .call1((
+                                event.bag,
+                                event.round,
+                                event.n_trees,
+                                event.train_deviance,
+                                event.eval_deviance,
+                            ))?
+                            .is_truthy()
+                    });
+                    match verdict {
+                        Ok(v) => stop = v,
+                        Err(err) => {
+                            raised = Some(err);
+                            stop = true;
+                        }
+                    }
+                }
+                // A bag that already finished no longer listens; nothing to do then.
+                let _ = reply.send(stop);
+            }
+            (worker.join(), raised)
+        })
+    });
+    if let Some(err) = raised {
+        return Err(err);
+    }
+    match outcome {
+        Ok(result) => result.map_err(py_err),
+        Err(_) => Err(InternalError::new_err("the fit thread panicked")),
+    }
+}
+
+/// [`fit_model_ambient_bagged`] with an external evaluation set (R1). The numeric grids and
+/// categorical encoders are fit on the fit rows alone; the evaluation rows are then binned
+/// through them exactly as serving bins unseen rows, appended, and marked as the shared
+/// early-stopping holdout, with [`FitControl::external_holdout`] keeping their targets out of
+/// the intercept and the slope recalibration. Bags never draw them and the cell refit never
+/// sees them (holdout rows are in-bag for everyone).
+#[allow(clippy::too_many_arguments)]
+fn fit_with_eval_rows(
+    state: &PyBooster,
+    columns: &[Vec<f32>],
+    y: &[f32],
+    weight: Option<&[f32]>,
+    exposure: Option<&[f32]>,
+    feature_names: Option<Vec<String>>,
+    class_labels: Option<Vec<String>>,
+    monotone_map: &MonotoneMap,
+    cat_x: Option<&[Vec<String>]>,
+    es_holdout: Option<&[bool]>,
+    bag_groups: Option<&[u32]>,
+    eval: &EvalRows,
+) -> Result<Model, PbError> {
+    if es_holdout.is_some() {
+        return Err(PbError::InvalidConfig {
+            what: "an external evaluation set replaces es_holdout; pass one or the other".into(),
+        });
+    }
+    if eval.columns.len() != columns.len()
+        || eval.cat_x.as_ref().map(Vec::len) != cat_x.map(<[Vec<String>]>::len)
+    {
+        return Err(PbError::ShapeMismatch {
+            what: "eval_x must have the same numeric and categorical columns as x".into(),
+        });
+    }
+    if exposure.is_some() != eval.exposure.is_some() {
+        return Err(PbError::InvalidInput {
+            what: "exposure and eval_exposure must be given together".into(),
+        });
+    }
+    let n_fit = y.len();
+    let n_eval = eval.y.len();
+    if n_eval == 0 {
+        return Err(PbError::InvalidInput {
+            what: "the evaluation set has no rows".into(),
+        });
+    }
+    let n_rows = u32::try_from(n_fit + n_eval).map_err(|_| PbError::InvalidInput {
+        what: "more than u32::MAX rows is out of scope for v1".into(),
+    })?;
+    for (what, len) in eval
+        .columns
+        .iter()
+        .map(|c| ("eval_x column", c.len()))
+        .chain(
+            eval.cat_x
+                .iter()
+                .flatten()
+                .map(|c| ("eval_cat_x column", c.len())),
+        )
+        .chain(eval.weight.iter().map(|w| ("eval_weight", w.len())))
+        .chain(eval.exposure.iter().map(|e| ("eval_exposure", e.len())))
+    {
+        if len != n_eval {
+            return Err(PbError::ShapeMismatch {
+                what: format!("{what} len {len} != eval_y len {n_eval}"),
+            });
+        }
+    }
+    let joined = |fit: Option<&[f32]>, ev: Option<&[f32]>| -> Option<Vec<f32>> {
+        if fit.is_none() && ev.is_none() {
+            return None;
+        }
+        let mut out = fit.map_or_else(|| vec![1.0; n_fit], <[f32]>::to_vec);
+        out.extend_from_slice(ev.unwrap_or(&vec![1.0; n_eval]));
+        Some(out)
+    };
+    let all_y: Vec<f32> = y.iter().chain(&eval.y).copied().collect();
+    let all_weight = joined(weight, eval.weight.as_deref());
+    let all_exposure = joined(exposure, eval.exposure.as_deref());
+    let mask: Vec<bool> = (0..n_fit + n_eval).map(|r| r >= n_fit).collect();
+    let n_numeric = columns.len();
+    let loss = state.objective.instantiate()?;
+    let mut config = state.config.clone();
+    config.fit_control.external_holdout = true;
+    let spec = FitSpec {
+        loss: loss.as_loss(),
+        weight: all_weight.as_deref(),
+        exposure: all_exposure.as_deref(),
+        monotone: monotone_map.clone(),
+        interaction: state.interaction.clone(),
+        credibility: state.credibility,
+        fixed_holdout: Some(&mask),
+        bag_groups: None,
+        seed: state.seed,
+    };
+    // Bag groups cover the fit rows; the holdout rows are never drawn, so any id serves them.
+    let all_groups: Option<Vec<u32>> = bag_groups.map(|g| {
+        let mut out = g.to_vec();
+        out.resize(n_fit + n_eval, 0);
+        out
+    });
+    let spec = FitSpec {
+        bag_groups: all_groups.as_deref(),
+        ..spec
+    };
+    let append = |mut fit: BinnedMatrix, ev: BinnedMatrix| -> Result<BinnedMatrix, PbError> {
+        if fit.data.len() != ev.data.len() {
+            return Err(PbError::Internal {
+                what: "evaluation design has a different axis count".into(),
+            });
+        }
+        for (dst, src) in fit.data.iter_mut().zip(ev.data) {
+            dst.extend(src);
+        }
+        fit.n_rows = n_rows;
+        Ok(fit)
+    };
+    let mut cat_axes_per_raw: Option<Vec<Vec<TsEncodingId>>> = None;
+    let mut model = match cat_x {
+        None => {
+            let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
+            let fit_x = bin_columns(&refs, weight, &state.bin_config, state.seed)?;
+            let mut ev = BinnedMatrix {
+                data: Vec::with_capacity(n_numeric),
+                n_rows: u32::try_from(n_eval).unwrap_or(u32::MAX),
+                grids: fit_x.grids.clone(),
+                provenance: fit_x.provenance.clone(),
+            };
+            for (values, grid) in eval.columns.iter().zip(&fit_x.grids) {
+                ev.data.push(
+                    values
+                        .iter()
+                        .map(|&v| bin(v, grid))
+                        .collect::<Result<Vec<u8>, _>>()?,
+                );
+            }
+            let x = append(fit_x, ev)?;
+            Booster::with_config(config).fit(&x, &all_y, &spec)?
+        }
+        Some(cats) => {
+            let eval_cats = eval.cat_x.as_deref().unwrap_or(&[]);
+            let numeric = columns
+                .iter()
+                .enumerate()
+                .map(|(i, values)| {
+                    Ok::<_, PbError>(NumericColumn {
+                        raw: FeatureId(raw_id(i)?),
+                        values,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let cat_cols = cats
+                .iter()
+                .enumerate()
+                .map(|(j, levels)| {
+                    let raw = FeatureId(raw_id(n_numeric + j)?);
+                    let ids = categorical_channel_ids(
+                        levels,
+                        weight,
+                        exposure,
+                        state.cat_channels,
+                        &state.cat_config,
+                        state.cat_count_min_levels,
+                        state.cat_class_freq_min_levels,
+                        None,
+                    )?;
+                    let cols = ids
+                        .iter()
+                        .map(|&id| {
+                            Ok::<_, PbError>(CategoricalColumn {
+                                raw,
+                                id,
+                                levels,
+                                config: cat_channel_config(
+                                    id,
+                                    &state.cat_config,
+                                    state.cat_count_config.as_ref(),
+                                    &[],
+                                )?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok::<_, PbError>((ids, cols))
+                })
+                .collect::<Result<Vec<(Vec<TsEncodingId>, Vec<_>)>, _>>()?;
+            let axes: Vec<Vec<TsEncodingId>> =
+                cat_cols.iter().map(|(ids, _)| ids.clone()).collect();
+            let cat_spec = FitSpec {
+                monotone: expand_monotone_map_for_cat_channels(&spec.monotone, n_numeric, &axes)?,
+                ..spec
+            };
+            let categorical = cat_cols
+                .into_iter()
+                .flat_map(|(_, cols)| cols)
+                .collect::<Vec<_>>();
+            let fitted = bin_train_columns_with_holdout(
+                &numeric,
+                &categorical,
+                y,
+                weight,
+                exposure,
+                &state.bin_config,
+                state.seed,
+                None,
+            )?;
+            let eval_numeric = eval
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(i, values)| {
+                    Ok::<_, PbError>(NumericColumn {
+                        raw: FeatureId(raw_id(i)?),
+                        values,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let eval_categorical = axes
+                .iter()
+                .zip(eval_cats)
+                .enumerate()
+                .flat_map(|(j, (ids, levels))| {
+                    ids.iter().map(move |&id| {
+                        Ok::<_, PbError>(ServeCategoricalColumn {
+                            raw: FeatureId(raw_id(n_numeric + j)?),
+                            id,
+                            levels,
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let train = fitted.train.0;
+            let ev = bin_serve_columns(
+                &eval_numeric,
+                &eval_categorical,
+                &train.grids,
+                &train.provenance,
+                &fitted.cat_encoders,
+            )?;
+            let x = TrainBinnedMatrix(append(train, ev.0)?);
+            cat_axes_per_raw = Some(axes);
+            Booster::with_config(config).fit_train(&x, &all_y, &cat_spec, fitted.cat_encoders)?
+        }
+    };
+    // Bag membership is reported over the FIT rows only (the holdout rows were in every bag).
+    if let Some(in_bag) = model.bag_in_bag.as_mut() {
+        for bag in in_bag {
+            bag.truncate(n_fit);
+        }
+    }
+    if let Some(names) = feature_names {
+        let names = match &cat_axes_per_raw {
+            Some(axes) => expand_feature_names_for_cat_channels(names, n_numeric, axes)?,
+            None => names,
+        };
+        if names.len() != model.schema.feature_names.len() {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "feature_names len {} != n_features {}",
+                    names.len(),
+                    model.schema.feature_names.len()
+                ),
+            });
+        }
+        model.schema.feature_names = names;
+    }
+    model.schema.class_labels = class_labels;
+    model.validate()?;
+    Ok(model)
 }
 
 /// Fit a single-output [`Model`] on the **ambient** rayon pool (no pool of its own): bin the

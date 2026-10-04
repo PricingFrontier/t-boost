@@ -892,6 +892,10 @@ pub struct Model {
     /// bit-identical model" would stop being checkable by comparing models.
     #[serde(skip)]
     pub delta_step_gate: Option<DeltaStepGateReport>,
+    /// Runtime-only per-bag boosting report (round counts, stop reasons, optional history),
+    /// one entry per bag in bag order. `None` on loaded models and on non-fit constructions.
+    #[serde(skip)]
+    pub fit_report: Option<Vec<BagFitReport>>,
 }
 
 impl PartialEq for Model {
@@ -2017,6 +2021,99 @@ pub struct Config {
     /// this: a caller who named a cap gets exactly that cap for the whole fit, gate or no gate.
     /// See [`GatedDeltaStep`] for the signal, the engage semantics, and the evidence.
     pub max_delta_step_gated: GatedStepPolicy,
+    /// Run-time controls that never change what a round computes: an external evaluation
+    /// holdout, per-round history, a round observer. The default is inert (bit-identical).
+    pub fit_control: FitControl,
+}
+
+/// Run-time controls of a single-output fit ([`Config::fit_control`]).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FitControl {
+    /// The [`FitSpec::fixed_holdout`] rows are an external evaluation set, not fit rows: they
+    /// only score early stopping. The holdout slope recalibration (`reanchor_slope`) is skipped
+    /// and the intercept re-anchor uses the training rows only.
+    pub external_holdout: bool,
+    /// Record each round's stopping deviance in [`BagFitReport`] (and the training deviance
+    /// too when an observer is set, which computes it).
+    pub record_history: bool,
+    /// Called after every boosting round; returning `true` stops this fit's boosting.
+    pub observer: Option<RoundObserver>,
+    /// This fit's bag index, reported in [`RoundEvent::bag`] (set by the outer bag).
+    pub bag: u32,
+}
+
+/// One boosting round, as a [`RoundObserver`] sees it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RoundEvent {
+    /// Bag index (0 for an unbagged fit).
+    pub bag: u32,
+    /// Round number, 1-based.
+    pub round: u32,
+    /// The configured round ceiling.
+    pub n_trees: u32,
+    /// Mean deviance on the rows this bag trains on, after the round.
+    pub train_deviance: f64,
+    /// Mean deviance on the early-stopping rows after the round; `None` without them.
+    pub eval_deviance: Option<f64>,
+}
+
+/// A per-round hook ([`FitControl::observer`]). Shared by every bag of a fit, so it may be
+/// called concurrently; bags call it in round order each.
+#[derive(Clone)]
+pub struct RoundObserver(pub std::sync::Arc<dyn Fn(&RoundEvent) -> bool + Send + Sync>);
+
+impl std::fmt::Debug for RoundObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RoundObserver")
+    }
+}
+
+impl PartialEq for RoundObserver {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Why a fit's boosting loop ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// Ran every configured round.
+    MaxTrees,
+    /// Early-stopping patience ran out.
+    EarlyStopping,
+    /// No admissible split cleared the floors.
+    NoSplit,
+    /// A [`RoundObserver`] asked to stop.
+    Callback,
+}
+
+impl StopReason {
+    /// The stable name used in reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxTrees => "max_trees",
+            Self::EarlyStopping => "early_stopping",
+            Self::NoSplit => "no_split",
+            Self::Callback => "callback",
+        }
+    }
+}
+
+/// How one bag's boosting went (runtime-only; see [`Model::fit_report`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct BagFitReport {
+    /// Trees the bag kept (after any early-stopping truncation).
+    pub trees_kept: u32,
+    /// Rounds the bag trained.
+    pub rounds_trained: u32,
+    /// Why the loop ended.
+    pub reason: StopReason,
+    /// Per-round training deviance, when [`FitControl::record_history`] and an observer are set.
+    pub train_deviance: Vec<f64>,
+    /// Per-round stopping deviance, when [`FitControl::record_history`] is set and stopping
+    /// rows exist.
+    pub eval_deviance: Vec<f64>,
 }
 
 /// How [`Config::max_delta_step_gated`] resolves. Tri-state on purpose: `None`-as-"auto" and
@@ -2108,6 +2205,7 @@ impl Default for Config {
             boosters: crate::boosters::BoosterConfig::default(),
             lambda_scale_invariant: false,
             max_delta_step_gated: GatedStepPolicy::Objective,
+            fit_control: FitControl::default(),
         }
     }
 }

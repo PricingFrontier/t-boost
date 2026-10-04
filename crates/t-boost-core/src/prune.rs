@@ -1970,6 +1970,7 @@ fn bag_member_model(
         bag_intercepts: None,
         bag_in_bag: None,
         delta_step_gate: None,
+        fit_report: None,
     })
 }
 
@@ -4715,6 +4716,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let serve = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![1, 2, 3]],

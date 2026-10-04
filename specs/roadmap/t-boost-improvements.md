@@ -56,7 +56,7 @@ rounds and no stopping reason, and there is no loss curve and no progress during
 | R5 | An official metadata slot in the saved model | P2 | Self-describing `.tboost` files without relying on unknown-key tolerance |
 | R6 | Arbitrary link-scale `offset` | P2 | Offsets under RMSE and Logloss |
 | R7 | Unknown-category policy | P2 | Haute stops pre-checking categorical levels |
-| R8 | Refuse `exposure` under `squared_error` and logistic | P3 | One less silent case |
+| R8 | Refuse `exposure` under `squared_error` | P3 | One less silent case |
 | R9 | Contributions as a matrix keyed by feature tuples | P2 | Faster explanations; feature names may contain `:` |
 | R10 | Public cell indices and documented border semantics | P2 | Cell-level validation and unfolding into rating tables |
 | R11 | Typed top-level imports | P3 | Cleaner adapter |
@@ -134,8 +134,8 @@ training row trains, and the deployed model is the one validated.
 | `stopping_reason_` | One summary: `"callback"` if any bag was stopped by a callback, else `"early_stopping"` if any bag early-stopped, else `"no_split"` if any bag ran out of admissible splits, else `"max_trees"` |
 
 **Semantics.** The counts describe the deployed fit's boosting, before pruning; pruning does
-not change them. A multiclass fit reports one entry (its classes advance together). A
-model saved by 0.6.2 or earlier loads with these attributes set to `None`.
+not change them. They are `None` for a multiclass fit (outside Haute's scope) and for a model
+saved by 0.6.2 or earlier.
 
 **Tests t-boost ships.** Each stopping reason is produced by a constructed fit; the
 attributes survive both formats; a fit without early stopping reports `"max_trees"` and
@@ -160,7 +160,8 @@ def on_round(info: dict) -> bool | None:
 `info` holds `phase` (`"fit"` for the deployed fit, `"prune_fold"` for a pruning fold
 fit), `bag`, `n_bags`, `round` (1-based), `n_trees` (the ceiling), `train_deviance` and
 `eval_deviance` (the stopping deviance on the `eval_set` or the internal holdout; `None`
-when there is none). And a fitted `evals_result_` for the deployed fit:
+when there is none). With `eval_set` or `callbacks`, a fitted `evals_result_` for the deployed
+fit:
 
 ```python
 {"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}  # per bag, per round
@@ -168,6 +169,10 @@ when there is none). And a fitted `evals_result_` for the deployed fit:
 
 **Semantics.** Deviances are the objective's mean deviance, weighted by `sample_weight`
 (with exposure as an offset for the log-link objectives), as early stopping measures it.
+Only the deployed fit reports; the pruning fold fits do not call back (`phase` is always
+`"fit"` today). The `"eval"` curve is free (early stopping computes it); the `"train"` curve
+costs an extra pass per round (10-20% of fit time measured on 300k rows), so it is computed
+only when callbacks are given.
 Bags run in parallel, so calls for different bags interleave; within a bag rounds arrive
 in order. Callbacks run on the calling thread, so they may touch Python state and may
 raise: an exception stops every bag and propagates unchanged. Returning `True` stops every
@@ -216,15 +221,20 @@ meaningful only under the log-link objectives.
 `predict_contributions`: a link-scale term added to every row's raw score, under any
 regression or binary objective. `exposure` keeps its meaning; supplying both adds both.
 
-**Semantics.** The offset is never learned, purified into the tables, or counted as mass.
-At scoring time it is optional, like `exposure`: omitted, the model scores on a zero
-offset (as XGBoost's `base_margin` and LightGBM's `init_score` do). Given, it is added to
-the raw score, and `predict_contributions` reports it as an `"offset"` term, so
-`base_value + sum(contributions)` equals the raw score including it. Multiclass rejects it.
+**Semantics.** The offset is never learned or purified into the tables. Under
+`squared_error` the fit is exactly the fit of `y - offset`. Under the log and logit links it
+joins the exposure offset (`log(exposure) + offset`), which is exact for fitting and scoring;
+as with exposure there, it also scales the row's mass in the tables' reference measure and
+`support` (the engine derives that mass from the offset). A Poisson fit with
+`offset=log(e)` is the fit with `exposure=e`. At scoring time the offset is optional, like
+`exposure`: omitted, the model scores on a zero offset (as XGBoost's `base_margin` and
+LightGBM's `init_score` do). Given, it is added to the raw score, and
+`predict_contributions` reports it as an `"offset"` term, so `base_value +
+sum(contributions)` equals the raw score including it. Multiclass rejects it.
 
-**Tests t-boost ships.** A constant offset under `squared_error` shifts predictions by that
-constant; a varying offset is added exactly in `predict_raw`; the fit learns around it;
-contributions stay exact with it.
+**Tests t-boost ships.** Under `squared_error` a fit with an offset matches the plain fit of
+`y - offset`; a varying offset is added exactly in `predict_raw`; the Poisson offset fit equals
+the exposure fit; the logistic fit learns around the offset; contributions stay exact with it.
 
 **Unlocks in Haute.** Offsets under every loss.
 
@@ -246,14 +256,16 @@ default cell under `"default_cell"`; a null never raises.
 
 **Unlocks in Haute.** Haute sets `"error"` and drops its own level check.
 
-### R8. Refuse `exposure` under `squared_error` and logistic
+### R8. Refuse `exposure` under `squared_error`
 
-**Observed in 0.6.2.** `TBoostRegressor(objective="squared_error")` and `TBoostClassifier`
-accept `exposure` without complaint, although an exposure offset has no meaning under the
-identity or logit link.
+**Observed in 0.6.2.** `TBoostRegressor(objective="squared_error")` accepts `exposure`
+without complaint, although a `log(exposure)` offset on a mean has no meaning under the
+identity link.
 
-**API.** Raise a `ValueError` naming the objectives that accept exposure, and pointing at
-`offset` (R6) for the others. This is a breaking change for callers who passed it.
+**API.** Raise a `ValueError` naming the objectives that accept exposure. This is a breaking
+change for callers who passed it. Logistic keeps exposure: there it is a deliberate
+rare-event logit offset (the BUG-056 fix made the A/E report honour it), and `offset` (R6) is
+the general alternative.
 
 ### R9. Contributions as a matrix keyed by feature tuples
 
@@ -322,6 +334,15 @@ nested model schema version; which versions a release reads is not stated.
 schema versions a release reads, that `t_boost_version` is informational, that any
 readable document predicts identically under the reading release, and that an unreadable
 one raises `SerializationError` naming both versions.
+
+## Implementation status (4 October 2026, branch `haute-integration`)
+
+All requirements except the withdrawn R4 are implemented, with the tests listed above in
+`python/tests/test_haute_integration.py` and `crates/t-boost-core/tests/fit_control.rs`.
+The envelope `schema_version` is 5. Two deliberate limits:
+
+- R2/R3 report the deployed fit only, and not for multiclass.
+- R6 under the log and logit links shares exposure's mass caveat (see R6).
 
 ## Behaviour Haute relies on today
 

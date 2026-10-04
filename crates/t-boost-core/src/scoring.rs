@@ -1578,6 +1578,7 @@ mod tests {
             refine_closed_form_tier2: false,
             incremental_mu: false,
             boosters: Default::default(),
+            fit_control: Default::default(),
         }
     }
 

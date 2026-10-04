@@ -256,3 +256,234 @@ def test_cell_indices_refuses_multiclass() -> None:
 def test_top_level_names_resolve_to_the_estimators() -> None:
     assert t_boost.TBoostRegressor is TBoostRegressor
     assert t_boost.TBoostClassifier is TBoostClassifier
+
+
+# --- R1 / R2 / R3: eval_set, fit report, callbacks ------------------------------------------
+
+from _artifact import model_bytes  # noqa: E402
+
+ES = dict(n_trees=400, n_bags=2, seed=5, early_stopping_adaptive=None, early_stopping_rounds=40,
+          early_stopping_min_delta=0.0, learning_rate=0.2)
+
+
+@pytest.fixture(scope="module")
+def split() -> tuple[pl.DataFrame, np.ndarray, pl.DataFrame, np.ndarray]:
+    frame, y = _frame(6000, seed=11)
+    return frame[:4500], y[:4500], frame[4500:], y[4500:]
+
+
+def test_eval_set_stops_each_bag_at_its_best_eval_round(split) -> None:
+    x, y, xv, yv = split
+    model = TBoostRegressor(**ES, prune=False).fit(x, y, eval_set=(xv, yv))
+    assert "train" not in model.evals_result_, "the training curve is computed for callbacks only"
+    history = model.evals_result_["eval"]["deviance"]
+    assert len(history) == 2 == len(model.n_trees_per_bag_)
+    for kept, curve, reason in zip(model.n_trees_per_bag_, history, model.stopping_reason_per_bag_):
+        assert kept == int(np.argmin(curve)) + 1
+        assert reason in ("early_stopping", "max_trees")
+    report = {row["param"]: row for row in model.binding_report_}
+    assert report["validation_fraction"]["overridden_by"] == "eval_set"
+
+
+def test_eval_rows_never_reach_training(split) -> None:
+    x, y, xv, yv = split
+    moved = yv.copy()
+    moved[0] = 1e4
+    histories = [
+        TBoostRegressor(**ES)
+        .fit(x, y, eval_set=(xv, target), callbacks=lambda info: None)
+        .evals_result_["train"]["deviance"]
+        for target in (yv, moved)
+    ]
+    for a, b in zip(*histories):
+        k = min(len(a), len(b))
+        assert k > 0 and a[:k] == b[:k]
+
+
+def test_eval_set_is_identical_across_n_jobs(split) -> None:
+    x, y, xv, yv = split
+    blobs = {
+        model_bytes(TBoostRegressor(**{**ES, "n_jobs": jobs}).fit(x, y, eval_set=(xv, yv)))
+        for jobs in (1, 4)
+    }
+    assert len(blobs) == 1
+
+
+def test_eval_set_binary_classifier_and_column_names(split) -> None:
+    x, y, xv, yv = split
+    labels, val_labels = (y > 0.5).astype(int), (yv > 0.5).astype(int)
+    frame_v = xv.with_columns(pl.Series("target", val_labels))
+    model = TBoostClassifier(**ES).fit(x, labels, eval_set=(frame_v, "target"))
+    assert model.n_trees_per_bag_ is not None and "eval" in model.evals_result_
+
+
+def test_eval_set_refusals(split) -> None:
+    x, y, xv, yv = split
+    with pytest.raises(ValueError, match="eval_exposure"):
+        TBoostRegressor(objective="poisson", **ES).fit(
+            x, np.abs(y), exposure=np.ones(len(y)), eval_set=(xv, np.abs(yv))
+        )
+    with pytest.raises(ValueError, match="reanchor_slope"):
+        TBoostRegressor(reanchor_slope=True, **ES).fit(x, y, eval_set=(xv, yv))
+    with pytest.raises(ValueError, match="binary"):
+        TBoostClassifier(**ES).fit(x, np.digitize(y, [-0.5, 0.5]), eval_set=(xv, np.digitize(yv, [-0.5, 0.5])))
+
+
+def test_stopping_reasons_and_counts(split) -> None:
+    x, y, xv, yv = split
+    capped = TBoostRegressor(n_trees=30, n_bags=2, validation_fraction=None, prune=False).fit(x, y)
+    assert capped.n_trees_per_bag_ == [30, 30] and capped.stopping_reason_ == "max_trees"
+    assert capped.n_trees_ == 30
+    flat = TBoostRegressor(n_trees=30, n_bags=1, prune=False).fit(x, np.full(len(y), 2.0))
+    assert flat.stopping_reason_ == "no_split" and flat.n_trees_ == 0
+    stopped = TBoostRegressor(**ES).fit(x, y, eval_set=(xv, yv))
+    assert stopped.stopping_reason_ == "early_stopping"
+    assert "early_stopping" in stopped.stopping_reason_per_bag_
+
+
+def test_fit_report_survives_serialization(split) -> None:
+    x, y, xv, yv = split
+    model = TBoostRegressor(**ES).fit(x, y, eval_set=(xv, yv))
+    for loaded in (TBoostRegressor.from_bytes(model.to_bytes()), TBoostRegressor.from_json(model.to_json())):
+        assert loaded.n_trees_per_bag_ == model.n_trees_per_bag_
+        assert loaded.stopping_reason_per_bag_ == model.stopping_reason_per_bag_
+        assert loaded.n_trees_ == model.n_trees_ and loaded.stopping_reason_ == model.stopping_reason_
+    doc = json.loads(model.to_json())
+    del doc["fit_report"]
+    old = TBoostRegressor.from_json(json.dumps(doc))
+    assert old.n_trees_per_bag_ is None and old.stopping_reason_ is None
+
+
+def test_callbacks_see_rounds_in_order_and_match_history(split) -> None:
+    x, y, xv, yv = split
+    seen: list[dict] = []
+    model = TBoostRegressor(**ES).fit(x, y, eval_set=(xv, yv), callbacks=[seen.append])
+    for bag in range(2):
+        rounds = [e for e in seen if e["bag"] == bag]
+        assert [e["round"] for e in rounds] == list(range(1, len(rounds) + 1))
+        assert [e["eval_deviance"] for e in rounds] == model.evals_result_["eval"]["deviance"][bag]
+        assert [e["train_deviance"] for e in rounds] == model.evals_result_["train"]["deviance"][bag]
+    assert {e["phase"] for e in seen} == {"fit"} and {e["n_bags"] for e in seen} == {2}
+
+
+def test_callback_true_stops_and_exceptions_propagate(split) -> None:
+    x, y, _, _ = split
+    model = TBoostRegressor(n_trees=200, n_bags=2, prune=False).fit(
+        x, y, callbacks=lambda info: info["round"] >= 5
+    )
+    assert model.n_trees_per_bag_ == [5, 5]
+    assert model.stopping_reason_ == "callback"
+
+    class Cancelled(Exception):
+        pass
+
+    def cancel(info: dict) -> None:
+        raise Cancelled(info["round"])
+
+    with pytest.raises(Cancelled):
+        TBoostRegressor(n_trees=200, n_bags=2).fit(x, y, callbacks=cancel)
+
+
+# --- R6 ------------------------------------------------------------------------------------
+
+
+def test_offset_under_squared_error_is_a_target_shift(split) -> None:
+    x, y, _, _ = split
+    rng = np.random.default_rng(1)
+    offset = rng.normal(size=len(y)) * 3
+    model = TBoostRegressor(**FAST).fit(x, y + offset, offset=offset)
+    plain = TBoostRegressor(**FAST).fit(x, y)
+    np.testing.assert_allclose(model.predict(x, offset=offset) - offset, plain.predict(x), atol=1e-3)
+    np.testing.assert_array_equal(model.predict_raw(x, offset=offset), model.predict_raw(x) + offset)
+    result = model.predict_contributions(x, return_format="matrix", offset=offset)
+    assert result.terms[-1] == ("offset",) and result.term_types[-1] == "offset"
+    np.testing.assert_array_equal(result.values[:, -1], offset)
+
+
+def test_offset_column_name_and_eval_offset(split) -> None:
+    x, y, xv, yv = split
+    frame = x.with_columns(pl.Series("off", np.linspace(-1, 1, len(y))))
+    frame_v = xv.with_columns(pl.Series("off", np.zeros(len(yv))))
+    model = TBoostRegressor(**ES).fit(
+        frame, y, offset="off", eval_set=(frame_v, yv), eval_offset="off"
+    )
+    assert "off" not in list(model.feature_names_in_)
+    np.testing.assert_array_equal(
+        model.predict_raw(frame, offset="off"), model.predict_raw(frame) + frame["off"].to_numpy()
+    )
+    with pytest.raises(ValueError, match="eval_offset"):
+        TBoostRegressor(**ES).fit(frame, y, offset="off", eval_set=(frame_v, yv))
+
+
+def test_offset_under_log_link_equals_exposure(split) -> None:
+    x, y, _, _ = split
+    exposure = np.exp(np.random.default_rng(2).normal(size=len(y)) * 0.3)
+    counts = np.random.default_rng(3).poisson(exposure)
+    by_offset = TBoostRegressor(objective="poisson", **FAST).fit(x, counts, offset=np.log(exposure))
+    by_exposure = TBoostRegressor(objective="poisson", **FAST).fit(x, counts, exposure=exposure)
+    np.testing.assert_array_equal(by_offset.predict(x), by_exposure.predict(x))
+
+
+def test_offset_under_logistic_scores_around_the_offset(split) -> None:
+    x, y, _, _ = split
+    rng = np.random.default_rng(4)
+    offset = rng.normal(size=len(y)) * 2
+    labels = (rng.uniform(size=len(y)) < 1 / (1 + np.exp(-offset))).astype(int)
+    model = TBoostClassifier(**FAST).fit(x, labels, offset=offset)
+    p = model.predict_proba(x, offset=offset)[:, 1]
+    np.testing.assert_allclose(
+        p, 1 / (1 + np.exp(-(model.decision_function(x) + offset))), rtol=1e-12
+    )
+    assert np.mean(np.abs(model.decision_function(x))) < 0.5, "the offset carries the signal"
+    records = model.predict_contributions(x[:3], offset=offset[:3])
+    assert records[0]["contributions"][-1]["term"] == "offset"
+
+
+def test_offset_refused_for_multiclass(split) -> None:
+    x, y, _, _ = split
+    with pytest.raises(ValueError, match="offset"):
+        TBoostClassifier(n_trees=5, n_bags=1).fit(x, np.digitize(y, [-0.5, 0.5]), offset=np.zeros(len(y)))
+
+
+def test_multiclass_fit_report_is_none() -> None:
+    frame, y = _frame(600)
+    model = TBoostClassifier(n_trees=10, n_bags=1).fit(frame, np.digitize(y, [-0.5, 0.5]))
+    assert model.n_trees_per_bag_ is None and model.stopping_reason_ is None
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"n_bags": 1},
+        {"cat_channels": ["mean", "count"], "cat_count_min_levels": 2},
+        {"prune": False},
+    ],
+    ids=["single-bag", "multi-channel", "unpruned"],
+)
+def test_eval_set_paths(split, options) -> None:
+    x, y, xv, yv = split
+    model = TBoostRegressor(**{**ES, **options}).fit(x, y, eval_set=(xv, yv))
+    curves = model.evals_result_["eval"]["deviance"]
+    assert len(curves) == len(model.n_trees_per_bag_) == int(model.n_bags)
+    for kept, curve in zip(model.n_trees_per_bag_, curves):
+        assert kept == int(np.argmin(curve)) + 1
+    assert np.isfinite(model.predict(xv)).all()
+
+
+def test_eval_set_with_groups(split) -> None:
+    x, y, xv, yv = split
+    groups = np.arange(len(y)) // 3
+    model = TBoostRegressor(**ES).fit(x, y, groups=groups, eval_set=(xv, yv))
+    assert len(model.n_trees_per_bag_) == 2 and np.isfinite(model.predict(xv)).all()
+
+
+def test_eval_set_unknown_levels_follow_the_policy(split) -> None:
+    x, y, xv, yv = split
+    bad = xv.with_columns(pl.lit("never").alias("d"))
+    with pytest.raises(ValueError, match="never"):
+        TBoostRegressor(**ES, unknown_category="error").fit(x, y, eval_set=(bad, yv))
+    TBoostRegressor(**ES).fit(x, y, eval_set=(bad, yv))  # default_cell: accepted
+
+
+def test_contribution_matrix_is_exported() -> None:
+    assert t_boost.ContributionMatrix is ContributionMatrix

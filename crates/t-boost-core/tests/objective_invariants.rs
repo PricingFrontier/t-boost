@@ -67,6 +67,7 @@ fn cfg() -> Config {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     }
 }
 
@@ -164,6 +165,7 @@ fn poisson_default_fit_is_max_delta_step_stabilized() {
         refine_closed_form_tier2: false,
         incremental_mu: false,
         boosters: Default::default(),
+        fit_control: Default::default(),
     })
     .fit(&x, &y, &spec(&Poisson, None))
     .unwrap();

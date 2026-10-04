@@ -1880,6 +1880,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         // Categorical columns both follow the SAME (1,1)="a" / (2,2)="b" pattern (the only two
         // joint tuples this fixture's frozen levels produce); the numeric column (raw 1) varies
@@ -2004,6 +2005,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![1, 2, 3]],
@@ -2181,6 +2183,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![1, 1, 2, 2, 2], vec![1, 2, 1, 2, 2]],
@@ -2330,6 +2333,7 @@ mod tests {
             bag_intercepts: None,
             bag_in_bag: None,
             delta_step_gate: None,
+            fit_report: None,
         };
         let x = ServeBinnedMatrix(BinnedMatrix {
             data: vec![vec![1, 2]],
