@@ -1,0 +1,96 @@
+site_name: t-boost
+site_description: >-
+  A Tabulating Boosting Machine (TBM): gradient boosting whose fitted model is exactly a set of
+  rating tables.
+site_url: https://pricingfrontier.github.io/t-boost/
+repo_url: https://github.com/PricingFrontier/t-boost
+repo_name: PricingFrontier/t-boost
+edit_uri: edit/main/docs/
+copyright: t-boost is released under the Apache-2.0 license.
+
+# Any warning (a broken link, a missing page, a nav entry with no file) fails the build.
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.footer
+    - navigation.indexes
+    - navigation.sections
+    - navigation.tabs
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: [docs]
+      check_paths: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+# Shared fragments are pulled into pages by pymdownx.snippets; they are not pages themselves.
+exclude_docs: |
+  _snippets/
+  requirements.txt
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Installation:
+      - installation/index.md
+      - pip install: installation/pip-install.md
+      - Build from source: installation/build-from-source.md
+      - Test t-boost: installation/test.md
+  - Key Features:
+      - Categorical features: features/categorical-features.md
+  - Python package:
+      - Quick start: quickstart.md
+  - Model analysis:
+      - Rating tables: model-analysis/rating-tables.md
+  - Algorithm details:
+      - Transforming categorical features to numerical features: algorithm/categorical-features.md
+      - Missing values processing: algorithm/missing-values.md
