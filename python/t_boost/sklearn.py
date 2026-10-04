@@ -6275,10 +6275,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         if n_features != int(self.n_features_in_):
             raise ValueError(f"X has {n_features} features but model expects {self.n_features_in_}")
         cat_idx = list(getattr(self, "_cat_indices_", None) or [])
+        has_mass = vectors["sample_weight"] is not None or vectors["exposure"] is not None
+        schema = {"feature": pl.String, "value": pl.String, "rows": pl.Int64, "mass": pl.Float64}
+        if not cat_idx:  # no categorical feature, so nothing can be unseen
+            empty = pl.DataFrame({k: [] for k in schema}, schema=schema)
+            return empty if has_mass else empty.drop("mass")
         _, cat_x, _ = self._split_columns(X, cat_idx, _feature_names_from_x(X), coded=True)
-        n = len(cat_x[0][0]) if cat_x else 0
+        n = len(cat_x[0][0])
         mass = None
-        if vectors["sample_weight"] is not None or vectors["exposure"] is not None:
+        if has_mass:
             mass = np.ones(n, dtype=np.float64)
             for key in ("sample_weight", "exposure"):
                 if vectors[key] is not None:
@@ -6304,7 +6309,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 rows["value"].append(value)
                 rows["rows"].append(int(count))
                 rows["mass"].append(total if masses is not None else None)
-        schema = {"feature": pl.String, "value": pl.String, "rows": pl.Int64, "mass": pl.Float64}
         frame = pl.DataFrame(rows, schema=schema)
         return frame if mass is not None else frame.drop("mass")
 

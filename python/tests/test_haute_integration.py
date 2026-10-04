@@ -610,6 +610,9 @@ def test_unseen_values_counts(rare_model) -> None:
     ]
     weighted = model.unseen_values(probe, sample_weight="w")
     assert weighted["mass"].to_list() == [3.0, 3.0]
+    numeric = TBoostRegressor(n_trees=5, n_bags=1).fit(probe.select("a"), np.arange(6.0))
+    none = numeric.unseen_values(probe.select("a", "w"), sample_weight="w")
+    assert none.height == 0 and none.columns == ["feature", "value", "rows", "mass"]
 
 
 def test_eval_set_unseen_levels_score_as_rare() -> None:
