@@ -11,8 +11,10 @@ the settings pages instead of being written by hand:
 
 ``check`` (what the Docs workflow runs) fails when a constructor parameter has no entry under
 ``docs/training-parameters/``, has more than one, or documents a default that differs from the
-code; when an entry names a parameter the constructor does not have; or when a derived file is
-stale. ``fix`` rewrites the derived files; entries for new parameters are written by hand.
+code; when an entry names a parameter the constructor does not have; when a class docstring's
+Parameters section misses a constructor parameter or names one the constructor does not have; or
+when a derived file is stale. ``fix`` rewrites the derived files; entries for new parameters,
+on the settings pages and in the docstrings, are written by hand.
 
 The estimator source is parsed, not imported, so this needs neither the Rust toolchain nor a
 built extension.
@@ -168,6 +170,28 @@ def _entry_problems(params: list[tuple[str, object, bool]]) -> list[str]:
     return problems
 
 
+def _docstring_problems(constructors: dict[str, list[tuple[str, object, bool]]]) -> list[str]:
+    """Each class docstring's Parameters section must list exactly the constructor's parameters."""
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    docstrings = {
+        node.name: ast.get_docstring(node) or ""
+        for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name in constructors
+    }
+    problems = []
+    for cls, params in constructors.items():
+        section = re.search(
+            r"^Parameters\n-+\n(.*?)(?=^\w[\w ]*\n-+\n|\Z)", docstrings.get(cls, ""), re.M | re.S
+        )
+        documented = set(re.findall(r"^(\w+) : ", section.group(1), re.M)) if section else set()
+        names = [name for name, _, _ in params]
+        problems += [f"`{name}` has no entry in the {cls} docstring" for name in names
+                     if name not in documented]
+        problems += [f"the {cls} docstring documents `{name}`, which is not a constructor parameter"
+                     for name in sorted(documented - set(names))]
+    return problems
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("command", choices=("check", "fix"))
@@ -181,6 +205,7 @@ def main(argv: list[str] | None = None) -> int:
             path.write_text(text, encoding="utf-8")
 
     problems = _entry_problems(constructors["TBoostRegressor"])
+    problems += _docstring_problems(constructors)
     problems += [
         f"{path.relative_to(ROOT)} is stale: run `python scripts/check_docs.py fix`"
         for path, text in generated.items()
