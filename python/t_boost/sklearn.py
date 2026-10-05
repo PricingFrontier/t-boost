@@ -757,6 +757,24 @@ _PRUNE_PATH_FRACTION_DEFAULT = 0.995
 # +0.78%); this bound caps that at 0.1% of deviance, the same figure as banding's deviance cap.
 # Measured offline (35 datasets): Elo 1427 vs 1424 (fraction alone), 1428 (the minimum).
 _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
+# Which knobs each keep-set selector reads, for `binding_report_`. The ranked path reads only its
+# own three. The fold vote reads the others: its CV and vote, the evidence gate, the walk's size
+# prices, the guard and the slope re-anchor, plus the K>=3 selection fits, legacy split and guard.
+# Every other `prune_*` knob (`prune_main_effects`, `prune_guard_min_rows`, `prune_rebalance` and
+# the deployed budgets) is read by both. `multiclass_prune_cv` is left out: on grouped rows it also
+# picks the K>=3 deploy fit's early-stopping carve, so it is not inert on the path.
+_RANKED_PATH_KNOBS = ("prune_path_steps", "prune_path_fraction", "prune_path_tolerance")
+_FOLD_VOTE_KNOBS = (
+    "prune_n_folds", "prune_fold_min_rows", "prune_fold_es_patience", "prune_validation_fraction",
+    "prune_min_stability", "prune_min_mean_gain", "prune_drop_z", "prune_keep_budget",
+    "prune_fold_fidelity", "prune_se_rule", "prune_lambda_boxes", "prune_lambda_tables",
+    "prune_size_penalty", "prune_guard", "prune_guard_tol", "prune_guard_z", "prune_guard_z_dn",
+    "prune_guard_tol_floor", "prune_slope_eps", "prune_slope_min_z", "multiclass_prune_sel_bags",
+    "multiclass_prune_guard", "multiclass_prune_guard_floor",
+)
+# `pruning_report_["selector"]` of a fold-vote fit: the single-output aggregator, then the K>=3
+# CV vote and its legacy single-split walk.
+_FOLD_VOTE_SELECTORS = ("heldout_contribution_stability", "cv_fold_vote", "single_split_walk")
 # Main-effect pruning (2026-10-04, `prune_main_effects`). Off by default: every main effect the fit
 # realized is deployed, and pruning only ever simplifies interactions. On, the main effects are
 # candidates in every selector, under hierarchy -- a main effect leaves only when it does not earn
@@ -2800,11 +2818,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             drop_z is not None
             and rep.get("evidence_budget_bound") is False
         )
+        # The selector that chose the keep-set. Both gates are fold-vote knobs: when the ranked
+        # path ran instead, or a monotone fit kept the full bank, they are reported below with
+        # the other knobs of the selector that did not run.
+        selector = rep.get("selector")
+        fold_vote = selector in _FOLD_VOTE_SELECTORS
         for gate in ("prune_min_stability", "prune_min_mean_gain"):
             if gate not in defaults or getattr(self, gate, None) == defaults[gate]:
                 continue
             if not pruning_on:
                 add(gate, "INERT", "prune=False, so no table selection ran", "prune")
+            elif not fold_vote:
+                continue
             elif evidence_open and admitted:
                 add(gate, "OVERRIDDEN",
                     f"the evidence path re-admitted {admitted} table(s) this gate refused; its "
@@ -2820,6 +2845,36 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 if name.startswith("prune_") and getattr(self, name, None) != defaults[name] \
                         and not any(r["param"] == name for r in rows):
                     add(name, "INERT", "prune=False, so the prune stage did not run", "prune")
+
+        # the knobs of the selector that did not run (see `_FOLD_VOTE_KNOBS`)
+        def add_unread(names: tuple[str, ...], reason: str, by: str | None) -> None:
+            for name in names:
+                if name in defaults and getattr(self, name, None) != defaults[name] \
+                        and not any(r["param"] == name for r in rows):
+                    add(name, "INERT", reason, by)
+
+        if pruning_on and selector == "ranked_path":
+            # a `multiclass_*` knob is never read by a single-output fit, whatever the selector
+            multiclass = len(getattr(self, "classes_", ())) > 2
+            add_unread(tuple(n for n in _FOLD_VOTE_KNOBS
+                             if multiclass or not n.startswith("multiclass_")),
+                       "the ranked path selected the tables, so the fold vote this knob tunes "
+                       "did not run", "prune_selector")
+            if "skipped" in (rep.get("selection") or {}):
+                add_unread(_RANKED_PATH_KNOBS, "the fit had no out-of-bag rows to score the "
+                           "path on, so the full table bank was kept", None)
+        elif pruning_on and fold_vote:
+            if getattr(self, "prune_selector", None) == "fold_vote":
+                add_unread(_RANKED_PATH_KNOBS, "prune_selector='fold_vote', so the ranked path "
+                           "did not run", "prune_selector")
+            else:
+                add_unread(_RANKED_PATH_KNOBS, "the ranked path needs out-of-bag rows and this "
+                           "fit had none it could use (for example n_bags=1), so the fold vote "
+                           "selected the tables", None)
+        elif pruning_on and "constraints" in rep:
+            add_unread(tuple(n for n in defaults if n.startswith("prune_")),
+                       "monotone_constraints keeps the full table bank, so no table selection "
+                       "ran", "monotone_constraints")
 
         # size caps: a cap above the bank never binds (the count is only read when a cap is set)
         for cap, what in (("prune_table_budget", "tables"), ("prune_box_budget", "boxes")):
