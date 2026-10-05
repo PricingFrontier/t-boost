@@ -42,8 +42,8 @@ squared_error
 
 #### Description
 
-The maximum number of trees ([`n_trees`](../training-parameters/common.md#n_trees)). The
-overfitting detector decides the actual number.
+The maximum number of trees ([`n_trees`](../training-parameters/common.md#n_trees)). Early
+stopping decides the actual number.
 
 **Possible types**
 

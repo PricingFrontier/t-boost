@@ -1,9 +1,9 @@
-# Using the overfitting detector
+# Using early stopping
 
 If overfitting occurs, t-boost can stop the training earlier than the training parameters
-dictate. For example, it can be stopped before the specified number of trees are built. The
-overfitting detector is turned on by default. See [Overfitting detector](../algorithm/overfitting-detector.md)
-for how it works.
+dictate. For example, it can be stopped before the specified number of trees are built. Early
+stopping is turned on by default. See [Early stopping](../algorithm/early-stopping.md) for how it
+works.
 
 ## Python package {#python-package}
 
@@ -14,7 +14,7 @@ model is trained:
 
 `validation_fraction`
 :   The fraction of the training objects set aside as the validation dataset (0.1). `None` turns
-    the overfitting detector off.
+    early stopping off.
 
 `early_stopping_rounds`
 :   The number of iterations to continue the training after the iteration with the optimal
@@ -27,8 +27,7 @@ model is trained:
 :   The minimum relative improvement of the metric for an iteration to become the new best
     (0.0001).
 
-See [Overfitting detection settings](../training-parameters/overfitting-detection.md) for
-details.
+See [Early stopping settings](../training-parameters/early-stopping.md) for details.
 
 The following parameters can be set for the `fit` method:
 

@@ -14,9 +14,9 @@ any other parameters. In order to do this it is necessary to analyze the metric 
 validation dataset and the number of trees each bag kept.
 
 By default the number of trees ([`n_trees`](training-parameters/common.md#n_trees)) is a large
-cap and the [overfitting detector](algorithm/overfitting-detector.md) decides when to stop.
-After the fit, check `stopping_reason_per_bag_`: bags that stopped with `"max_trees"` reached the
-cap before the detector triggered, so raise `n_trees` or `learning_rate`. Pass an `eval_set` to
+cap and [early stopping](algorithm/early-stopping.md) decides when to stop. After the fit,
+check `stopping_reason_per_bag_`: bags that stopped with `"max_trees"` reached the cap before
+early stopping triggered, so raise `n_trees` or `learning_rate`. Pass an `eval_set` to
 `fit` to monitor the deviance of every iteration in `evals_result_`.
 
 ## Learning rate {#learning-rate}

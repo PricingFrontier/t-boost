@@ -1,23 +1,23 @@
-# Overfitting detection settings
+# Early stopping settings
 
-The overfitting detector stops the training of each bag when the deviance of the objective on
-a validation dataset stops improving, and keeps the trees up to the iteration with the best
+Early stopping ends the training of each bag when the deviance of the objective on a
+validation dataset stops improving, and keeps the trees up to the iteration with the best
 deviance. By default the validation dataset is a fraction of the training objects
 ([`validation_fraction`](#validation_fraction)). Pass `eval_set` to `fit` to use a separate
-dataset instead. See [Overfitting detector](../algorithm/overfitting-detector.md) for details.
+dataset instead. See [Early stopping](../algorithm/early-stopping.md) for details.
 
 ## validation_fraction {#validation_fraction}
 
 #### Description
 
-The fraction of the training objects set aside as the validation dataset of the overfitting
-detector. Each bag sets aside its own validation objects from its own sample.
+The fraction of the training objects set aside as the validation dataset of early stopping.
+Each bag sets aside its own validation objects from its own sample.
 
 The validation objects are stratified for classification (by class) and for the `poisson` and
 `tweedie` objectives (zero versus non-zero target). When `groups` is passed to `fit`, whole
 groups are set aside instead of single objects, once, and the bags share them.
 
-`None` turns the overfitting detector off, so every bag builds [`n_trees`](common.md#n_trees)
+`None` turns early stopping off, so every bag builds [`n_trees`](common.md#n_trees)
 trees. The value is ignored when an `eval_set` is passed to `fit`.
 
 **Type**
@@ -37,7 +37,7 @@ optimal metric value. The metric is the mean deviance of the objective on the va
 objects.
 
 With [`early_stopping_adaptive`](#early_stopping_adaptive) set, this is the upper bound of the
-number of iterations. It is ignored when the overfitting detector is off.
+number of iterations. It is ignored when early stopping is off.
 
 **Type**
 
@@ -93,7 +93,7 @@ float
 
 #### Description
 
-A single setting for the patience of the overfitting detector. An `int` sets
+A single setting for the patience of early stopping. An `int` sets
 [`early_stopping_rounds`](#early_stopping_rounds), a `float` sets
 [`early_stopping_adaptive`](#early_stopping_adaptive).
 

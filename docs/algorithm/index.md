@@ -12,8 +12,8 @@ built consecutively. Each successive tree is built with reduced loss compared to
 trees. The trees are constrained so that the trained model can be rewritten exactly as a set of
 rating tables.
 
-The number of trees is controlled by the starting parameters. To prevent overfitting, use the
-[overfitting detector](overfitting-detector.md). When it is triggered, trees stop being built.
+The number of trees is controlled by the starting parameters. To prevent overfitting, use
+[early stopping](early-stopping.md). When it is triggered, trees stop being built.
 
 Building stages for a single tree:
 

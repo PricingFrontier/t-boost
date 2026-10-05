@@ -12,9 +12,8 @@ used variables in the listed metrics.
 
 The objective is set by the [`objective`](../training-parameters/common.md#objective) parameter.
 Every objective is the deviance of a distribution with a link function, and the same deviance is
-used throughout the fit: the trees minimize it, the
-[overfitting detector](../algorithm/overfitting-detector.md) monitors it on the validation
-dataset, and pruning compares sets of tables with it.
+used throughout the fit: the trees minimize it, [early stopping](../algorithm/early-stopping.md)
+monitors it on the validation dataset, and pruning compares sets of tables with it.
 
 | Objective | Machine learning problem | Link | Class |
 |-----------|--------------------------|------|-------|

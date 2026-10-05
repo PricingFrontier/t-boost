@@ -21,15 +21,15 @@ Each bag is trained on a sample of [`bag_subsample`](../training-parameters/bagg
 of the objects (80% by default), drawn without replacement (subagging). A value of 1 or more
 draws a full-size bootstrap sample with replacement instead.
 
-The sample is stratified in the same way as the validation objects of the overfitting detector:
+The sample is stratified in the same way as the validation objects of early stopping:
 by class for classification, and by zero versus non-zero target for the `poisson` and `tweedie`
 objectives, so rare classes and rare events are represented in every bag. When `groups` is passed
 to `fit`, whole groups are sampled, so the out-of-bag objects never include an object whose group
 was in the bag.
 
-Each bag then sets aside its own validation objects for the
-[overfitting detector](overfitting-detector.md), unless `groups` or an `eval_set` is given (the
-bags then share one validation dataset), and stops at its own best iteration.
+Each bag then sets aside its own validation objects for [early stopping](early-stopping.md),
+unless `groups` or an `eval_set` is given (the bags then share one validation dataset), and
+stops at its own best iteration.
 
 ## Averaging the bags {#averaging}
 

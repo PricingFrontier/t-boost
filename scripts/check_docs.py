@@ -38,7 +38,7 @@ SIGNATURES = {
 }
 # The order of the settings pages in the overview (and in mkdocs.yml's nav).
 PAGES = (
-    "common", "overfitting-detection", "quantization", "interaction", "categorical", "bagging",
+    "common", "early-stopping", "quantization", "interaction", "categorical", "bagging",
     "pruning", "pruning-fold-vote", "banding", "graduation", "purification",
     "multiclassification", "performance", "advanced",
 )
