@@ -1,0 +1,62 @@
+name: Docs
+
+# Builds the MkDocs site (docs/, mkdocs.yml) on every PR and deploys it to GitHub Pages from
+# main. The build is strict: a broken link, a missing page or a page left out of the nav fails
+# it, and so does a constructor parameter missing from the parameter reference
+# (scripts/check_docs.py). The pages are hand-written, so the job needs neither the Rust
+# toolchain nor t-boost.
+#
+# One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  # Supersede stale PR builds, but never cancel a deployment from main part-way through.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # docs/requirements.txt pins MkDocs 1.x, so Material's notice about MkDocs 2.0 is noise here.
+  NO_MKDOCS_2_WARNING: "true"
+
+jobs:
+  build:
+    name: Build site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # Every constructor parameter documented once, with its real default; the generated class
+      # signatures and parameter overview current. Parses the source: no build needed.
+      - name: Check the parameter reference
+        run: uv run --no-project python scripts/check_docs.py check
+      # --no-project: build the site without building t-boost itself.
+      - name: Build (strict)
+        run: uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict
+      - name: Upload Pages artifact
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: Deploy to GitHub Pages
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

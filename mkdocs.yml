@@ -1,0 +1,183 @@
+site_name: t-boost
+site_description: >-
+  A Tabulating Boosting Machine (TBM): gradient boosting whose fitted model is exactly a set of
+  rating tables.
+site_url: https://pricingfrontier.github.io/t-boost/
+repo_url: https://github.com/PricingFrontier/t-boost
+repo_name: PricingFrontier/t-boost
+edit_uri: edit/main/docs/
+copyright: t-boost is released under the Apache-2.0 license.
+
+# Any warning (a broken link, a missing page, a nav entry with no file) fails the build.
+strict: true
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+    - navigation.footer
+    - navigation.indexes
+    - navigation.top
+    - search.highlight
+    - search.suggest
+    - toc.follow
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: [docs]
+      check_paths: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+# Shared fragments are pulled into pages by pymdownx.snippets; they are not pages themselves.
+exclude_docs: |
+  _snippets/
+  requirements.txt
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn
+
+nav:
+  - Home: index.md
+  - Installation:
+      - installation/index.md
+      - Install from PyPI: installation/pip-install.md
+      - Build from source: installation/build-from-source.md
+      - Test t-boost: installation/test.md
+  - Key Features:
+      - Training: features/training.md
+      - Regular prediction: features/prediction.md
+      - Exposure and offsets: features/exposure.md
+      - Using the overfitting detector: features/overfitting-detector.md
+      - Categorical features: features/categorical-features.md
+      - Panel data: features/panel-data.md
+      - Feature importances: features/feature-importances.md
+      - Saving and loading models: features/saving-models.md
+  - Training parameters:
+      - Overview: training-parameters/index.md
+      - Common parameters: training-parameters/common.md
+      - Overfitting detection settings: training-parameters/overfitting-detection.md
+      - Quantization settings: training-parameters/quantization.md
+      - Interaction settings: training-parameters/interaction.md
+      - Categorical features settings: training-parameters/categorical.md
+      - Bagging settings: training-parameters/bagging.md
+      - Pruning settings: training-parameters/pruning.md
+      - Fold vote pruning settings: training-parameters/pruning-fold-vote.md
+      - Banding settings: training-parameters/banding.md
+      - Graduation settings: training-parameters/graduation.md
+      - Purification settings: training-parameters/purification.md
+      - Multiclassification settings: training-parameters/multiclassification.md
+      - Performance settings: training-parameters/performance.md
+      - Advanced settings: training-parameters/advanced.md
+  - Python package:
+      - python-reference/index.md
+      - Quick start: quickstart.md
+      - TBoostRegressor:
+          - python-reference/tboostregressor/index.md
+          - fit: python-reference/tboostregressor/fit.md
+          - predict: python-reference/tboostregressor/predict.md
+          - predict_raw: python-reference/tboostregressor/predict_raw.md
+          - Attributes: python-reference/tboostregressor/attributes.md
+          - actual_vs_expected: python-reference/tboostregressor/actual_vs_expected.md
+          - cell_indices: python-reference/tboostregressor/cell_indices.md
+          - check_bindings: python-reference/tboostregressor/check_bindings.md
+          - from_bytes: python-reference/tboostregressor/from_bytes.md
+          - from_json: python-reference/tboostregressor/from_json.md
+          - get_params: python-reference/tboostregressor/get_params.md
+          - predict_contributions: python-reference/tboostregressor/predict_contributions.md
+          - pricing_report: python-reference/tboostregressor/pricing_report.md
+          - score: python-reference/tboostregressor/score.md
+          - set_params: python-reference/tboostregressor/set_params.md
+          - tables: python-reference/tboostregressor/tables.md
+          - to_bytes: python-reference/tboostregressor/to_bytes.md
+          - to_json: python-reference/tboostregressor/to_json.md
+          - unseen_values: python-reference/tboostregressor/unseen_values.md
+      - TBoostClassifier:
+          - python-reference/tboostclassifier/index.md
+          - fit: python-reference/tboostclassifier/fit.md
+          - predict: python-reference/tboostclassifier/predict.md
+          - predict_proba: python-reference/tboostclassifier/predict_proba.md
+          - decision_function: python-reference/tboostclassifier/decision_function.md
+          - Attributes: python-reference/tboostclassifier/attributes.md
+          - actual_vs_expected: python-reference/tboostclassifier/actual_vs_expected.md
+          - cell_indices: python-reference/tboostclassifier/cell_indices.md
+          - check_bindings: python-reference/tboostclassifier/check_bindings.md
+          - from_bytes: python-reference/tboostclassifier/from_bytes.md
+          - from_json: python-reference/tboostclassifier/from_json.md
+          - get_params: python-reference/tboostclassifier/get_params.md
+          - predict_contributions: python-reference/tboostclassifier/predict_contributions.md
+          - pricing_report: python-reference/tboostclassifier/pricing_report.md
+          - score: python-reference/tboostclassifier/score.md
+          - set_params: python-reference/tboostclassifier/set_params.md
+          - tables: python-reference/tboostclassifier/tables.md
+          - to_bytes: python-reference/tboostclassifier/to_bytes.md
+          - to_json: python-reference/tboostclassifier/to_json.md
+          - unseen_values: python-reference/tboostclassifier/unseen_values.md
+      - ContributionMatrix: python-reference/contribution-matrix.md
+      - recommended_recipe: python-reference/recommended-recipe.md
+      - metrics: python-reference/metrics.md
+      - Exceptions and warnings: python-reference/exceptions.md
+  - Objectives and metrics:
+      - objectives/index.md
+      - Variables used in formulas: objectives/variables.md
+      - Regression: objectives/regression.md
+      - Classification: objectives/classification.md
+      - Multiclassification: objectives/multiclassification.md
+  - Model analysis:
+      - Rating tables: model-analysis/rating-tables.md
+      - Prediction contributions: model-analysis/contributions.md
+      - Feature importance: model-analysis/feature-importance.md
+      - Actual versus expected: model-analysis/actual-vs-expected.md
+  - Algorithm details:
+      - How training is performed: algorithm/index.md
+      - Choosing the tree structure: algorithm/tree-structure.md
+      - Transforming categorical features to numerical features: algorithm/categorical-features.md
+      - Missing values processing: algorithm/missing-values.md
+      - Bagging: algorithm/bagging.md
+      - Decomposing the trees into rating tables: algorithm/decomposition.md
+      - Pruning, banding and graduation: algorithm/readable-tables.md
+      - Overfitting detector: algorithm/overfitting-detector.md
+  - Parameter tuning: parameter-tuning.md
+  - Development and contributions: development.md

@@ -37,3 +37,6 @@ examples/frequency_model.bin
 # bugs.md reproduction harness outputs (specs/roadmap/repro/README.md)
 /specs/roadmap/repro/out/*
 !/specs/roadmap/repro/out/.gitkeep
+
+# MkDocs build output (docs site)
+/site

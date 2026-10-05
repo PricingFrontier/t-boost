@@ -1,0 +1,1 @@
+--8<-- "_snippets/methods/cell_indices.md"

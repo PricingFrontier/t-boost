@@ -1,0 +1,1 @@
+--8<-- "_snippets/methods/pricing_report.md"
