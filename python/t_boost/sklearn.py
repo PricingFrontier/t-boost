@@ -3689,15 +3689,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     ) -> list[dict[str, Any]]:
         """Actual versus expected by rating-factor level, for every feature (2026-09-06).
 
-        This shows where observed and predicted totals differ. Exact factor-level balance
-        is not a general property of boosted models or of every GLM/link/penalty combination. One entry per raw feature, aggregated over the merged-grid
-        cells the deployed tables actually use (cell 0 is the missing-value cell), with
-        ``actual`` = Σ weight·y, ``expected`` = Σ weight·prediction (the prediction already
-        carries ``exposure`` for log-link fits), ``mass`` = Σ weight·exposure and ``rows``
-        per cell. ``ae`` is ``actual / expected`` (``nan`` where expected is zero).
+        One entry per raw feature, aggregated over the merged-grid cells the deployed tables
+        actually use (cell 0 is the missing-value cell), with ``actual`` = Σ weight·y,
+        ``expected`` = Σ weight·prediction (the prediction already carries ``exposure`` for
+        log-link fits), ``mass`` = Σ weight·exposure and ``rows`` per cell. ``ae`` is
+        ``actual / expected`` (``nan`` where expected is zero). Exact factor-level balance is
+        not a general property of boosted models or of every GLM/link/penalty combination, so
+        the ratios show where observed and predicted totals differ.
 
-        Only available on a pruned fit (``prune=True``, the default), whose deployed model
-        is a set of tables with a fixed grid. Pass ``sample_weight`` and ``exposure`` explicitly
+        Available for regression and binary classification, pruned or not: every fit deploys
+        rating tables with a fixed grid. A multiclass (K>=3) fit, which has one table bank per
+        class, is not supported. Pass ``sample_weight`` and ``exposure`` explicitly
         when the fit used them, including on the training data. Row count does not establish
         alignment: fitted vectors are never silently reused. Use explicit unit vectors when
         an unweighted or unit-exposure evaluation is intended. ``y`` may name a polars column.
@@ -3705,8 +3707,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         model = getattr(self, "_model", None)
         if model is None or not hasattr(model, "cell_indices"):
             raise ValueError(
-                "actual_vs_expected needs a pruned tables-only fit (prune=True); the tree "
-                "ensemble of an unpruned fit has no fixed cell grid to aggregate over."
+                "actual_vs_expected supports regression and binary classification fits; "
+                + (
+                    "this multiclass (K>=3) fit has one table bank per class."
+                    if getattr(self, "_multi_model", None) is not None
+                    else "this model is a tree ensemble saved by an older t-boost, with no "
+                    "fixed cell grid to aggregate over. Refit it to get rating tables."
+                )
             )
         X, vectors = self._resolve_fit_vectors(
             X, {"y": y, "sample_weight": sample_weight, "exposure": exposure}

@@ -53,6 +53,21 @@ def test_ae_weight_requirement_and_column_arguments():
         m.actual_vs_expected(df, y, exposure=e[:-1], sample_weight=w)
 
 
+def test_ae_covers_unpruned_fits_and_names_the_multiclass_limit():
+    # Every fit deploys rating tables, so an unpruned fit has a grid too. Multiclass has one bank
+    # per class and is refused, with a reason that does not tell the caller to set prune=True.
+    from t_boost import TBoostClassifier
+
+    x, y, e = fixture()
+    m = estimator(objective='poisson', prune=False).fit(x, y, exposure=e)
+    assert m.actual_vs_expected(x, y, exposure=e)
+    labels = np.digitize(x[:, 0], [-0.5, 0.5])
+    multi = TBoostClassifier(n_trees=25, n_bags=3, n_jobs=1).fit(x, labels)
+    with pytest.raises(ValueError, match='multiclass') as err:
+        multi.actual_vs_expected(x, labels)
+    assert 'prune=True' not in str(err.value)
+
+
 @pytest.mark.parametrize('grouped', [False, True])
 def test_graduation_withholds_no_rows_from_the_fit(monkeypatch, grouped):
     # The inverse of the 2026-09-09..2026-09-20 invariant. Graduation used to carve
