@@ -757,6 +757,24 @@ _PRUNE_PATH_FRACTION_DEFAULT = 0.995
 # +0.78%); this bound caps that at 0.1% of deviance, the same figure as banding's deviance cap.
 # Measured offline (35 datasets): Elo 1427 vs 1424 (fraction alone), 1428 (the minimum).
 _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
+# Which knobs each keep-set selector reads, for `binding_report_`. The ranked path reads only its
+# own three. The fold vote reads the others: its CV and vote, the evidence gate, the walk's size
+# prices, the guard and the slope re-anchor, plus the K>=3 selection fits, legacy split and guard.
+# Every other `prune_*` knob (`prune_main_effects`, `prune_guard_min_rows`, `prune_rebalance` and
+# the deployed budgets) is read by both. `multiclass_prune_cv` is left out: on grouped rows it also
+# picks the K>=3 deploy fit's early-stopping carve, so it is not inert on the path.
+_RANKED_PATH_KNOBS = ("prune_path_steps", "prune_path_fraction", "prune_path_tolerance")
+_FOLD_VOTE_KNOBS = (
+    "prune_n_folds", "prune_fold_min_rows", "prune_fold_es_patience", "prune_validation_fraction",
+    "prune_min_stability", "prune_min_mean_gain", "prune_drop_z", "prune_keep_budget",
+    "prune_fold_fidelity", "prune_se_rule", "prune_lambda_boxes", "prune_lambda_tables",
+    "prune_size_penalty", "prune_guard", "prune_guard_tol", "prune_guard_z", "prune_guard_z_dn",
+    "prune_guard_tol_floor", "prune_slope_eps", "prune_slope_min_z", "multiclass_prune_sel_bags",
+    "multiclass_prune_guard", "multiclass_prune_guard_floor",
+)
+# `pruning_report_["selector"]` of a fold-vote fit: the single-output aggregator, then the K>=3
+# CV vote and its legacy single-split walk.
+_FOLD_VOTE_SELECTORS = ("heldout_contribution_stability", "cv_fold_vote", "single_split_walk")
 # Main-effect pruning (2026-10-04, `prune_main_effects`). Off by default: every main effect the fit
 # realized is deployed, and pruning only ever simplifies interactions. On, the main effects are
 # candidates in every selector, under hierarchy -- a main effect leaves only when it does not earn
@@ -2800,11 +2818,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             drop_z is not None
             and rep.get("evidence_budget_bound") is False
         )
+        # The selector that chose the keep-set. Both gates are fold-vote knobs: when the ranked
+        # path ran instead, or a monotone fit kept the full bank, they are reported below with
+        # the other knobs of the selector that did not run.
+        selector = rep.get("selector")
+        fold_vote = selector in _FOLD_VOTE_SELECTORS
         for gate in ("prune_min_stability", "prune_min_mean_gain"):
             if gate not in defaults or getattr(self, gate, None) == defaults[gate]:
                 continue
             if not pruning_on:
                 add(gate, "INERT", "prune=False, so no table selection ran", "prune")
+            elif not fold_vote:
+                continue
             elif evidence_open and admitted:
                 add(gate, "OVERRIDDEN",
                     f"the evidence path re-admitted {admitted} table(s) this gate refused; its "
@@ -2820,6 +2845,36 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 if name.startswith("prune_") and getattr(self, name, None) != defaults[name] \
                         and not any(r["param"] == name for r in rows):
                     add(name, "INERT", "prune=False, so the prune stage did not run", "prune")
+
+        # the knobs of the selector that did not run (see `_FOLD_VOTE_KNOBS`)
+        def add_unread(names: tuple[str, ...], reason: str, by: str | None) -> None:
+            for name in names:
+                if name in defaults and getattr(self, name, None) != defaults[name] \
+                        and not any(r["param"] == name for r in rows):
+                    add(name, "INERT", reason, by)
+
+        if pruning_on and selector == "ranked_path":
+            # a `multiclass_*` knob is never read by a single-output fit, whatever the selector
+            multiclass = len(getattr(self, "classes_", ())) > 2
+            add_unread(tuple(n for n in _FOLD_VOTE_KNOBS
+                             if multiclass or not n.startswith("multiclass_")),
+                       "the ranked path selected the tables, so the fold vote this knob tunes "
+                       "did not run", "prune_selector")
+            if "skipped" in (rep.get("selection") or {}):
+                add_unread(_RANKED_PATH_KNOBS, "the fit had no out-of-bag rows to score the "
+                           "path on, so the full table bank was kept", None)
+        elif pruning_on and fold_vote:
+            if getattr(self, "prune_selector", None) == "fold_vote":
+                add_unread(_RANKED_PATH_KNOBS, "prune_selector='fold_vote', so the ranked path "
+                           "did not run", "prune_selector")
+            else:
+                add_unread(_RANKED_PATH_KNOBS, "the ranked path needs out-of-bag rows and this "
+                           "fit had none it could use (for example n_bags=1), so the fold vote "
+                           "selected the tables", None)
+        elif pruning_on and "constraints" in rep:
+            add_unread(tuple(n for n in defaults if n.startswith("prune_")),
+                       "monotone_constraints keeps the full table bank, so no table selection "
+                       "ran", "monotone_constraints")
 
         # size caps: a cap above the bank never binds (the count is only read when a cap is set)
         for cap, what in (("prune_table_budget", "tables"), ("prune_box_budget", "boxes")):
@@ -3208,7 +3263,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         diagonal-Hessian cell solves accepted by ONE joint backtrack on the multinomial loss —
         `engine::boost::attach_multiclass_cell_correction`) as of 2026-08-25; none of them are
         validated here. As on the single-output path the refit needs a bag partition, so
-        `cell_refit_base` with `n_bags=1` is silently inert on BOTH paths alike.
+        `cell_refit_base` with `n_bags=1` raises on BOTH paths alike (the native config
+        refuses it).
 
         Called once, near the top of `_fit_multiclass`, before either the pruned or unpruned
         branch (both are equally affected).
@@ -3634,15 +3690,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     ) -> list[dict[str, Any]]:
         """Actual versus expected by rating-factor level, for every feature (2026-09-06).
 
-        This shows where observed and predicted totals differ. Exact factor-level balance
-        is not a general property of boosted models or of every GLM/link/penalty combination. One entry per raw feature, aggregated over the merged-grid
-        cells the deployed tables actually use (cell 0 is the missing-value cell), with
-        ``actual`` = Σ weight·y, ``expected`` = Σ weight·prediction (the prediction already
-        carries ``exposure`` for log-link fits), ``mass`` = Σ weight·exposure and ``rows``
-        per cell. ``ae`` is ``actual / expected`` (``nan`` where expected is zero).
+        One entry per raw feature, aggregated over the merged-grid cells the deployed tables
+        actually use (cell 0 is the missing-value cell), with ``actual`` = Σ weight·y,
+        ``expected`` = Σ weight·prediction (the prediction already carries ``exposure`` for
+        log-link fits), ``mass`` = Σ weight·exposure and ``rows`` per cell. ``ae`` is
+        ``actual / expected`` (``nan`` where expected is zero). Exact factor-level balance is
+        not a general property of boosted models or of every GLM/link/penalty combination, so
+        the ratios show where observed and predicted totals differ.
 
-        Only available on a pruned fit (``prune=True``, the default), whose deployed model
-        is a set of tables with a fixed grid. Pass ``sample_weight`` and ``exposure`` explicitly
+        Available for regression and binary classification, pruned or not: every fit deploys
+        rating tables with a fixed grid. A multiclass (K>=3) fit, which has one table bank per
+        class, is not supported. Pass ``sample_weight`` and ``exposure`` explicitly
         when the fit used them, including on the training data. Row count does not establish
         alignment: fitted vectors are never silently reused. Use explicit unit vectors when
         an unweighted or unit-exposure evaluation is intended. ``y`` may name a polars column.
@@ -3650,8 +3708,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         model = getattr(self, "_model", None)
         if model is None or not hasattr(model, "cell_indices"):
             raise ValueError(
-                "actual_vs_expected needs a pruned tables-only fit (prune=True); the tree "
-                "ensemble of an unpruned fit has no fixed cell grid to aggregate over."
+                "actual_vs_expected supports regression and binary classification fits; "
+                + (
+                    "this multiclass (K>=3) fit has one table bank per class."
+                    if getattr(self, "_multi_model", None) is not None
+                    else "this model is a tree ensemble saved by an older t-boost, with no "
+                    "fixed cell grid to aggregate over. Refit it to get rating tables."
+                )
             )
         X, vectors = self._resolve_fit_vectors(
             X, {"y": y, "sample_weight": sample_weight, "exposure": exposure}
@@ -6510,22 +6573,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
 
 class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
-    """Exact, depth-3 oblivious-tree gradient boosting regressor.
+    """Exact oblivious-tree gradient boosting regressor.
 
-    Every tree is a symmetric (oblivious) depth-3 tree that touches at most three distinct
-    raw features, so the fitted ensemble decomposes exactly into a sum of at-most-3-way
-    fANOVA effect tables (see :meth:`tables`) with no approximation: the score any row
-    receives is exactly the sum of the table lookups that explain it. Supports squared-error
-    regression and the Poisson/Gamma/Tweedie GLM families via ``objective``.
+    By default every tree is a symmetric (oblivious) depth-3 tree that touches at most three
+    distinct raw features (``max_depth``, ``max_interaction_order``), so the fitted ensemble
+    decomposes exactly into a sum of at-most-3-way fANOVA effect tables (see :meth:`tables`)
+    with no approximation: the score any row receives is exactly the sum of the table lookups
+    that explain it. Supports squared-error regression and the Poisson/Gamma/Tweedie GLM
+    families via ``objective``.
 
-    The defaults include a complete fitting pipeline. The September 2026 benchmark
-    describes an earlier pipeline; current graduation reserves a separate holdout. early stopping is on
-    by default (``validation_fraction=0.1``, ``early_stopping_rounds=500`` with adaptive
-    patience ``early_stopping_adaptive=1.5``, against a large ``n_trees=4000`` cap), outer
-    bagging is on by default (``n_bags=8``), per-tree column sampling is on by default
-    (``colsample_bytree=0.8``), and post-fit table pruning is on by default (``prune=True`` —
-    the fitted artifact is the CV-pruned tables-only model). Pass
-    ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit baseline.
+    The defaults are a complete fitting pipeline: early stopping is on
+    (``validation_fraction=0.1``, ``early_stopping_rounds=500`` with adaptive patience
+    ``early_stopping_adaptive=1.5``, against a large ``n_trees=4000`` cap), outer bagging is on
+    (``n_bags=8``), per-tree column sampling is on (``colsample_bytree=0.8``), and post-fit
+    table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
+    (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
+    tables are graduated (``graduate``). The fitted artifact is that tables-only model.
+    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
+    baseline.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -6636,13 +6701,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     colsample_bytree : float, default=0.8
         Fraction of features randomly sampled per tree.
     learning_rate_decay : float, default=0.0
-        Per-round multiplicative decay applied to ``learning_rate``. ``0.0`` is a constant
-        rate.
+        Learning-rate decay over the boosting rounds: round ``t`` uses
+        ``learning_rate / (1 + learning_rate_decay * t)``. ``0.0`` keeps the rate constant.
     validation_fraction : float or None, default=0.1
         Fraction of training rows carved out as an internal early-stopping holdout. ``None``
         disables internal early stopping entirely, so every fit runs the full ``n_trees``.
         Paired with ``early_stopping_rounds=500`` against the ``n_trees=4000`` cap, this is
         the tuned default: early stopping decides when a fit actually stops.
+    early_stopping : int, float or None, default=None
+        One setting for the early-stopping patience: an int sets ``early_stopping_rounds``, a
+        float sets ``early_stopping_adaptive``. Setting it together with a different value of
+        the parameter it sets raises ``ValueError``.
     early_stopping_rounds : int, default=500
         Patience: the fit stops once this many rounds pass without a validation-deviance
         improvement (see ``early_stopping_min_delta`` for what counts as an improvement).
@@ -6735,7 +6804,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fANOVA banks). Replicated benchmarking found row-bag plus column diversity to be the
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
-        default. ``n_bags=1`` disables bagging.
+        default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
+        banding is skipped and pruning falls back to the fold vote.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
@@ -6747,7 +6817,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Base ridge penalty for the out-of-bag (OOB) fANOVA cell refit: after bagging, each
         cell coefficient in the averaged bank is re-fit toward its bags' OOB residual under a
         ridge penalty shaped by ``cell_refit_gamma``, then re-purified. ``None`` (the
-        default) disables it. Requires real bagging (an OOB partition, i.e. ``n_bags >= 1``)
+        default) disables it. Requires real bagging (an OOB partition, i.e. ``n_bags >= 2``)
         — setting it without bagging raises ``ValueError`` rather than silently no-opping.
         Held-out no-harm guarded: adopted only if it improves held-out deviance.
     cell_refit_gamma : float, default=2.0
@@ -6793,7 +6863,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         the same link-aware default as ``reanchor``; an explicit ``True``/``False`` always
         wins.
     max_interaction_order : int, default=3
-        Whole-tree cap on the number of distinct raw features a tree may use (1 to 4) —
+        Whole-tree cap on the number of distinct raw features a tree may use (1 to 8) —
         caps interaction ORDER, which is the number of axes an exported table has. It does
         not cap tree depth; see ``max_depth`` for that. Must be ``<= max_depth`` (a tree
         needs one level per distinct feature), and values above 3 are opt-in.
@@ -6803,8 +6873,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         same algebra a 3-way is, and all five decomposability checks pass unchanged. It is a
         READABILITY relaxation, priced in three places: the interaction-gain hurdle doubles
         again at the 3->4 transition, ``table_budget_order_shrink`` halves the table-size
-        prior's allowance, and the evidence-gated prune drops any 4-way the held-out folds
-        cannot pay for. Measured: on a target whose highest true interaction is a pair,
+        prior's allowance, and the prune drops any 4-way table that does not pay for itself on
+        held-out rows. Measured: on a target whose highest true interaction is a pair,
         raising the cap from 3 to 4 leaves the deployed table set and the fit IDENTICAL.
 
         **Prefer ``max_depth == max_interaction_order`` at order 4.** A 4-way effect is
@@ -6824,8 +6894,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         a lifted order-3 effect is exported as a dense cube, and a cube is cubic in the
         per-axis extent, so without the tighter budget the bank overflows its firewall.
         4096 lands at roughly 16 cells per axis for a 3-way table and 64x64 for a pair.
+    table_budget_order_shrink : float, default=2.0
+        How much ``table_budget_cells`` shrinks per interaction order above 3: a k-way support
+        (k > 3) is measured against ``budget / table_budget_order_shrink ** (k - 3)`` cells,
+        because a table with more axes is harder to read at the same cell count. ``1.0`` turns
+        the shrink off.
     max_depth : int, default=3
-        Whole-tree cap on the number of split LEVELS (3 to 6). Orthogonal to
+        Whole-tree cap on the number of split LEVELS (3 to 8). Orthogonal to
         ``max_interaction_order``: depth caps *resolution*, order caps *interaction*.
 
         Once a tree holds ``max_interaction_order`` distinct raw features, deeper levels
@@ -6844,9 +6919,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         capability: a 7-step main effect fit in a single boosting round.
 
         **The default is 3 and should stay 3 unless a held-out probe says otherwise.**
-        Deeper trees put ~3.4x fewer rows in each cell, and raising depth automatically
-        raises the ``min_data_in_leaf`` floor to compensate (see that parameter). Not
-        supported together with ``ridge_refit_l2``, which errors.
+        Deeper trees put ~3.4x fewer rows in each cell, and ``min_data_in_leaf`` stays ``0``
+        at every depth unless you set it (see that parameter). Not supported together with
+        ``ridge_refit_l2``, which errors.
     seed : int, default=0
         Seed for every deterministic source of randomness in the fit (row/column sampling,
         bagging, DART dropout, ``random_strength`` noise). The same seed and inputs
@@ -6949,14 +7024,14 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         can only add axes. Raise it (e.g. to ``20``, matching ``cat_count_min_levels``) to
         restrict the channels to high-cardinality features.
     prune : bool, default=True
-        Whether to run post-fit table pruning: drop fANOVA tables that don't improve
-        cross-validated held-out deviance, and deploy the smaller, more explainable
-        tables-only model (see ``pruning_report_``). ON by default — every insur-arena
-        benchmark cell deployed the pruned artifact, and the selection is held-out-guarded
-        (neutral-or-better by construction) — at the cost of a handful of extra single-bag
-        fold fits. ``False`` deploys the full, unpruned table bank instead (fitted faster, but
-        a much larger artifact than the pruned bank or the trees it is built from). Either
-        way the model is stored as rating tables.
+        Whether to run post-fit table pruning: drop the fANOVA tables that do not earn their
+        place on held-out rows, and deploy the smaller, more explainable tables-only model
+        (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
+        the pruned artifact. ``prune_selector`` decides how the tables are judged: the default
+        ranked path reads the bags' out-of-bag rows and costs little extra, while the fold vote
+        refits the model on cross-validation folds. ``False`` deploys the full, unpruned table
+        bank instead (fitted faster, but a much larger artifact than the pruned bank or the
+        trees it is built from). Either way the model is stored as rating tables.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too. ``False`` deploys every main effect the fit
         built and prunes interactions only. ``True`` makes the main effects candidates in every
@@ -6968,25 +7043,58 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``prune_path_fraction`` is then measured against the intercept-only model rather than
         the main-effects-only one, which can change the interactions kept as well. Requires
         ``prune=True`` and refuses ``monotone_constraints`` (raises otherwise).
+    prune_selector : {"ranked_path", "fold_vote"}, default="ranked_path"
+        How pruning chooses the tables to keep. ``"ranked_path"`` ranks the candidate tables by
+        purified variance, admits them in that order under heredity (a k-way table only after
+        all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
+        deploys the smallest one that is good enough (``prune_path_fraction``,
+        ``prune_path_tolerance``). It needs out-of-bag rows: without at least
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
+        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
+        vote, evidence gate and no-harm guard: the parameters documented as fold vote only.
+        ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
+        lists the parameters you set that it did not read.
+    prune_path_fraction : float, default=0.995
+        Ranked path only: the fraction of the out-of-bag improvement the deployed prefix must
+        capture, measured from the main-effects-only model (the intercept-only model with
+        ``prune_main_effects=True``) to the prefix with the lowest out-of-bag deviance. ``1.0``
+        deploys that best prefix. Must be in ``(0, 1]``.
+    prune_path_tolerance : float, default=0.001
+        Ranked path only: the largest relative excess of the deployed prefix's out-of-bag
+        deviance over the best prefix's. The deployed prefix is the larger of the smallest one
+        that captures ``prune_path_fraction`` of the improvement and the smallest one within
+        this tolerance, so a small fraction of a large improvement cannot cost more than this
+        fraction of the deviance. Must be ``>= 0``; ignored when ``prune_path_fraction`` is
+        ``1.0``.
+    prune_path_steps : int, default=32
+        Ranked path only: the number of prefixes scored, their sizes spaced geometrically
+        between one table and all the candidates.
     prune_validation_fraction : float, default=0.15
-        Train/select split fraction of the LEGACY multiclass (K>=3) prune
-        (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
-        by ``prune_n_folds`` — a non-default value there raises ``ValueError`` rather than
-        silently no-opping.
+        Train/select split fraction of the LEGACY multiclass (K>=3) fold vote
+        (``multiclass_prune_cv=False``). In every other configuration a non-default value
+        raises ``ValueError`` rather than silently no-opping.
     multiclass_prune_cv : bool, default=True
         Multiclass (K>=3) prune selection regime; see :class:`TBoostClassifier`.
     multiclass_prune_guard_floor : float, default=0.002
         Floor of the multiclass (K>=3) prune guard's bar; see :class:`TBoostClassifier`.
+    multiclass_prune_guard : bool, default=True
+        The multiclass (K>=3) fold vote's no-harm guard; see :class:`TBoostClassifier`.
+    multiclass_prune_sel_bags : int, default=1
+        Bag count of the multiclass (K>=3) selection fits; see :class:`TBoostClassifier`. Any
+        value other than ``1`` raises here.
     prune_se_rule : float, default=0.0
-        Pruning selection rule, in standard errors of the cross-validated deviance estimate.
-        ``0.0`` (the default) selects the held-out-deviance minimum, which improves or is
-        neutral versus the unpruned model on every benchmark tried. A larger value (e.g.
-        ``0.5`` or the classic ``1.0`` one-standard-error rule) prunes more aggressively for
-        parsimony but monotonically degrades the deviance metric — a deliberate
-        explainability/accuracy trade-off, opt in explicitly for smaller models.
+        Fold vote only (see ``prune_selector``). Pruning selection rule, in standard errors of
+        the cross-validated deviance estimate. ``0.0`` (the default) selects the
+        held-out-deviance minimum, which improves or is neutral versus the unpruned model on
+        every benchmark tried. A larger value (e.g. ``0.5`` or the classic ``1.0``
+        one-standard-error rule) prunes more aggressively for parsimony but monotonically
+        degrades the deviance metric — a deliberate explainability/accuracy trade-off, opt in
+        explicitly for smaller models.
 
-        **MULTICLASS (K>=3) ONLY.** That path selects on a single train/select split, so the
-        band decides the deployed keep-set directly. The regressor/binary path instead
+        **MULTICLASS (K>=3) FOLD VOTE ONLY.** There the band applies to each selection walk:
+        the legacy single train/select split (``multiclass_prune_cv=False``), where it decides
+        the deployed keep-set directly, or each CV fold's walk. The regressor/binary path instead
         AGGREGATES per-fold selections, and the band reaches that aggregation only through
         ``kept_rate``, which the keep rule ORs against ``positive_rate`` — measured
         bit-identical banks for ``prune_se_rule`` in ``{0, 0.5, 1, 2, 10, 100}`` at four
@@ -6994,25 +7102,28 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         silently no-opping; use ``prune_table_budget`` / ``prune_box_budget`` for a smaller
         bank on that path. Only has an effect together with ``prune=True``.
     prune_n_folds : int, default=5
-        Number of cross-validation folds used to estimate each candidate table's
-        contribution during pruning. Only has an effect together with ``prune=True``.
+        Fold vote only (see ``prune_selector``). Number of cross-validation folds used to
+        estimate each candidate table's contribution during pruning; on small data it adapts
+        down so every fold keeps at least ``prune_fold_min_rows`` rows. Only has an effect
+        together with ``prune=True``.
     prune_drop_z : float or None, default=2.0
-        Evidence bar for DROPPING a table (av37). With paired per-fold CV evidence in hand, a
-        candidate interaction table is dropped only when its mean drop-gain clears this many
-        standard errors of that mean over the prune folds; no evidence means keep. ``None``
-        restores the pre-av37 rule, which kept a table on the SIGN of its fold-mean and so
-        dropped on evidence that could not resolve the question (measured: 11.0 +/- 1.9 of 14
-        tables kept across 90 fits of identical data, seed the only difference). The gate is
-        monotone — it can only ever keep MORE tables than the old rule, never fewer. Tables
-        scored by fewer than two folds keep the old verdict: absence from a fold's bank is a
-        structural fact, not an ambiguous measurement. Only has an effect with ``prune=True``.
+        Fold vote only (see ``prune_selector``). Evidence bar for DROPPING a table (av37). With
+        paired per-fold CV evidence in hand, a candidate interaction table is dropped only when
+        its mean drop-gain clears this many standard errors of that mean over the prune folds;
+        no evidence means keep. ``None`` restores the pre-av37 rule, which kept a table on the
+        SIGN of its fold-mean and so dropped on evidence that could not resolve the question
+        (measured: 11.0 +/- 1.9 of 14 tables kept across 90 fits of identical data, seed the
+        only difference). The gate is monotone — it can only ever keep MORE tables than the old
+        rule, never fewer. Tables scored by fewer than two folds keep the old verdict: absence
+        from a fold's bank is a structural fact, not an ambiguous measurement. Only has an
+        effect with ``prune=True``.
     prune_keep_budget : int, default=32
-        Explainability budget for ``prune_drop_z`` admissions. Ambiguous tables are ranked by
-        mean gain and admitted only while the pre-cascade keep-set stays within
-        ``max(prune_keep_budget, <the pre-av37 keep-set size>)``. A bank that was already
-        larger than the budget is therefore left exactly as the old rule chose it, while a
-        small candidate bank — the regime where the fold evidence cannot resolve anything —
-        comes back whole.
+        Fold vote only (see ``prune_selector``). Explainability budget for ``prune_drop_z``
+        admissions. Ambiguous tables are ranked by mean gain and admitted only while the
+        pre-cascade keep-set stays within ``max(prune_keep_budget, <the pre-av37 keep-set
+        size>)``. A bank that was already larger than the budget is therefore left exactly as
+        the old rule chose it, while a small candidate bank — the regime where the fold evidence
+        cannot resolve anything — comes back whole.
     prune_box_budget : int, default=0
         DEPLOYED-BOX budget: the total rank-1 region boxes the deployed bank may carry. ``0``
         disables it, and the fit is then bit-identical to one without the parameter.
@@ -7030,8 +7141,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         subset. Dense tables cost zero boxes and are never touched. A budget at or above the
         bank's own box total is a verbatim no-op. Requires ``prune=True`` (raises otherwise).
     prune_lambda_boxes : float, default=0.0
-        SELECTION-time price of one deployed box, in held-out-deviance units. ``0.0``
-        disables it and the fit is bit-identical to one without the parameter.
+        Fold vote only (see ``prune_selector``). SELECTION-time price of one deployed box, in
+        held-out-deviance units. ``0.0`` disables it and the fit is bit-identical to one without
+        the parameter.
 
         The selection-time analogue of ``prune_box_budget``, and the piece the av38 depth
         battery named as missing: selection could not see bank size, so it could not REFUSE a
@@ -7075,10 +7187,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         many classes carry a copy — while an arity census that sums per-class copies reads
         about K times higher. Both numbers describe the same bank.
     prune_lambda_tables : float, default=0.0
-        SELECTION-time price of one kept table of arity ``>= prune_table_min_arity``, in
-        held-out-deviance units. ``0.0`` disables it and the fit is bit-identical to one
-        without the parameter. The waypoint objective gains
-        ``+ prune_lambda_tables * (kept tables at or above the floor)``.
+        Fold vote only (see ``prune_selector``). SELECTION-time price of one kept table of arity
+        ``>= prune_table_min_arity``, in held-out-deviance units. ``0.0`` disables it and the
+        fit is bit-identical to one without the parameter. The waypoint objective gains ``+
+        prune_lambda_tables * (kept tables at or above the floor)``.
 
         KNOWN LIMIT, and the reason this is not the knob to reach for if you want the bar met.
         Like ``prune_lambda_boxes`` it only re-picks a waypoint on an already-fixed
@@ -7089,38 +7201,56 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         across four more decades of lambda, while ``prune_table_budget`` lands on 8, 4 or 2
         exactly on request. Use this to let SELECTION see table count — the gap the av38
         battery named — not to hit a number.
+    prune_size_penalty : float or None, default=None
+        Fold vote only: the same lever as ``prune_lambda_tables`` (and the replacement for the
+        deprecated ``prune_lambda_boxes``). Setting it sets ``prune_lambda_tables``; setting
+        both to different values raises ``ValueError``.
     prune_table_min_arity : int, default=3
         Lowest interaction order that ``prune_table_budget`` and ``prune_lambda_tables`` count.
         Consulted only when one of them is armed, so its value cannot perturb a default fit.
         ``3`` is the product bar: mains and pairs are what a filing reads, three-way tables are
         what inflates it. Must be in ``1..8``.
+    prune_guard : bool, default=True
+        Fold vote only: check the selected set of tables as a whole. The vote judges tables one
+        at a time, so it can drop a group of correlated tables that only matter together; the
+        guard compares the selected set with the full set on honest rows (the out-of-bag rows,
+        or a shared holdout for grouped data) and re-admits dropped tables, best evidence
+        first, while the relative deviance gap exceeds ``prune_guard_tol``. The multiclass
+        (K>=3) fold vote uses ``multiclass_prune_guard`` instead.
+    prune_guard_tol : float, default=0.05
+        Fold vote only: the no-harm guard's tolerance, the largest acceptable relative increase
+        of the selected set's deviance over the full set's. ``prune_guard_z``,
+        ``prune_guard_z_dn`` and ``prune_guard_tol_floor`` turn it into an SE-aware bar.
     prune_guard_z : float, default=0.0
-        SE multiplier for the set-level no-harm guard's breach test: it breaches, and the
-        re-admission ladder stops, on ``gap > max(prune_guard_tol, prune_guard_z * SE)`` where
-        ``SE`` is the standard error of the relative deviance gap on the guard's own evidence
-        rows (reported as ``gap_se``, with the resulting bar as ``tol_effective``). The shipped
-        ``0.0`` is the fixed-relative-tolerance test. Measured and deliberately off: on a
-        zero-inflated compound target the row-level SE is dominated by a few large claims and
-        cannot resolve even a real set-level gap — see the ``_PRUNE_GUARD_Z_DEFAULT`` note.
+        Fold vote only (see ``prune_selector``). SE multiplier for the set-level no-harm guard's
+        breach test: it breaches, and the re-admission ladder stops, on ``gap >
+        max(prune_guard_tol, prune_guard_z * SE)`` where ``SE`` is the standard error of the
+        relative deviance gap on the guard's own evidence rows (reported as ``gap_se``, with the
+        resulting bar as ``tol_effective``). The shipped ``0.0`` is the fixed-relative-tolerance
+        test. Measured and deliberately off: on a zero-inflated compound target the row-level SE
+        is dominated by a few large claims and cannot resolve even a real set-level gap — see
+        the ``_PRUNE_GUARD_Z_DEFAULT`` note.
     prune_guard_z_dn : float, default=2.0
-        SE multiplier for the DOWNWARD recalibration of the same bar (av39). The effective
-        tolerance becomes ``min(tol_up, max(prune_guard_tol_floor, prune_guard_z_dn * SE))``,
-        where ``tol_up`` is the ``prune_guard_z`` result above — so where the guard's jury is
-        sharp the bar tightens to a few SE instead of a fixed 5%, and where it is blunt the
-        ``min`` pins the bar back at ``prune_guard_tol`` and the fit is bit-identical. This knob
-        can therefore only ever make the guard fire MORE, never less. It governs BOTH the breach
-        trigger and the ladder's stopping rule. ``0.0`` restores the pre-av39 guard exactly.
+        Fold vote only (see ``prune_selector``). SE multiplier for the DOWNWARD recalibration of
+        the same bar (av39). The effective tolerance becomes ``min(tol_up,
+        max(prune_guard_tol_floor, prune_guard_z_dn * SE))``, where ``tol_up`` is the
+        ``prune_guard_z`` result above — so where the guard's jury is sharp the bar tightens to
+        a few SE instead of a fixed 5%, and where it is blunt the ``min`` pins the bar back at
+        ``prune_guard_tol`` and the fit is bit-identical. This knob can therefore only ever make
+        the guard fire MORE, never less. It governs BOTH the breach trigger and the ladder's
+        stopping rule. ``0.0`` restores the pre-av39 guard exactly.
     prune_guard_tol_floor : float, default=0.005
-        Lower clamp on the downward recalibration, so an arbitrarily sharp jury cannot drive the
-        bar to zero and re-admit the whole bank on immeasurable noise. Ignored when
-        ``prune_guard_z_dn = 0``.
+        Fold vote only (see ``prune_selector``). Lower clamp on the downward recalibration, so
+        an arbitrarily sharp jury cannot drive the bar to zero and re-admit the whole bank on
+        immeasurable noise. Ignored when ``prune_guard_z_dn = 0``.
     prune_min_stability : float, default=0.5
-        Fold-stability bar for keeping a table: the aggregator keeps one when
-        ``mean_gain > prune_min_mean_gain`` **and** (it survived at least this fraction of the
-        prune folds' own selections, **or** scored a positive drop-gain in at least this
-        fraction of them). In plain terms: *in how many folds must this table show signal.*
-        Previously a hardcoded ``0.5`` — this is the knob that actually governs the deployed
-        bank's size on the regressor/binary path, where ``prune_se_rule`` cannot reach.
+        Fold vote only (see ``prune_selector``). Fold-stability bar for keeping a table: the
+        aggregator keeps one when ``mean_gain > prune_min_mean_gain`` **and** (it survived at
+        least this fraction of the prune folds' own selections, **or** scored a positive
+        drop-gain in at least this fraction of them). In plain terms: *in how many folds must
+        this table show signal.* Previously a hardcoded ``0.5`` — this is the knob that actually
+        governs the deployed bank's size on the regressor/binary path, where ``prune_se_rule``
+        cannot reach.
 
         The fold rates quantise to ``1/prune_n_folds``, so at the default 5 folds this is a
         3-position dial: ``(0.4, 0.6]`` = 3/5, ``(0.6, 0.8]`` = 4/5, ``(0.8, 1.0]`` = 5/5.
@@ -7128,17 +7258,19 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         bank from 58.3 to 37.0 tables and 1216 to 389 boxes for −0.49% ± 0.66 of test D², the
         best explainability-per-accuracy-point of any pruning knob, and it halves the
         seed-to-seed spread in bank size. The default stays ``0.5`` pending a multi-dataset
-        battery. Multiclass (K>=3) has no fold vote to threshold, so a non-default value raises
-        there. Only has an effect together with ``prune=True``.
+        battery. On a multiclass (K>=3) fit a non-default value raises only under the legacy
+        single split (``multiclass_prune_cv=False``), which has no fold vote to threshold. Only
+        has an effect together with ``prune=True``.
     prune_min_mean_gain : float, default=0.0
-        Minimum mean held-out drop-gain a table must earn to be kept, in deviance units on the
-        dataset's own per-unit-weight scale. ``0.0`` (the default) is the historical
-        ``mean_gain > 0`` test, bit-for-bit — under it a table kept on a mean gain of ``1e-9``
-        is kept on noise. This is the threshold-parameterised counterpart to
-        ``prune_table_budget``'s count cap: drop everything whose evidence is weaker than a
-        stated bar, rather than keeping the best-ranked N. The native pruning report has always
-        carried a ``min_mean_gain`` field and always written a literal ``0.0``; it now reports
-        the threshold actually used. Multiclass (K>=3) raises on a non-default value, as for
+        Fold vote only (see ``prune_selector``). Minimum mean held-out drop-gain a table must
+        earn to be kept, in deviance units on the dataset's own per-unit-weight scale. ``0.0``
+        (the default) is the historical ``mean_gain > 0`` test, bit-for-bit — under it a table
+        kept on a mean gain of ``1e-9`` is kept on noise. This is the threshold-parameterised
+        counterpart to ``prune_table_budget``'s count cap: drop everything whose evidence is
+        weaker than a stated bar, rather than keeping the best-ranked N. The native pruning
+        report has always carried a ``min_mean_gain`` field and always written a literal
+        ``0.0``; it now reports the threshold actually used. On a multiclass (K>=3) fit a
+        non-default value raises only under the legacy single split, as for
         ``prune_min_stability``. Only has an effect together with ``prune=True``.
 
         **It interacts with ``prune_drop_z``, and not in the obvious direction.** The floor
@@ -7156,32 +7288,43 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         takes the deployed bank 54 -> 46 -> 31 tables, with ``1e-5`` landing 15% fewer tables at
         a slightly BETTER test deviance (0.55911 vs 0.55915) than the default.
     prune_fold_min_rows : int, default=125
-        Rows-per-fold floor that sizes the prune CV: the fold count is
-        ``max(2, min(prune_n_folds, n // prune_fold_min_rows, n))``, so on small data the number
-        of folds adapts DOWN rather than producing folds too thin to score a table. Raising it
-        makes that adaptation kick in earlier. Only has an effect together with ``prune=True``.
+        Fold vote only (see ``prune_selector``). Rows-per-fold floor that sizes the prune CV:
+        the fold count is ``max(2, min(prune_n_folds, n // prune_fold_min_rows, n))``, so on
+        small data the number of folds adapts DOWN rather than producing folds too thin to score
+        a table. Raising it makes that adaptation kick in earlier. Only has an effect together
+        with ``prune=True``.
     prune_fold_es_patience : int or None, default=None
-        Early-stopping patience for the prune-CV FOLD fits only; the deploy fit always keeps the
-        estimator's own ``early_stopping_rounds``. ``None`` resolves to the shipped ``250``; an
-        explicit integer overrides it. The fold fits exist only to vote on table survival, which is why
-        their patience is tighter than the deploy fit's — 250 left every studied keep-set
-        bit-identical with the MTPL CV scan 19.4% faster. Only has an effect together with
-        ``prune=True``.
+        Fold vote only (see ``prune_selector``). Early-stopping patience for the prune-CV FOLD
+        fits only; the deploy fit always keeps the estimator's own ``early_stopping_rounds``.
+        ``None`` resolves to the shipped ``250``; an explicit integer overrides it. The fold
+        fits exist only to vote on table survival, which is why their patience is tighter than
+        the deploy fit's — 250 left every studied keep-set bit-identical with the MTPL CV scan
+        19.4% faster. Only has an effect together with ``prune=True``.
+    prune_fold_fidelity : bool, default=False
+        Fold vote only: score every candidate table in every fold. A fold model searches its own
+        structure, so it may not build some of the deployed model's tables, and those then get
+        no evidence from that fold; with this on, each fold gives the missing tables values by
+        a ridge fit on its training rows, so every candidate gets a held-out gain. Regression
+        and binary classification only: ``True`` raises on a multiclass (K>=3) fit.
     prune_guard_min_rows : int, default=500
-        Minimum honest evidence rows before the set-level no-harm guard will judge at all —
+        Minimum honest evidence rows before the tables are judged on them. The ranked path
+        needs this many out-of-bag rows, or the fit falls back as ``prune_selector`` describes.
+        The fold vote's set-level no-harm guard needs this many before it judges at all —
         below this the pruned-vs-full deviance ratio is noise and the guard reports itself
-        skipped rather than acting on it. Counts out-of-bag-covered rows on the OOB path and
+        skipped rather than acting on it; it counts out-of-bag-covered rows on the OOB path and
         shared-holdout rows on the grouped carve path. Only has an effect together with
-        ``prune=True`` and ``prune_guard=True``.
+        ``prune=True``.
     prune_slope_eps : float, default=0.01
-        Dead band on the post-prune slope re-anchor: the correction is not applied unless the
-        out-of-bag scale ``b`` differs from 1 by more than this, so a bank that was not
-        materially compressed keeps a byte-identical artifact. See ``pruning_report_["slope"]``.
+        Fold vote only (see ``prune_selector``). Dead band on the post-prune slope re-anchor:
+        the correction is not applied unless the out-of-bag scale ``b`` differs from 1 by more
+        than this, so a bank that was not materially compressed keeps a byte-identical artifact.
+        See ``pruning_report_["slope"]``.
     prune_slope_min_z : float, default=3.0
-        Significance bar for that same correction: ``b`` must also be off by at least this many
-        standard errors (``z_b``) before it is applied. Together with ``prune_slope_eps`` this
-        is the "materially AND significantly off" test — lowering either makes the re-anchor
-        fire more readily. See ``pruning_report_["slope"]``.
+        Fold vote only (see ``prune_selector``). Significance bar for that same correction:
+        ``b`` must also be off by at least this many standard errors (``z_b``) before it is
+        applied. Together with ``prune_slope_eps`` this is the "materially AND significantly
+        off" test — lowering either makes the re-anchor fire more readily. See
+        ``pruning_report_["slope"]``.
     prune_refit_full : bool, default=False
         Deprecated and without effect on any path: contribution-stability pruning always
         fits the deployed model on all rows and applies the keep-set to that same fit, so
@@ -7195,6 +7338,19 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
         Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
         to deploy the drop-only pruned model. Only has an effect together with ``prune=True``.
+    band_tolerance : float or None, default=0.75
+        Banding: after pruning, each deployed interaction table is condensed into a small
+        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        them, every table containing a feature cuts it at the same nested places, and missing
+        values keep their own band. The mean squared change of the predictions is held within
+        ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
+        within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
+        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
+        outcome is in ``pruning_report_["banding"]``.
+    band_deviance_cap : float, default=0.001
+        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
+        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
+        that can cost.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -7224,8 +7380,11 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         assuming it is always present.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and their cross-validated contributions. Only set when
-        ``prune=True``.
+        kept, and deployed, and the evidence they were judged on. Only set when
+        ``prune=True``. ``["selector"]`` names the selector that ran: ``"ranked_path"``, whose
+        prefixes and their out-of-bag deviances are under ``["path"]`` (``["selection"]`` on a
+        multiclass fit), or a fold vote, which the guard, slope and evidence fields below
+        describe.
 
         ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
         slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
@@ -7642,7 +7801,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             The export reports residual conditional means on observed support. Main effects
             are not observed marginal A/E or causal effects. Orders three and above stay
             product-purified (a hybrid), variance shares no longer add to one, and the
-            equal-split attributions are no longer Shapley values.
+            equal-split attributions are no longer Shapley values. ``"joint"`` is not
+            supported for banded tables (the default ``band_tolerance``): fit with
+            ``band_tolerance=None`` to export under it.
         laplace : float, default=1.0
             Laplace smoothing constant for the ``"product_marginals"`` reference measure.
             Unused for the other measures.
@@ -7739,22 +7900,24 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
 
 
 class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
-    """Exact, depth-3 oblivious-tree gradient boosting classifier.
+    """Exact oblivious-tree gradient boosting classifier.
 
     Binary (K=2) fits stay on an exact single-model logistic path. Fits with three or more
     classes (K>=3) use a native multinomial-softmax path with one exact fANOVA table bank
-    per class. Every tree is a symmetric (oblivious) depth-3 tree touching at most three
-    distinct raw features, so each class's fitted ensemble decomposes exactly into a sum of
-    at-most-3-way fANOVA effect tables (see :meth:`tables`) with no approximation.
+    per class. By default every tree is a symmetric (oblivious) depth-3 tree touching at most
+    three distinct raw features (``max_depth``, ``max_interaction_order``), so each class's
+    fitted ensemble decomposes exactly into a sum of at-most-3-way fANOVA effect tables (see
+    :meth:`tables`) with no approximation.
 
-    The defaults include a complete fitting pipeline. The September 2026 benchmark
-    describes an earlier pipeline; current graduation reserves a separate holdout. early stopping is on
-    by default (``validation_fraction=0.1``, ``early_stopping_rounds=500`` with adaptive
-    patience ``early_stopping_adaptive=1.5``, against a large ``n_trees=4000`` cap), outer
-    bagging is on by default (``n_bags=8``), per-tree column sampling is on by default
-    (``colsample_bytree=0.8``), and post-fit table pruning is on by default (``prune=True`` —
-    the fitted artifact is the CV-pruned tables-only model). Pass
-    ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit baseline.
+    The defaults are a complete fitting pipeline: early stopping is on
+    (``validation_fraction=0.1``, ``early_stopping_rounds=500`` with adaptive patience
+    ``early_stopping_adaptive=1.5``, against a large ``n_trees=4000`` cap), outer bagging is on
+    (``n_bags=8``), per-tree column sampling is on (``colsample_bytree=0.8``), and post-fit
+    table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
+    (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
+    tables are graduated (``graduate``; not for multiclass). The fitted artifact is that tables-only model.
+    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
+    baseline.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -7873,20 +8036,23 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Row-sampling rate for split search. ``None`` scans every row. A value in ``(0, 1)``
         switches to minimal-variance-style (MVS) sampling: a probability-proportional-to-
         gradient row subset chooses the split structure, with ``mvs_min_rows`` as a floor on
-        the sampled count; leaf values are still refit from all rows regardless. Binary
-        (K=2) path only — the multiclass (K>=3) path always scans every row: setting this
-        away from its default (``None``) raises ``ValueError`` at multiclass fit time rather
-        than silently ignoring it (see the class-level honesty note).
+        the sampled count; leaf values are still refit from all rows regardless. On the
+        multiclass (K>=3) path one row draw per round is shared by the K class trees, weighted
+        by the joint gradient/hessian norm across classes.
     colsample_bytree : float, default=0.8
         Fraction of features randomly sampled per tree.
     learning_rate_decay : float, default=0.0
-        Per-round multiplicative decay applied to ``learning_rate``. ``0.0`` is a constant
-        rate.
+        Learning-rate decay over the boosting rounds: round ``t`` uses
+        ``learning_rate / (1 + learning_rate_decay * t)``. ``0.0`` keeps the rate constant.
     validation_fraction : float or None, default=0.1
         Fraction of training rows carved out as an internal early-stopping holdout. ``None``
         disables internal early stopping entirely, so every fit runs the full ``n_trees``.
         See the class-level honesty note above regarding class-stratification of this carve
         for binary versus multiclass fits.
+    early_stopping : int, float or None, default=None
+        One setting for the early-stopping patience: an int sets ``early_stopping_rounds``, a
+        float sets ``early_stopping_adaptive``. Setting it together with a different value of
+        the parameter it sets raises ``ValueError``.
     early_stopping_rounds : int, default=500
         Patience: the fit stops once this many rounds pass without a validation-deviance
         improvement (see ``early_stopping_min_delta`` for what counts as an improvement).
@@ -7958,10 +8124,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         objective; kept for constructor symmetry with :class:`TBoostRegressor`.
     mvs_min_rows : int, default=1
         Floor on the sampled row count when ``subsample`` enables minimal-variance-style
-        (MVS) row sampling. Has no effect when ``subsample`` is ``None``, and no effect at
-        all on the multiclass (K>=3) path, which does not row-sample: setting this away from
-        its default (``1``) independently raises ``ValueError`` at multiclass fit time (see
-        ``subsample``).
+        (MVS) row sampling, on the binary and multiclass (K>=3) paths alike. Has no effect
+        when ``subsample`` is ``None``.
     hist_precision : {"full", "quantized"} or None, default=None
         Histogram accumulator precision. ``None``/``"full"`` uses the exact full-precision
         accumulator; ``"quantized"`` uses a faster quantized-integer accumulator.
@@ -7970,27 +8134,22 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         fANOVA banks). Replicated benchmarking found row-bag plus column diversity to be the
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
-        default. ``n_bags=1`` disables bagging. Binary (K=2) path only: the multiclass
-        (K>=3) native-softmax path fits a single unbagged model regardless of this setting —
-        every multiclass fit costs roughly what a single-bag binary fit would, not ``n_bags``
-        times that. The shipped default (``8``) is already non-inert, so a multiclass fit
-        warns once per estimator instance whenever this is greater than ``1`` — including at
-        its own default — rather than raising (see the class-level honesty note); pass
-        ``n_bags=1`` to silence the warning.
+        default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
+        banding is skipped and pruning falls back to the fold vote (a multiclass fit keeps
+        its full bank instead). The multiclass (K>=3) path bags too, souping the bags per
+        class.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
         duplicates rows, which makes the per-bag early-stopping validation carve overlap the
         bag's own training multiset, a train/validation leak that lets validation deviance
         improve indefinitely and defeats early stopping. Set to ``1.0`` to restore classic
-        bootstrap bagging. Only relevant when ``n_bags > 1``, which in turn only has an
-        effect on the binary (K=2) path, and is warned about (not raised) on multiclass fits
-        alongside ``n_bags`` (see ``n_bags``).
+        bootstrap bagging. Only relevant when ``n_bags > 1``.
     cell_refit_base : float or None, default=None
         Base ridge penalty for the out-of-bag (OOB) fANOVA cell refit: after bagging, each
         cell coefficient in the averaged bank is re-fit toward its bags' OOB residual under a
         ridge penalty shaped by ``cell_refit_gamma``, then re-purified. ``None`` (the
-        default) disables it. Requires real bagging (an OOB partition, i.e. ``n_bags >= 1``)
+        default) disables it. Requires real bagging (an OOB partition, i.e. ``n_bags >= 2``)
         — setting it without bagging raises ``ValueError`` rather than silently no-opping.
         Held-out no-harm guarded: adopted only if it improves held-out deviance. Honored on
         the multiclass (K>=3) path too since 2026-08-25: there the softmax Hessian block
@@ -8057,7 +8216,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         setting — an explicit ``True``/``False`` there raises ``ValueError`` rather than
         silently no-opping.
     max_interaction_order : int, default=3
-        Whole-tree cap on the number of distinct raw features a tree may use (1 to 4) —
+        Whole-tree cap on the number of distinct raw features a tree may use (1 to 8) —
         caps interaction ORDER, which is the number of axes an exported table has. It does
         not cap tree depth; see ``max_depth`` for that. Must be ``<= max_depth`` (a tree
         needs one level per distinct feature), and values above 3 are opt-in.
@@ -8067,8 +8226,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         same algebra a 3-way is, and all five decomposability checks pass unchanged. It is a
         READABILITY relaxation, priced in three places: the interaction-gain hurdle doubles
         again at the 3->4 transition, ``table_budget_order_shrink`` halves the table-size
-        prior's allowance, and the evidence-gated prune drops any 4-way the held-out folds
-        cannot pay for. Measured: on a target whose highest true interaction is a pair,
+        prior's allowance, and the prune drops any 4-way table that does not pay for itself on
+        held-out rows. Measured: on a target whose highest true interaction is a pair,
         raising the cap from 3 to 4 leaves the deployed table set and the fit IDENTICAL.
 
         **Prefer ``max_depth == max_interaction_order`` at order 4.** A 4-way effect is
@@ -8088,8 +8247,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         a lifted order-3 effect is exported as a dense cube, and a cube is cubic in the
         per-axis extent, so without the tighter budget the bank overflows its firewall.
         4096 lands at roughly 16 cells per axis for a 3-way table and 64x64 for a pair.
+    table_budget_order_shrink : float, default=2.0
+        How much ``table_budget_cells`` shrinks per interaction order above 3: a k-way support
+        (k > 3) is measured against ``budget / table_budget_order_shrink ** (k - 3)`` cells,
+        because a table with more axes is harder to read at the same cell count. ``1.0`` turns
+        the shrink off.
     max_depth : int, default=3
-        Whole-tree cap on the number of split LEVELS (3 to 6). Orthogonal to
+        Whole-tree cap on the number of split LEVELS (3 to 8). Orthogonal to
         ``max_interaction_order``: depth caps *resolution*, order caps *interaction*.
 
         Once a tree holds ``max_interaction_order`` distinct raw features, deeper levels
@@ -8108,9 +8272,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         capability: a 7-step main effect fit in a single boosting round.
 
         **The default is 3 and should stay 3 unless a held-out probe says otherwise.**
-        Deeper trees put ~3.4x fewer rows in each cell, and raising depth automatically
-        raises the ``min_data_in_leaf`` floor to compensate (see that parameter). Not
-        supported together with ``ridge_refit_l2``, which errors.
+        Deeper trees put ~3.4x fewer rows in each cell, and ``min_data_in_leaf`` stays ``0``
+        at every depth unless you set it (see that parameter). Not supported together with
+        ``ridge_refit_l2``, which errors.
     seed : int, default=0
         Seed for every deterministic source of randomness in the fit (row/column sampling,
         bagging, DART dropout, ``random_strength`` noise). The same seed and inputs
@@ -8228,21 +8392,47 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         can only add axes. Raise it (e.g. to ``20``, matching ``cat_count_min_levels``) to
         restrict the channels to high-cardinality features.
     prune : bool, default=True
-        Whether to run post-fit table pruning: drop fANOVA tables that don't improve
-        cross-validated held-out deviance, and deploy the smaller, more explainable
-        tables-only model (see ``pruning_report_``). ON by default — every insur-arena
-        benchmark cell deployed the pruned artifact, and the selection is held-out-guarded
-        (neutral-or-better by construction). ``False`` deploys the full, unpruned table bank
-        instead (fitted faster, but a much larger artifact). Either way the model is stored
-        as rating tables. Available on both the binary and multiclass (K>=3) paths.
+        Whether to run post-fit table pruning: drop the fANOVA tables that do not earn their
+        place on held-out rows, and deploy the smaller, more explainable tables-only model
+        (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
+        the pruned artifact. ``prune_selector`` decides how the tables are judged (see
+        :class:`TBoostRegressor`). ``False`` deploys the full, unpruned table bank instead
+        (fitted faster, but a much larger artifact). Either way the model is stored as rating
+        tables. Available on both the binary and multiclass (K>=3) paths.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too; see :class:`TBoostRegressor`. Honored by
         every selector on the binary and multiclass (K>=3) paths.
+    prune_selector : {"ranked_path", "fold_vote"}, default="ranked_path"
+        How pruning chooses the tables to keep. ``"ranked_path"`` ranks the candidate tables by
+        purified variance, admits them in that order under heredity (a k-way table only after
+        all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
+        deploys the smallest one that is good enough (``prune_path_fraction``,
+        ``prune_path_tolerance``). It needs out-of-bag rows: without at least
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
+        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
+        vote, evidence gate and no-harm guard: the parameters documented as fold vote only.
+        ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
+        lists the parameters you set that it did not read.
+    prune_path_fraction : float, default=0.995
+        Ranked path only: the fraction of the out-of-bag improvement the deployed prefix must
+        capture, measured from the main-effects-only model (the intercept-only model with
+        ``prune_main_effects=True``) to the prefix with the lowest out-of-bag deviance. ``1.0``
+        deploys that best prefix. Must be in ``(0, 1]``.
+    prune_path_tolerance : float, default=0.001
+        Ranked path only: the largest relative excess of the deployed prefix's out-of-bag
+        deviance over the best prefix's. The deployed prefix is the larger of the smallest one
+        that captures ``prune_path_fraction`` of the improvement and the smallest one within
+        this tolerance, so a small fraction of a large improvement cannot cost more than this
+        fraction of the deviance. Must be ``>= 0``; ignored when ``prune_path_fraction`` is
+        ``1.0``.
+    prune_path_steps : int, default=32
+        Ranked path only: the number of prefixes scored, their sizes spaced geometrically
+        between one table and all the candidates.
     prune_validation_fraction : float, default=0.15
-        Train/select split fraction of the LEGACY multiclass (K>=3) prune
-        (``multiclass_prune_cv=False``). Every other configuration selects on K-fold CV sized
-        by ``prune_n_folds`` — a non-default value there raises ``ValueError`` rather than
-        silently no-opping.
+        Train/select split fraction of the LEGACY multiclass (K>=3) fold vote
+        (``multiclass_prune_cv=False``). In every other configuration a non-default value
+        raises ``ValueError`` rather than silently no-opping.
     multiclass_prune_cv : bool, default=True
         Multiclass (K>=3) prune selection regime. ``True`` (the default since 2026-09-07) is
         the single-output prune's design: ``prune_n_folds`` fold refits scored on their
@@ -8257,16 +8447,26 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         pruned model is within ``max(prune_guard_z_dn * SE, floor * (dev_null - dev_full))`` of
         the full bank on honest rows; the floor is the price a simpler model is allowed to pay.
         ``0.0`` keeps the SE term only.
+    multiclass_prune_guard : bool, default=True
+        The multiclass (K>=3) fold vote's set-level no-harm guard: check the selected tables as
+        a whole against the full bank on honest rows, and re-admit dropped tables while the gap
+        exceeds the bar (see ``multiclass_prune_guard_floor``). The ranked path has no guard.
+    multiclass_prune_sel_bags : int, default=1
+        Bag count of the multiclass (K>=3) fold vote's selection fits (the fold models, or the
+        selection model of the legacy single split). Must be ``>= 1``; any value other than
+        ``1`` raises for binary classification.
     prune_se_rule : float, default=0.0
-        Pruning selection rule, in standard errors of the cross-validated deviance estimate.
-        ``0.0`` (the default) selects the held-out-deviance minimum, which improves or is
-        neutral versus the unpruned model on every benchmark tried. A larger value (e.g.
-        ``0.5`` or the classic ``1.0`` one-standard-error rule) prunes more aggressively for
-        parsimony but monotonically degrades the deviance metric — a deliberate
-        explainability/accuracy trade-off, opt in explicitly for smaller models.
+        Fold vote only (see ``prune_selector``). Pruning selection rule, in standard errors of
+        the cross-validated deviance estimate. ``0.0`` (the default) selects the
+        held-out-deviance minimum, which improves or is neutral versus the unpruned model on
+        every benchmark tried. A larger value (e.g. ``0.5`` or the classic ``1.0``
+        one-standard-error rule) prunes more aggressively for parsimony but monotonically
+        degrades the deviance metric — a deliberate explainability/accuracy trade-off, opt in
+        explicitly for smaller models.
 
-        **MULTICLASS (K>=3) ONLY.** That path selects on a single train/select split, so the
-        band decides the deployed keep-set directly. The regressor/binary path instead
+        **MULTICLASS (K>=3) FOLD VOTE ONLY.** There the band applies to each selection walk:
+        the legacy single train/select split (``multiclass_prune_cv=False``), where it decides
+        the deployed keep-set directly, or each CV fold's walk. The regressor/binary path instead
         AGGREGATES per-fold selections, and the band reaches that aggregation only through
         ``kept_rate``, which the keep rule ORs against ``positive_rate`` — measured
         bit-identical banks for ``prune_se_rule`` in ``{0, 0.5, 1, 2, 10, 100}`` at four
@@ -8274,26 +8474,28 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         silently no-opping; use ``prune_table_budget`` / ``prune_box_budget`` for a smaller
         bank on that path. Only has an effect together with ``prune=True``.
     prune_n_folds : int, default=5
-        Number of cross-validation folds used to estimate each candidate table's
-        contribution during pruning on the binary (K=2) path. Unused on the multiclass path
-        (see ``prune_validation_fraction``).
+        Fold vote only (see ``prune_selector``). Number of cross-validation folds used to
+        estimate each candidate table's contribution during pruning; on small data it adapts
+        down so every fold keeps at least ``prune_fold_min_rows`` rows. The legacy multiclass
+        single split (``multiclass_prune_cv=False``) uses no folds.
     prune_drop_z : float or None, default=2.0
-        Evidence bar for DROPPING a table (av37). With paired per-fold CV evidence in hand, a
-        candidate interaction table is dropped only when its mean drop-gain clears this many
-        standard errors of that mean over the prune folds; no evidence means keep. ``None``
-        restores the pre-av37 rule, which kept a table on the SIGN of its fold-mean and so
-        dropped on evidence that could not resolve the question (measured: 11.0 +/- 1.9 of 14
-        tables kept across 90 fits of identical data, seed the only difference). The gate is
-        monotone — it can only ever keep MORE tables than the old rule, never fewer. Tables
-        scored by fewer than two folds keep the old verdict: absence from a fold's bank is a
-        structural fact, not an ambiguous measurement. Only has an effect with ``prune=True``.
+        Fold vote only (see ``prune_selector``). Evidence bar for DROPPING a table (av37). With
+        paired per-fold CV evidence in hand, a candidate interaction table is dropped only when
+        its mean drop-gain clears this many standard errors of that mean over the prune folds;
+        no evidence means keep. ``None`` restores the pre-av37 rule, which kept a table on the
+        SIGN of its fold-mean and so dropped on evidence that could not resolve the question
+        (measured: 11.0 +/- 1.9 of 14 tables kept across 90 fits of identical data, seed the
+        only difference). The gate is monotone — it can only ever keep MORE tables than the old
+        rule, never fewer. Tables scored by fewer than two folds keep the old verdict: absence
+        from a fold's bank is a structural fact, not an ambiguous measurement. Only has an
+        effect with ``prune=True``.
     prune_keep_budget : int, default=32
-        Explainability budget for ``prune_drop_z`` admissions. Ambiguous tables are ranked by
-        mean gain and admitted only while the pre-cascade keep-set stays within
-        ``max(prune_keep_budget, <the pre-av37 keep-set size>)``. A bank that was already
-        larger than the budget is therefore left exactly as the old rule chose it, while a
-        small candidate bank — the regime where the fold evidence cannot resolve anything —
-        comes back whole.
+        Fold vote only (see ``prune_selector``). Explainability budget for ``prune_drop_z``
+        admissions. Ambiguous tables are ranked by mean gain and admitted only while the
+        pre-cascade keep-set stays within ``max(prune_keep_budget, <the pre-av37 keep-set
+        size>)``. A bank that was already larger than the budget is therefore left exactly as
+        the old rule chose it, while a small candidate bank — the regime where the fold evidence
+        cannot resolve anything — comes back whole.
     prune_box_budget : int, default=0
         DEPLOYED-BOX budget: the total rank-1 region boxes the deployed bank may carry. ``0``
         disables it, and the fit is then bit-identical to one without the parameter.
@@ -8311,8 +8513,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         subset. Dense tables cost zero boxes and are never touched. A budget at or above the
         bank's own box total is a verbatim no-op. Requires ``prune=True`` (raises otherwise).
     prune_lambda_boxes : float, default=0.0
-        SELECTION-time price of one deployed box, in held-out-deviance units. ``0.0``
-        disables it and the fit is bit-identical to one without the parameter.
+        Fold vote only (see ``prune_selector``). SELECTION-time price of one deployed box, in
+        held-out-deviance units. ``0.0`` disables it and the fit is bit-identical to one without
+        the parameter.
 
         The selection-time analogue of ``prune_box_budget``, and the piece the av38 depth
         battery named as missing: selection could not see bank size, so it could not REFUSE a
@@ -8356,10 +8559,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         many classes carry a copy — while an arity census that sums per-class copies reads
         about K times higher. Both numbers describe the same bank.
     prune_lambda_tables : float, default=0.0
-        SELECTION-time price of one kept table of arity ``>= prune_table_min_arity``, in
-        held-out-deviance units. ``0.0`` disables it and the fit is bit-identical to one
-        without the parameter. The waypoint objective gains
-        ``+ prune_lambda_tables * (kept tables at or above the floor)``.
+        Fold vote only (see ``prune_selector``). SELECTION-time price of one kept table of arity
+        ``>= prune_table_min_arity``, in held-out-deviance units. ``0.0`` disables it and the
+        fit is bit-identical to one without the parameter. The waypoint objective gains ``+
+        prune_lambda_tables * (kept tables at or above the floor)``.
 
         KNOWN LIMIT, and the reason this is not the knob to reach for if you want the bar met.
         Like ``prune_lambda_boxes`` it only re-picks a waypoint on an already-fixed
@@ -8370,38 +8573,56 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         across four more decades of lambda, while ``prune_table_budget`` lands on 8, 4 or 2
         exactly on request. Use this to let SELECTION see table count — the gap the av38
         battery named — not to hit a number.
+    prune_size_penalty : float or None, default=None
+        Fold vote only: the same lever as ``prune_lambda_tables`` (and the replacement for the
+        deprecated ``prune_lambda_boxes``). Setting it sets ``prune_lambda_tables``; setting
+        both to different values raises ``ValueError``.
     prune_table_min_arity : int, default=3
         Lowest interaction order that ``prune_table_budget`` and ``prune_lambda_tables`` count.
         Consulted only when one of them is armed, so its value cannot perturb a default fit.
         ``3`` is the product bar: mains and pairs are what a filing reads, three-way tables are
         what inflates it. Must be in ``1..8``.
+    prune_guard : bool, default=True
+        Fold vote only: check the selected set of tables as a whole. The vote judges tables one
+        at a time, so it can drop a group of correlated tables that only matter together; the
+        guard compares the selected set with the full set on honest rows (the out-of-bag rows,
+        or a shared holdout for grouped data) and re-admits dropped tables, best evidence
+        first, while the relative deviance gap exceeds ``prune_guard_tol``. The multiclass
+        (K>=3) fold vote uses ``multiclass_prune_guard`` instead.
+    prune_guard_tol : float, default=0.05
+        Fold vote only: the no-harm guard's tolerance, the largest acceptable relative increase
+        of the selected set's deviance over the full set's. ``prune_guard_z``,
+        ``prune_guard_z_dn`` and ``prune_guard_tol_floor`` turn it into an SE-aware bar.
     prune_guard_z : float, default=0.0
-        SE multiplier for the set-level no-harm guard's breach test: it breaches, and the
-        re-admission ladder stops, on ``gap > max(prune_guard_tol, prune_guard_z * SE)`` where
-        ``SE`` is the standard error of the relative deviance gap on the guard's own evidence
-        rows (reported as ``gap_se``, with the resulting bar as ``tol_effective``). The shipped
-        ``0.0`` is the fixed-relative-tolerance test. Measured and deliberately off: on a
-        zero-inflated compound target the row-level SE is dominated by a few large claims and
-        cannot resolve even a real set-level gap — see the ``_PRUNE_GUARD_Z_DEFAULT`` note.
+        Fold vote only (see ``prune_selector``). SE multiplier for the set-level no-harm guard's
+        breach test: it breaches, and the re-admission ladder stops, on ``gap >
+        max(prune_guard_tol, prune_guard_z * SE)`` where ``SE`` is the standard error of the
+        relative deviance gap on the guard's own evidence rows (reported as ``gap_se``, with the
+        resulting bar as ``tol_effective``). The shipped ``0.0`` is the fixed-relative-tolerance
+        test. Measured and deliberately off: on a zero-inflated compound target the row-level SE
+        is dominated by a few large claims and cannot resolve even a real set-level gap — see
+        the ``_PRUNE_GUARD_Z_DEFAULT`` note.
     prune_guard_z_dn : float, default=2.0
-        SE multiplier for the DOWNWARD recalibration of the same bar (av39). The effective
-        tolerance becomes ``min(tol_up, max(prune_guard_tol_floor, prune_guard_z_dn * SE))``,
-        where ``tol_up`` is the ``prune_guard_z`` result above — so where the guard's jury is
-        sharp the bar tightens to a few SE instead of a fixed 5%, and where it is blunt the
-        ``min`` pins the bar back at ``prune_guard_tol`` and the fit is bit-identical. This knob
-        can therefore only ever make the guard fire MORE, never less. It governs BOTH the breach
-        trigger and the ladder's stopping rule. ``0.0`` restores the pre-av39 guard exactly.
+        Fold vote only (see ``prune_selector``). SE multiplier for the DOWNWARD recalibration of
+        the same bar (av39). The effective tolerance becomes ``min(tol_up,
+        max(prune_guard_tol_floor, prune_guard_z_dn * SE))``, where ``tol_up`` is the
+        ``prune_guard_z`` result above — so where the guard's jury is sharp the bar tightens to
+        a few SE instead of a fixed 5%, and where it is blunt the ``min`` pins the bar back at
+        ``prune_guard_tol`` and the fit is bit-identical. This knob can therefore only ever make
+        the guard fire MORE, never less. It governs BOTH the breach trigger and the ladder's
+        stopping rule. ``0.0`` restores the pre-av39 guard exactly.
     prune_guard_tol_floor : float, default=0.005
-        Lower clamp on the downward recalibration, so an arbitrarily sharp jury cannot drive the
-        bar to zero and re-admit the whole bank on immeasurable noise. Ignored when
-        ``prune_guard_z_dn = 0``.
+        Fold vote only (see ``prune_selector``). Lower clamp on the downward recalibration, so
+        an arbitrarily sharp jury cannot drive the bar to zero and re-admit the whole bank on
+        immeasurable noise. Ignored when ``prune_guard_z_dn = 0``.
     prune_min_stability : float, default=0.5
-        Fold-stability bar for keeping a table: the aggregator keeps one when
-        ``mean_gain > prune_min_mean_gain`` **and** (it survived at least this fraction of the
-        prune folds' own selections, **or** scored a positive drop-gain in at least this
-        fraction of them). In plain terms: *in how many folds must this table show signal.*
-        Previously a hardcoded ``0.5`` — this is the knob that actually governs the deployed
-        bank's size on the regressor/binary path, where ``prune_se_rule`` cannot reach.
+        Fold vote only (see ``prune_selector``). Fold-stability bar for keeping a table: the
+        aggregator keeps one when ``mean_gain > prune_min_mean_gain`` **and** (it survived at
+        least this fraction of the prune folds' own selections, **or** scored a positive
+        drop-gain in at least this fraction of them). In plain terms: *in how many folds must
+        this table show signal.* Previously a hardcoded ``0.5`` — this is the knob that actually
+        governs the deployed bank's size on the regressor/binary path, where ``prune_se_rule``
+        cannot reach.
 
         The fold rates quantise to ``1/prune_n_folds``, so at the default 5 folds this is a
         3-position dial: ``(0.4, 0.6]`` = 3/5, ``(0.6, 0.8]`` = 4/5, ``(0.8, 1.0]`` = 5/5.
@@ -8409,17 +8630,19 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         bank from 58.3 to 37.0 tables and 1216 to 389 boxes for −0.49% ± 0.66 of test D², the
         best explainability-per-accuracy-point of any pruning knob, and it halves the
         seed-to-seed spread in bank size. The default stays ``0.5`` pending a multi-dataset
-        battery. Multiclass (K>=3) has no fold vote to threshold, so a non-default value raises
-        there. Only has an effect together with ``prune=True``.
+        battery. On a multiclass (K>=3) fit a non-default value raises only under the legacy
+        single split (``multiclass_prune_cv=False``), which has no fold vote to threshold. Only
+        has an effect together with ``prune=True``.
     prune_min_mean_gain : float, default=0.0
-        Minimum mean held-out drop-gain a table must earn to be kept, in deviance units on the
-        dataset's own per-unit-weight scale. ``0.0`` (the default) is the historical
-        ``mean_gain > 0`` test, bit-for-bit — under it a table kept on a mean gain of ``1e-9``
-        is kept on noise. This is the threshold-parameterised counterpart to
-        ``prune_table_budget``'s count cap: drop everything whose evidence is weaker than a
-        stated bar, rather than keeping the best-ranked N. The native pruning report has always
-        carried a ``min_mean_gain`` field and always written a literal ``0.0``; it now reports
-        the threshold actually used. Multiclass (K>=3) raises on a non-default value, as for
+        Fold vote only (see ``prune_selector``). Minimum mean held-out drop-gain a table must
+        earn to be kept, in deviance units on the dataset's own per-unit-weight scale. ``0.0``
+        (the default) is the historical ``mean_gain > 0`` test, bit-for-bit — under it a table
+        kept on a mean gain of ``1e-9`` is kept on noise. This is the threshold-parameterised
+        counterpart to ``prune_table_budget``'s count cap: drop everything whose evidence is
+        weaker than a stated bar, rather than keeping the best-ranked N. The native pruning
+        report has always carried a ``min_mean_gain`` field and always written a literal
+        ``0.0``; it now reports the threshold actually used. On a multiclass (K>=3) fit a
+        non-default value raises only under the legacy single split, as for
         ``prune_min_stability``. Only has an effect together with ``prune=True``.
 
         **It interacts with ``prune_drop_z``, and not in the obvious direction.** The floor
@@ -8437,32 +8660,43 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         takes the deployed bank 54 -> 46 -> 31 tables, with ``1e-5`` landing 15% fewer tables at
         a slightly BETTER test deviance (0.55911 vs 0.55915) than the default.
     prune_fold_min_rows : int, default=125
-        Rows-per-fold floor that sizes the prune CV: the fold count is
-        ``max(2, min(prune_n_folds, n // prune_fold_min_rows, n))``, so on small data the number
-        of folds adapts DOWN rather than producing folds too thin to score a table. Raising it
-        makes that adaptation kick in earlier. Only has an effect together with ``prune=True``.
+        Fold vote only (see ``prune_selector``). Rows-per-fold floor that sizes the prune CV:
+        the fold count is ``max(2, min(prune_n_folds, n // prune_fold_min_rows, n))``, so on
+        small data the number of folds adapts DOWN rather than producing folds too thin to score
+        a table. Raising it makes that adaptation kick in earlier. Only has an effect together
+        with ``prune=True``.
     prune_fold_es_patience : int or None, default=None
-        Early-stopping patience for the prune-CV FOLD fits only; the deploy fit always keeps the
-        estimator's own ``early_stopping_rounds``. ``None`` resolves to the shipped ``250``; an
-        explicit integer overrides it. The fold fits exist only to vote on table survival, which is why
-        their patience is tighter than the deploy fit's — 250 left every studied keep-set
-        bit-identical with the MTPL CV scan 19.4% faster. Only has an effect together with
-        ``prune=True``.
+        Fold vote only (see ``prune_selector``). Early-stopping patience for the prune-CV FOLD
+        fits only; the deploy fit always keeps the estimator's own ``early_stopping_rounds``.
+        ``None`` resolves to the shipped ``250``; an explicit integer overrides it. The fold
+        fits exist only to vote on table survival, which is why their patience is tighter than
+        the deploy fit's — 250 left every studied keep-set bit-identical with the MTPL CV scan
+        19.4% faster. Only has an effect together with ``prune=True``.
+    prune_fold_fidelity : bool, default=False
+        Fold vote only: score every candidate table in every fold. A fold model searches its own
+        structure, so it may not build some of the deployed model's tables, and those then get
+        no evidence from that fold; with this on, each fold gives the missing tables values by
+        a ridge fit on its training rows, so every candidate gets a held-out gain. Regression
+        and binary classification only: ``True`` raises on a multiclass (K>=3) fit.
     prune_guard_min_rows : int, default=500
-        Minimum honest evidence rows before the set-level no-harm guard will judge at all —
+        Minimum honest evidence rows before the tables are judged on them. The ranked path
+        needs this many out-of-bag rows, or the fit falls back as ``prune_selector`` describes.
+        The fold vote's set-level no-harm guard needs this many before it judges at all —
         below this the pruned-vs-full deviance ratio is noise and the guard reports itself
-        skipped rather than acting on it. Counts out-of-bag-covered rows on the OOB path and
+        skipped rather than acting on it; it counts out-of-bag-covered rows on the OOB path and
         shared-holdout rows on the grouped carve path. Only has an effect together with
-        ``prune=True`` and ``prune_guard=True``.
+        ``prune=True``.
     prune_slope_eps : float, default=0.01
-        Dead band on the post-prune slope re-anchor: the correction is not applied unless the
-        out-of-bag scale ``b`` differs from 1 by more than this, so a bank that was not
-        materially compressed keeps a byte-identical artifact. See ``pruning_report_["slope"]``.
+        Fold vote only (see ``prune_selector``). Dead band on the post-prune slope re-anchor:
+        the correction is not applied unless the out-of-bag scale ``b`` differs from 1 by more
+        than this, so a bank that was not materially compressed keeps a byte-identical artifact.
+        See ``pruning_report_["slope"]``.
     prune_slope_min_z : float, default=3.0
-        Significance bar for that same correction: ``b`` must also be off by at least this many
-        standard errors (``z_b``) before it is applied. Together with ``prune_slope_eps`` this
-        is the "materially AND significantly off" test — lowering either makes the re-anchor
-        fire more readily. See ``pruning_report_["slope"]``.
+        Fold vote only (see ``prune_selector``). Significance bar for that same correction:
+        ``b`` must also be off by at least this many standard errors (``z_b``) before it is
+        applied. Together with ``prune_slope_eps`` this is the "materially AND significantly
+        off" test — lowering either makes the re-anchor fire more readily. See
+        ``pruning_report_["slope"]``.
     prune_refit_full : bool, default=False
         Deprecated and without effect on any path: contribution-stability pruning always
         fits the deployed model on all rows and applies the keep-set to that same fit, so
@@ -8477,6 +8711,19 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
         to deploy the drop-only pruned model. Binary (K=2) path only. Only has an effect
         together with ``prune=True``.
+    band_tolerance : float or None, default=0.75
+        Banding: after pruning, each deployed interaction table is condensed into a small
+        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        them, every table containing a feature cuts it at the same nested places, and missing
+        values keep their own band. The mean squared change of the predictions is held within
+        ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
+        within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
+        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
+        outcome is in ``pruning_report_["banding"]``.
+    band_deviance_cap : float, default=0.001
+        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
+        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
+        that can cost.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -8509,8 +8756,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         assuming it is always present.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and their cross-validated contributions. Only set when
-        ``prune=True``.
+        kept, and deployed, and the evidence they were judged on. Only set when
+        ``prune=True``. ``["selector"]`` names the selector that ran: ``"ranked_path"``, whose
+        prefixes and their out-of-bag deviances are under ``["path"]`` (``["selection"]`` on a
+        multiclass fit), or a fold vote, which the guard, slope and evidence fields below
+        describe.
 
         ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
         slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
@@ -9528,7 +9778,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             The export reports residual conditional means on observed support. Main effects
             are not observed marginal A/E or causal effects. Orders three and above stay
             product-purified (a hybrid), variance shares no longer add to one, and the
-            equal-split attributions are no longer Shapley values.
+            equal-split attributions are no longer Shapley values. ``"joint"`` is not
+            supported for banded tables (the default ``band_tolerance``): fit with
+            ``band_tolerance=None`` to export under it.
         laplace : float, default=1.0
             Laplace smoothing constant for the ``"product_marginals"`` reference measure.
             Unused for the other measures.

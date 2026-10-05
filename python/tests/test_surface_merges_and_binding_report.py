@@ -259,6 +259,71 @@ def test_a_merely_non_binding_cap_does_not_warn():
                for r in m.binding_report_)
 
 
+# ------------------------------------------------ the selector that did not run ----------------
+# The ranked path (the default since 2026-09-26) replaces the fold vote, so a fold-vote knob set on
+# a ranked-path fit did nothing; the report used to call the two gates HONOURED regardless.
+
+def _row(m, param):
+    return next(r for r in m.binding_report_ if r["param"] == param)
+
+
+def test_fold_vote_knobs_are_INERT_when_the_ranked_path_selects():
+    m, warns = _fit(prune_selector="ranked_path", prune_min_stability=1.0, prune_guard_tol=0.1)
+    assert m.pruning_report_["selector"] == "ranked_path"
+    for param in ("prune_min_stability", "prune_guard_tol"):
+        row = _row(m, param)
+        assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
+    assert warns == []                              # INERT stays silent at fit
+    with pytest.raises(ValueError, match="did not bind"):
+        m.check_bindings()
+
+
+def test_ranked_path_knobs_are_INERT_on_a_fold_vote_fit():
+    m, _ = _fit(prune_selector="fold_vote", prune_path_tolerance=0.01)
+    row = _row(m, "prune_path_tolerance")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
+
+
+def test_the_fold_vote_fallback_is_reported_on_the_ranked_path_knobs():
+    # One bag leaves no out-of-bag rows, so the default selector falls back to the fold vote.
+    m, _ = _fit(prune_selector="ranked_path", n_bags=1, prune_path_fraction=0.5,
+                prune_min_stability=1.0)
+    assert m.pruning_report_["selector"] == "heldout_contribution_stability"
+    row = _row(m, "prune_path_fraction")
+    assert (row["status"], row["overridden_by"]) == ("INERT", None)
+    assert "out-of-bag" in row["reason"]
+    assert _row(m, "prune_min_stability")["status"] != "INERT"   # the fold vote did run
+
+
+def test_a_monotone_fit_reports_its_selection_knobs_INERT():
+    # A monotone fit keeps the full table bank: no selector runs at all.
+    X, y = _fixture()
+    m = TBoostRegressor(objective="poisson", n_trees=60, seed=0, n_jobs=2, prune=True,
+                        monotone_constraints={"a": 1}, prune_min_stability=1.0).fit(X[["a", "b"]], y)
+    row = _row(m, "prune_min_stability")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "monotone_constraints")
+
+
+def test_multiclass_selection_knobs_follow_the_task():
+    X, _ = _fixture()
+    rng = np.random.default_rng(1)
+    noisy = X.a + rng.normal(size=len(X))
+    kw = dict(n_trees=60, seed=0, n_jobs=2, prune_selector="ranked_path")
+    multi = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
+        X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
+    row = _row(multi, "multiclass_prune_guard_floor")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
+    # The legacy single split's fraction only carves the selection rows the path never reads.
+    legacy = TBoostClassifier(**kw, multiclass_prune_cv=False, prune_validation_fraction=0.2).fit(
+        X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
+    row = _row(legacy, "prune_validation_fraction")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
+    # A binary fit never reads a multiclass knob, so the ranked path is not its reason.
+    binary = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
+        X[["a", "b"]], (noisy > 0).astype(int))
+    assert not [r for r in binary.binding_report_ if r["param"] == "multiclass_prune_guard_floor"]
+
+
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
     """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on

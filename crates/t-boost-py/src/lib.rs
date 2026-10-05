@@ -277,7 +277,7 @@ struct PyBooster {
 /// different requests:
 ///
 /// * `None` (the default) / `True` / `"auto"` / `"objective"` ⇒ [`GatedStepPolicy::Objective`]
-///   — the objective decides. Tweedie ships a gate (`0.01` / `0.3`); every other objective
+///   — the objective decides. Tweedie ships a gate (`0.001` / `0.3`); every other objective
 ///   ships none, so this is inert for them.
 /// * `False` / `"off"` / `"none"` ⇒ [`GatedStepPolicy::Off`] — never gate.
 /// * `(collapse_threshold, capped_step)` (any 2-sequence) or
@@ -4043,7 +4043,7 @@ impl PyBooster {
             // near-tie, so users set it directly on the native API and need to know it no-op'd).
             if cell_refit.is_some() {
                 return Err(py_err(PbError::InvalidConfig {
-                    what: "cell_refit_base requires n_bags >= 1 (OOB cell refit needs bag \
+                    what: "cell_refit_base requires n_bags >= 2 (OOB cell refit needs bag \
                            partitions)"
                         .into(),
                 }));

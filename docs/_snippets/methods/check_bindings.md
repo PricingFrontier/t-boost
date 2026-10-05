@@ -22,9 +22,9 @@ One entry per checked parameter set away from its default, with `param`, `value`
 (`HONOURED`, `INERT` or `OVERRIDDEN`), `reason` and `overridden_by`.
 
 The report covers parameters whose effect depends on other settings: the pruning gates and
-limits (for example, every pruning parameter when `prune=False`), `validation_fraction` with an
-`eval_set`, `monotone_constraints` and deprecated spellings. It is not an audit of every
-parameter.
+limits (for example, every pruning parameter when `prune=False`, and the parameters of the
+pruning selector that did not run), `validation_fraction` with an `eval_set`,
+`monotone_constraints` and deprecated spellings. It is not an audit of every parameter.
 
 ## Usage examples {#usage-examples}
 
