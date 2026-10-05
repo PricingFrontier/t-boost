@@ -153,7 +153,7 @@ def test_cell_refit_base_requires_bagging() -> None:
     with pytest.raises(ValueError, match="cell_refit_base") as excinfo:
         _Booster(objective="squared_error", n_bags=0, cell_refit_base=0.5)
     assert isinstance(excinfo.value, TBoostError)
-    # n_bags >= 1 is the documented requirement; construction must succeed.
+    # n_bags >= 2 is the documented requirement; construction must succeed.
     _Booster(objective="squared_error", n_bags=2, cell_refit_base=0.5)
 
 
