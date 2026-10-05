@@ -10,8 +10,8 @@ objects) give honest evidence that [pruning](pruning.md) and [banding](banding.m
 
 #### Description
 
-The number of bags. Each bag is trained on its own sample of the objects, with its own
-overfitting detector, and the bags are averaged into one model. Training costs about `n_bags`
+The number of bags. Each bag is trained on its own sample of the objects, with its own early
+stopping, and the bags are averaged into one model. Training costs about `n_bags`
 times as much as training a single model.
 
 1 turns bagging off. Without bagging there are no out-of-bag objects: banding is skipped, and
@@ -34,7 +34,7 @@ The fraction of the objects sampled for each bag. Only used when [`n_bags`](#n_b
 than 1.
 
 A value below 1 samples the objects without replacement (subagging). A value of 1 or more draws
-a full-size bootstrap sample with replacement. Subagging keeps the overfitting detector honest:
+a full-size bootstrap sample with replacement. Subagging keeps early stopping honest:
 in a bootstrap sample duplicated objects can fall on both sides of the validation split, so the
 validation deviance keeps improving and the training does not stop. When `groups` is passed to
 `fit`, whole groups are sampled.

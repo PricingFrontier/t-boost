@@ -82,7 +82,7 @@ string
 The largest number of trees kept by a bag. This number can differ from the value specified in
 the `n_trees` training parameter in the following cases:
 
-- The training is stopped by the [overfitting detector](../../algorithm/overfitting-detector.md).
+- The training is stopped by [early stopping](../../algorithm/early-stopping.md).
 - No split clears `min_split_gain`.
 - A callback stops the training.
 
@@ -107,7 +107,7 @@ list of ints
 #### Purpose
 
 Why the training stopped, summarized over the bags: `"callback"` if a callback stopped it, else
-`"early_stopping"` if a bag was stopped by the overfitting detector, else `"no_split"` if a bag
+`"early_stopping"` if a bag was stopped by early stopping, else `"no_split"` if a bag
 ran out of splits, else `"max_trees"`. `None` for a multiclassification model.
 
 #### Type

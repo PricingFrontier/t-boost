@@ -139,40 +139,40 @@ removes the overall bias that shrinkage leaves in the predictions.
 
 ### [reanchor_slope](common.md#reanchor_slope)
 
-Recalibrate the raw score $a$ to $b_0 + b_1 \cdot a$ on the validation objects of the
-[overfitting detector](overfitting-detection.md) after the training. This corrects a uniform
+Recalibrate the raw score $a$ to $b_0 + b_1 \cdot a$ on the validation objects of
+[early stopping](early-stopping.md) after the training. This corrects a uniform
 compression of the score scale that shrinkage and early stopping can leave, without changing the
 ranking of the objects or the decomposition into rating tables.
 
-## [Overfitting detection settings](overfitting-detection.md)
+## [Early stopping settings](early-stopping.md)
 
-### [validation_fraction](overfitting-detection.md#validation_fraction)
+### [validation_fraction](early-stopping.md#validation_fraction)
 
-The fraction of the training objects set aside as the validation dataset of the overfitting
-detector. Each bag sets aside its own validation objects from its own sample.
+The fraction of the training objects set aside as the validation dataset of early stopping.
+Each bag sets aside its own validation objects from its own sample.
 
-### [early_stopping_rounds](overfitting-detection.md#early_stopping_rounds)
+### [early_stopping_rounds](early-stopping.md#early_stopping_rounds)
 
 Stops the training after the specified number of iterations since the iteration with the
 optimal metric value. The metric is the mean deviance of the objective on the validation
 objects.
 
-### [early_stopping_adaptive](overfitting-detection.md#early_stopping_adaptive)
+### [early_stopping_adaptive](early-stopping.md#early_stopping_adaptive)
 
 Makes the number of iterations to wait grow with the iteration of the best result.
 
-### [early_stopping_min_delta](overfitting-detection.md#early_stopping_min_delta)
+### [early_stopping_min_delta](early-stopping.md#early_stopping_min_delta)
 
 The minimum relative improvement of the metric for an iteration to become the new best. The
 validation deviance must fall below $best \cdot (1 - early\_stopping\_min\_delta)$; smaller
 improvements do not reset the count of iterations to wait and do not move the iteration the
 model is truncated at.
 
-### [early_stopping](overfitting-detection.md#early_stopping)
+### [early_stopping](early-stopping.md#early_stopping)
 
-A single setting for the patience of the overfitting detector. An `int` sets
-[`early_stopping_rounds`](overfitting-detection.md#early_stopping_rounds), a `float` sets
-[`early_stopping_adaptive`](overfitting-detection.md#early_stopping_adaptive).
+A single setting for the patience of early stopping. An `int` sets
+[`early_stopping_rounds`](early-stopping.md#early_stopping_rounds), a `float` sets
+[`early_stopping_adaptive`](early-stopping.md#early_stopping_adaptive).
 
 ## [Quantization settings](quantization.md)
 
@@ -275,8 +275,8 @@ target statistic. Used only for multiclassification.
 
 ### [n_bags](bagging.md#n_bags)
 
-The number of bags. Each bag is trained on its own sample of the objects, with its own
-overfitting detector, and the bags are averaged into one model. Training costs about `n_bags`
+The number of bags. Each bag is trained on its own sample of the objects, with its own early
+stopping, and the bags are averaged into one model. Training costs about `n_bags`
 times as much as training a single model.
 
 ### [bag_subsample](bagging.md#bag_subsample)
@@ -380,10 +380,10 @@ makes the number of folds adapt down earlier.
 
 ### [prune_fold_es_patience](pruning-fold-vote.md#prune_fold_es_patience)
 
-The number of iterations the overfitting detector of the fold models waits after the iteration
-with the optimal metric value. The fold models only vote on which tables to keep, so they use a
+The number of iterations early stopping of the fold models waits after the iteration with the
+optimal metric value. The fold models only vote on which tables to keep, so they use a
 shorter patience than the deployed model, which always uses
-[`early_stopping_rounds`](overfitting-detection.md#early_stopping_rounds).
+[`early_stopping_rounds`](early-stopping.md#early_stopping_rounds).
 
 ### [prune_min_stability](pruning-fold-vote.md#prune_min_stability)
 

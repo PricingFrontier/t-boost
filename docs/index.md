@@ -34,7 +34,7 @@ tables = model.tables(train_data)   # the model, as rating tables
 
     - [Training](features/training.md)
     - [Training parameters](training-parameters/index.md)
-    - [Using the overfitting detector](features/overfitting-detector.md)
+    - [Using early stopping](features/early-stopping.md)
     - [Categorical features](features/categorical-features.md)
     - [Exposure and offsets](features/exposure.md)
     - [Panel data](features/panel-data.md)

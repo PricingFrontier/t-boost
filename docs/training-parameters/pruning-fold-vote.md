@@ -51,10 +51,10 @@ int
 
 #### Description
 
-The number of iterations the overfitting detector of the fold models waits after the iteration
-with the optimal metric value. The fold models only vote on which tables to keep, so they use a
+The number of iterations early stopping of the fold models waits after the iteration with the
+optimal metric value. The fold models only vote on which tables to keep, so they use a
 shorter patience than the deployed model, which always uses
-[`early_stopping_rounds`](overfitting-detection.md#early_stopping_rounds).
+[`early_stopping_rounds`](early-stopping.md#early_stopping_rounds).
 
 **Type**
 

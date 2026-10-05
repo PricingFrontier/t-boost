@@ -2,11 +2,11 @@
 
 #### Description
 
-The validation dataset used by the [overfitting detector](../../algorithm/overfitting-detector.md),
-as a tuple `(X_val, y_val)`. Every bag stops at its own best iteration on it, and no validation
+The validation dataset used by [early stopping](../../algorithm/early-stopping.md), as a tuple
+`(X_val, y_val)`. Every bag stops at its own best iteration on it, and no validation
 objects are set aside from `X` (`validation_fraction` is ignored).
 
-The evaluation objects are used only by the overfitting detector: they never reach the training,
+The evaluation objects are used only by early stopping: they never reach the training,
 the intercept, the cell refit, the tables or pruning. `X_val` is matched to the features as in
 `predict`, and `y_val` may name a column of a polars `X_val`. Setting `reanchor_slope=True` with
 an `eval_set` raises an error.

@@ -56,9 +56,9 @@ float
 The maximum number of trees that can be built when solving machine learning problems.
 
 When using other parameters that limit the number of iterations, the final number of trees may
-be less than the number specified in this parameter. By default the
-[overfitting detector](overfitting-detection.md) decides how many trees are built, and this
-value is a cap that is rarely reached. A fit also stops when no candidate split clears
+be less than the number specified in this parameter. By default
+[early stopping](early-stopping.md) decides how many trees are built, and this value is a cap
+that is rarely reached. A fit also stops when no candidate split clears
 [`min_split_gain`](#min_split_gain).
 
 With bagging, the limit applies to each bag.
@@ -539,8 +539,8 @@ None. Depends on the objective:
 
 #### Description
 
-Recalibrate the raw score $a$ to $b_0 + b_1 \cdot a$ on the validation objects of the
-[overfitting detector](overfitting-detection.md) after the training. This corrects a uniform
+Recalibrate the raw score $a$ to $b_0 + b_1 \cdot a$ on the validation objects of
+[early stopping](early-stopping.md) after the training. This corrects a uniform
 compression of the score scale that shrinkage and early stopping can leave, without changing the
 ranking of the objects or the decomposition into rating tables.
 
