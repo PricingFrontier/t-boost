@@ -103,13 +103,40 @@ logged to MLflow. Raises on an unknown `report_version`. Deterministic for a giv
   both `None` ("fit time unknown").
 - Heading: `<name> · fitted 2026-10-13 14:02 UTC` (default name: class and objective).
 
-### Persisted fit evidence
+### Persisted fit evidence (decided 2026-10-13)
 
-Haute loads models back from MLflow, so the evidence the report shows must survive
-`to_bytes`: also save `pruning_report_`, `graduation_validation_` and `evals_result_` in the
-envelope (tree counts and stopping reasons already are, sklearn.py:1439-1444). Older files: the
-affected sections say "not stored with this model", and `binding_report_` is reported as
-unavailable instead of claiming INERT.
+Haute loads models back from MLflow, so the pruning evidence must survive `to_bytes`: save
+`pruning_report_` and `graduation_validation_` in the envelope (tree counts and stopping
+reasons already are, sklearn.py:1439-1444). **`evals_result_` is not persisted** (user: "we
+don't need previous training history"); the Training section shows the curve only on a live
+fit and says so on a loaded one. Older files: the pruning section says "not stored with this
+model", and `binding_report_` keeps its `UNAVAILABLE` status for them.
+
+### Pruning transparency (user: "any transparency on the model fit is good")
+
+The ranked-path selector (default) scores nested banks on out-of-bag rows: the main effects,
+then interaction tables added in order of variance share (heredity-respecting), at a
+geometric grid of bank sizes. With `devs` the OOB deviance per size, total gain =
+`devs[0] − min(devs)`; the cutoff is the first size that reaches `prune_path_fraction` of the
+total gain **and** is within `prune_path_tolerance` of the minimum (sklearn.py:4530-4541).
+
+- At fit, add to `pruning_report_["path"]`: `sequence` (the ranked tables in the order they
+  enter, with the size step each joins), `total_gain`, `cutoff` (the chosen step) and the two
+  candidate steps it is the max of (`fraction_step`, `tolerance_step`, `min_step`).
+- Page section "Pruning":
+  - path chart: OOB deviance against bank size, with the minimum, the fraction-of-gain level,
+    the tolerance level and the cutoff marked;
+  - cumulative gain chart: share of the total gain captured against bank size, cutoff marked;
+  - ranked table list: rank, table, order, variance share, cumulative share, the step it
+    enters, kept / dropped (and kept but not deployed, from `kept_not_deployed`), with the
+    cutoff drawn as a rule between the last kept and first dropped row;
+  - one sentence in words, e.g. "kept 9 of 31 candidate tables, capturing 99.5% of the OOB
+    deviance gain; the next step would have improved OOB deviance by 0.02%".
+  - then the stages after selection: table/box budgets, guard, banding (cells before/after
+    per table), graduation.
+- Fold-vote selector (`prune_selector="fold_vote"`): its own evidence (stability, held-out
+  gain per table, guard) in the same list layout.
+- `prune=False`: "no pruning; full bank deployed" with the bank size.
 
 ### Thresholds
 
@@ -196,8 +223,8 @@ the offset).
    with `eval_set` or callbacks — the page says so otherwise); trees per bag; stopping
    reasons. Multiclass fits have no per-bag report: the section says so.
 5. **Model structure** — intercept, tables by order (dense, sparse, factored counted
-   separately), Sobol share per table, pruning path (OOB deviance against bank size, best
-   marked), candidate tables kept or dropped, banding, graduation, guard. Joint-measure caveats
+   separately), Sobol share per table; then the **Pruning** section described under
+   "Pruning transparency". Joint-measure caveats
    (non-Shapley, not exactly purified, `_pricing.annotate_joint_export`) kept verbatim.
 6. **Rating factors** — one card per feature, by importance:
    - effect chart of the 1-D table on the table's own axis: relativity (log link), odds
@@ -278,7 +305,8 @@ html = t_boost.report_html(report)  # temp .html → client.log_artifact(run_id,
 - Statistics against independent hand computations (not just `t_boost.metrics`): null
   deviances per objective, Gini with exposure, lift tie handling and row-order invariance, PSI
   with empty bins.
-- `from_bytes(to_bytes())`: fit time and fit evidence restored; an older-format file reports
+- `from_bytes(to_bytes())`: fit time, pruning report and graduation restored, `evals_result_`
+  absent; an older-format file reports
   "not stored" and no false INERT rows.
 - `unknown_category="error"` with unseen values: report produced, critical flag.
 - `prune=False` fit: page under the size budget.
@@ -309,7 +337,8 @@ private artifact for a visual check before the PR.
 
 1. Pre-existing bugs 1–5, with tests.
 2. Native multiclass `cell_indices` + `raw_feature_names` + stubs + test.
-3. `fitted_at_`/`fit_duration_`, persisted fit evidence, envelope bump.
+3. `fitted_at_`/`fit_duration_`, persisted pruning report + graduation, path `sequence`/
+   `total_gain`/`cutoff` fields, envelope bump.
 4. `metrics.py` deviances; `_report.py` (statistics, thresholds, flags); `pricing_report` v2
    including multiclass.
 5. `_html_report.py`; `report_html`, `html_report`.
@@ -335,10 +364,7 @@ Fable suggested one function name instead of `html_report` + `report_html` — k
 (method for convenience, function to render a stored report). Deferred: comparison against an
 incumbent model (rustystats' `base_predictions`), split/date provenance — see open questions.
 
-## Open questions
+## Decisions (2026-10-13)
 
-1. Incumbent comparison: accept `baseline=` predictions (column name or array) for a double-lift
-   chart and side-by-side metrics, like rustystats' `base_predictions`? Useful for sign-off,
-   adds scope.
-2. Persisting `pruning_report_`/`evals_result_` grows the saved model (the pruning path and
-   table scores are small; `evals_result_` is n_bags × rounds floats). OK?
+1. No comparison with an incumbent model yet (`baseline=` deferred).
+2. Persist `pruning_report_` and `graduation_validation_`; do not persist `evals_result_`.
