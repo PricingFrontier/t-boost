@@ -14,7 +14,9 @@ from functools import lru_cache as _lru_cache, wraps
 
 import json
 import math
+import time
 import warnings
+from datetime import datetime, timezone
 from typing import Any, Callable, TypeVar, cast
 
 import numpy as np
@@ -64,7 +66,12 @@ def _atomic_fit(method: _FitMethod) -> _FitMethod:
         previous = self.__dict__.copy()
         try:
             self._categorical_encoding_version_ = 3
-            return method(self, *args, **kwargs)
+            start = time.perf_counter()
+            result = method(self, *args, **kwargs)
+            # When the fit finished (UTC) and how long it took; saved with the model.
+            self.fitted_at_ = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            self.fit_duration_ = time.perf_counter() - start
+            return result
         except BaseException:
             self.__dict__.clear()
             self.__dict__.update(previous)
@@ -72,6 +79,9 @@ def _atomic_fit(method: _FitMethod) -> _FitMethod:
 
     return cast(_FitMethod, fit)
 
+
+# When the fit finished (ISO 8601, UTC) and its wall-clock seconds; set by `_atomic_fit`.
+_FIT_TIME_ATTRS = ("fitted_at_", "fit_duration_")
 
 # Fitted attributes describing the deployed fit's boosting (R2/R3), cleared with the fit.
 _STOP_REASONS = frozenset({"max_trees", "early_stopping", "no_split", "callback"})
@@ -158,7 +168,9 @@ def _reject_sparse(x: Any) -> None:
 _ESTIMATOR_MAGIC = b"TBP1"
 # 5 (0.7.0): the caller's `metadata` slot and the fit report (`n_trees_per_bag_`, ...). A 0.6.2
 # loader would silently drop both, so it refuses these headers instead.
-_ENVELOPE_SCHEMA_VERSION = 5
+# 6: the fit time (`fitted_at_`, `fit_duration_`) and the fit evidence (`pruning_report_`,
+# `graduation_validation_`), which a version-5 loader would silently drop.
+_ENVELOPE_SCHEMA_VERSION = 6
 _MULTICLASS_MAGIC = b"TBMC"  # the Rust multiclass container prefix (see serialize.rs)
 _TABLES_MAGIC = b"TBTM"  # the Rust tables-only (pruned) container prefix (see serialize.rs)
 _MULTICLASS_TABLES_MAGIC = b"TBMT"  # the Rust pruned-multiclass tables container prefix
@@ -763,13 +775,21 @@ _PRUNE_PATH_FRACTION_DEFAULT = 0.995
 # +0.78%); this bound caps that at 0.1% of deviance, the same figure as banding's deviance cap.
 # Measured offline (35 datasets): Elo 1427 vs 1424 (fraction alone), 1428 (the minimum).
 _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
+# The ranked path's variance-share floor (2026-10-13): after the cutoff, a kept table whose share
+# of the candidates' total variance is below this is dropped unless a kept table at or above the
+# floor contains it (the first rule, dropping supersets of a low table, removed a 1.3% VehAge x
+# VehGas pair on freMTPL2 because the VehGas main was 0.085%). 0 = off, so existing fits are
+# unchanged.
+_PRUNE_MIN_VARIANCE_SHARE_DEFAULT = 0.0
 # Which knobs each keep-set selector reads, for `binding_report_`. The ranked path reads only its
 # own three. The fold vote reads the others: its CV and vote, the evidence gate, the walk's size
 # prices, the guard and the slope re-anchor, plus the K>=3 selection fits, legacy split and guard.
 # Every other `prune_*` knob (`prune_main_effects`, `prune_guard_min_rows`, `prune_rebalance` and
 # the deployed budgets) is read by both. `multiclass_prune_cv` is left out: on grouped rows it also
 # picks the K>=3 deploy fit's early-stopping carve, so it is not inert on the path.
-_RANKED_PATH_KNOBS = ("prune_path_steps", "prune_path_fraction", "prune_path_tolerance")
+_RANKED_PATH_KNOBS = (
+    "prune_path_steps", "prune_path_fraction", "prune_path_tolerance", "prune_min_variance_share",
+)
 _FOLD_VOTE_KNOBS = (
     "prune_n_folds", "prune_fold_min_rows", "prune_fold_es_patience", "prune_validation_fraction",
     "prune_min_stability", "prune_min_mean_gain", "prune_drop_z", "prune_keep_budget",
@@ -1448,7 +1468,37 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
             "n_trees_per_bag": [int(v) for v in per_bag],
             "stopping_reason_per_bag": [str(v) for v in est.stopping_reason_per_bag_ or []],
         }
+    if getattr(est, "fitted_at_", None) is not None:
+        md["fit_time"] = {"fitted_at": str(est.fitted_at_),
+                          "duration_seconds": float(est.fit_duration_)}
+    evidence = {key: _json_plain(getattr(est, attr))
+                for key, attr in _FIT_EVIDENCE.items() if getattr(est, attr, None) is not None}
+    if evidence:
+        md["fit_evidence"] = evidence
     return md
+
+
+# Fit diagnostics saved with the model so a loaded model can still be reviewed (the per-round
+# `evals_result_` history is deliberately not saved). `graduation_report_` is the per-table
+# smoothing strength the report shows.
+_FIT_EVIDENCE = {
+    "pruning_report": "pruning_report_",
+    "graduation_validation": "graduation_validation_",
+    "graduation_report": "graduation_report_",
+}
+
+
+def _json_plain(value: Any) -> Any:
+    """``value`` with numpy scalars/arrays and tuples turned into plain JSON types."""
+    if isinstance(value, dict):
+        return {str(k): _json_plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_plain(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return _json_plain(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def _checked_user_metadata(value: Any) -> dict[str, Any]:
@@ -1615,6 +1665,23 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
                 or any(r not in _STOP_REASONS for r in reasons)):
             raise SerializationError("Invalid fit report in estimator envelope")
         est._set_fit_counts(per_bag, reasons)
+    fit_time = md.get("fit_time")
+    if fit_time is not None:
+        if (not isinstance(fit_time, dict) or not isinstance(fit_time.get("fitted_at"), str)
+                or not isinstance(fit_time.get("duration_seconds"), (int, float))):
+            raise SerializationError("Invalid fit time in estimator envelope")
+        est.fitted_at_ = fit_time["fitted_at"]
+        est.fit_duration_ = float(fit_time["duration_seconds"])
+    evidence = md.get("fit_evidence") or {}
+    if not isinstance(evidence, dict):
+        raise SerializationError("Invalid fit evidence in estimator envelope")
+    for key, attr in _FIT_EVIDENCE.items():
+        if key in evidence:
+            # graduation_report_ is a list of per-table dicts; the others are dicts.
+            kind = list if key == "graduation_report" else dict
+            if not isinstance(evidence[key], kind):
+                raise SerializationError(f"Invalid {key} in estimator envelope")
+            setattr(est, attr, evidence[key])
 
 
 def _pack_bytes(est: "_BaseTBoost", inner: bytes) -> bytes:
@@ -2253,6 +2320,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_path_steps: int = _PRUNE_PATH_STEPS_DEFAULT,
         prune_path_fraction: float = _PRUNE_PATH_FRACTION_DEFAULT,
         prune_path_tolerance: float = _PRUNE_PATH_TOLERANCE_DEFAULT,
+        prune_min_variance_share: float = _PRUNE_MIN_VARIANCE_SHARE_DEFAULT,
         prune_main_effects: bool = _PRUNE_MAIN_EFFECTS_DEFAULT,
         band_tolerance: float | None = _BAND_TOLERANCE_DEFAULT,
         band_deviance_cap: float = _BAND_DEVIANCE_CAP_DEFAULT,
@@ -2536,6 +2604,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_path_steps = prune_path_steps
         self.prune_path_fraction = prune_path_fraction
         self.prune_path_tolerance = prune_path_tolerance
+        self.prune_min_variance_share = prune_min_variance_share
         # See `_PRUNE_MAIN_EFFECTS_DEFAULT`.
         self.prune_main_effects = prune_main_effects
         # See `_BAND_TOLERANCE_DEFAULT`.
@@ -2648,6 +2717,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             *_AE_REQUIRES,
             "graduation_validation_",
             *_FIT_REPORT_ATTRS,
+            *_FIT_TIME_ATTRS,
             *_COLUMN_SPECS,
         ):
             if hasattr(self, name):
@@ -2674,6 +2744,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             *_AE_REQUIRES,
             "graduation_validation_",
             *_FIT_REPORT_ATTRS,
+            *_FIT_TIME_ATTRS,
         ):
             if hasattr(self, name):
                 delattr(self, name)
@@ -2914,7 +2985,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 f"signs expanded onto every axis of each named feature"
                 + (f"; input features: {names}" if names else ""))
 
-        if getattr(self, "_fit_eval_set_", False) and self.validation_fraction is not None:
+        # Only when set away from its default, like every other row (the default 0.1 is simply
+        # unused when eval_set supplies the rows; reporting it made every eval_set fit fail
+        # check_bindings).
+        if (getattr(self, "_fit_eval_set_", False) and self.validation_fraction is not None
+                and self.validation_fraction != defaults.get("validation_fraction")):
             add("validation_fraction", "INERT",
                 "eval_set supplied the early-stopping rows, so no holdout was carved", "eval_set")
 
@@ -3718,139 +3793,82 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         not a general property of boosted models or of every GLM/link/penalty combination, so
         the ratios show where observed and predicted totals differ.
 
-        Available for regression and binary classification, pruned or not: every fit deploys
-        rating tables with a fixed grid. A multiclass (K>=3) fit, which has one table bank per
-        class, is not supported. Pass ``sample_weight``, ``exposure`` and ``offset`` explicitly
-        when the fit used them, including on the training data. Row count does not establish
-        alignment: fitted vectors are never silently reused. Use explicit unit vectors (or a
-        zero offset) when an unweighted, unit-exposure or offset-free evaluation is intended.
-        ``y`` and the per-row vectors may name polars columns.
+        Every fit deploys rating tables with a fixed grid, pruned or not. A multiclass (K>=3)
+        fit has one table bank, and so one grid, per class: it returns one entry per class and
+        feature (with a ``class`` key), one-vs-rest — ``actual`` = Σ weight·[y = class],
+        ``expected`` = Σ weight·P(class). Pass ``sample_weight``, ``exposure`` and ``offset``
+        explicitly when the fit used them, including on the training data. Row count does not
+        establish alignment: fitted vectors are never silently reused. Use explicit unit vectors
+        (or a zero offset) when an unweighted, unit-exposure or offset-free evaluation is
+        intended. ``y`` and the per-row vectors may name polars columns.
         """
-        model = getattr(self, "_model", None)
-        if model is None or not hasattr(model, "cell_indices"):
-            raise ValueError(
-                "actual_vs_expected supports regression and binary classification fits; "
-                + (
-                    "this multiclass (K>=3) fit has one table bank per class."
-                    if getattr(self, "_multi_model", None) is not None
-                    else "this model is a tree ensemble saved by an older t-boost, with no "
-                    "fixed cell grid to aggregate over. Refit it to get rating tables."
-                )
-            )
-        X, vectors = self._resolve_fit_vectors(
-            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
-        )
-        y, sample_weight, exposure, offset = (
-            vectors[k] for k in ("y", "sample_weight", "exposure", "offset")
-        )
-        for name, value, flag in (
-            ("sample_weight", sample_weight, "_ae_requires_weight_"),
-            ("exposure", exposure, "_ae_requires_exposure_"),
-            ("offset", offset, "_ae_requires_offset_"),
-        ):
-            if value is None and getattr(self, flag, False):
-                raise ValueError(f"actual_vs_expected requires explicit {name} aligned to X")
-        x32, cat_x = self._serve_design(X)
-        if hasattr(self, "classes_"):
-            labels = np.asarray(y)
-            if labels.ndim == 2 and labels.shape[1] == 1:
-                labels = labels[:, 0]
-            if labels.ndim != 1 or not np.all(np.isin(labels, self.classes_)):
-                raise ValueError("y must contain a vector of fitted class labels")
-            if len(self.classes_) != 2:
-                raise ValueError("actual_vs_expected supports binary classifiers only")
-            yv = (labels == self.classes_[1]).astype(np.float64)
-        else:
-            yv = _as_float32_1d(y, "y").astype(np.float64)
-        n = int(x32.shape[0])
-        if yv.shape[0] != n:
-            raise ValueError(f"y has {yv.shape[0]} rows but X has {n}")
-        w = (
-            _as_float32_1d(sample_weight, "sample_weight").astype(np.float64)
-            if sample_weight is not None
-            else np.ones(n, dtype=np.float64)
-        )
-        e = (
-            _as_float32_1d(exposure, "exposure").astype(np.float64)
-            if exposure is not None
-            else np.ones(n, dtype=np.float64)
-        )
-        for name, values in (("y", yv), ("sample_weight", w), ("exposure", e)):
-            if values.shape != (n,) or not np.all(np.isfinite(values)):
-                raise ValueError(f"{name} must contain {n} finite values")
-            if name != "y" and np.any(values < 0):
-                raise ValueError(f"{name} must be non-negative")
-        off = None if offset is None else _offset_array(offset, n)
-        pred = np.asarray(self._expected_response(X, exposure, off), dtype=np.float64)
-        cells = np.asarray(model.cell_indices(x32, cat_x=cat_x), dtype=np.int64)
-        names = list(model.raw_feature_names())
-        # Every cell of the merged grid, so the lists index the grid's borders and levels.
-        n_cells = [int(axis["cells"]) for axis in json.loads(model.merged_axes())]
+        from . import _report
+
+        p = _report.prepare(self, X, y, sample_weight=sample_weight, exposure=exposure,
+                            offset=offset)
+        if p.proba is None:
+            return _report.factor_ae(p)
+        assert p.codes is not None
         out: list[dict[str, Any]] = []
-        for j, name in enumerate(names):
-            c = cells[:, j]
-            k = n_cells[j]
-            actual = np.bincount(c, weights=w * yv, minlength=k)
-            expected = np.bincount(c, weights=w * pred, minlength=k)
-            mass = np.bincount(c, weights=w * e, minlength=k)
-            rows = np.bincount(c, minlength=k)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                ae = np.where(expected != 0, actual / expected, np.nan)
-            out.append({
-                "feature": name,
-                "raw": j,
-                "actual": actual.tolist(),
-                "expected": expected.tolist(),
-                "mass": mass.tolist(),
-                "rows": rows.tolist(),
-                "ae": ae.tolist(),
-            })
+        for k, label in enumerate(self.classes_):
+            for row in _report.factor_ae(p, k, actual=(p.codes == k).astype(np.float64),
+                                         expected=p.proba[:, k]):
+                out.append({**row, "class": label.item() if hasattr(label, "item") else label})
         return out
 
     def pricing_report(
         self, X: Any, y: Any, *, sample_weight: Any | None = None,
         exposure: Any | None = None, offset: Any | None = None,
         ref_measure: str | None = None,
+        eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
+        eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
+        eval_offset: Any | None = None,
+        labels: tuple[str, ...] = ("train", "validation", "test"),
+        name: str | None = None,
+        thresholds: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Return rating tables, labelled A/E cells and stage diagnostics for review.
+        """Return the model report: fit quality, structure, pruning evidence, rating tables,
+        A/E by factor level, drift and review flags, as plain JSON (``report_version`` 2).
 
-        Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``.
-        The report describes the supplied evaluation data; it is not evidence that
-        those data were held out. Save it beside the serialized model.
+        ``X``/``y`` are the train data; ``eval_set`` adds the validation data as one ``(X, y)``
+        pair (the ``fit`` convention), or validation and test data as a list of two pairs, with
+        the ``eval_*`` vectors as lists to match. ``labels`` names the datasets in that order.
+        Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``. ``thresholds`` overrides the review thresholds
+        (``t_boost._report.DEFAULT_THRESHOLDS``; ``None`` disables a check). The report
+        describes the supplied data; it is not evidence that those data were held out. Render
+        it with ``t_boost.report_html`` and save it beside the serialized model.
         """
-        ae = self.actual_vs_expected(
-            X, y, sample_weight=sample_weight, exposure=exposure, offset=offset
+        from . import _report
+
+        return _report.build_report(
+            self, X, y, sample_weight=sample_weight, exposure=exposure, offset=offset,
+            ref_measure=ref_measure, eval_set=eval_set, eval_sample_weight=eval_sample_weight,
+            eval_exposure=eval_exposure, eval_offset=eval_offset, labels=labels, name=name,
+            thresholds=thresholds,
         )
-        design, vectors = self._resolve_fit_vectors(
-            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
-        )
-        bank = json.loads(self.tables(
-            design, ref_measure=ref_measure, sample_weight=vectors["sample_weight"],
-            exposure=vectors["exposure"],
+
+    def html_report(
+        self, X: Any, y: Any, *, sample_weight: Any | None = None,
+        exposure: Any | None = None, offset: Any | None = None,
+        ref_measure: str | None = None,
+        eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
+        eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
+        eval_offset: Any | None = None,
+        labels: tuple[str, ...] = ("train", "validation", "test"),
+        name: str | None = None,
+        thresholds: dict[str, Any] | None = None,
+    ) -> str:
+        """The model report as one self-contained HTML page: ``report_html(pricing_report(...))``
+        with the same arguments. No scripts and no external resources, so it opens offline and
+        in MLflow's artifact viewer."""
+        from ._html_report import report_html
+
+        return report_html(self.pricing_report(
+            X, y, sample_weight=sample_weight, exposure=exposure, offset=offset,
+            ref_measure=ref_measure, eval_set=eval_set, eval_sample_weight=eval_sample_weight,
+            eval_exposure=eval_exposure, eval_offset=eval_offset, labels=labels, name=name,
+            thresholds=thresholds,
         ))
-        # Each factor's axis is its merged grid, the cells its A/E lists index. A banded
-        # table's own axis is coarser and maps categorical levels to bands, so it is not used.
-        # (`actual_vs_expected` above has refused every model without a table bank.)
-        model = cast(_TableModel, self._model)
-        merged = json.loads(annotate_unseen_cells(
-            json.dumps({"axes": json.loads(model.merged_axes())}),
-            getattr(self, "unknown_category", "rare"),
-        ))["axes"]
-        for factor in ae:
-            # Undefined ratios have an explicit JSON null in the portable report.
-            factor["ae"] = [float(v) if np.isfinite(v) else None for v in factor["ae"]]
-            factor["axis"] = {**merged[int(factor["raw"])], "band_of": None}
-        return {
-            "report_version": 1, "prediction_units": (
-                "per unit exposure" if getattr(self, "_ae_requires_exposure_", False)
-                else "target units (including any rate units defined by the caller)"
-            ),
-            "reference_normalization": "zero mean on the link scale; not arithmetic mean rate",
-            "band_interpretation": "bag stability; not claim prediction or credibility intervals",
-            "tables": bank, "actual_vs_expected": ae,
-            "pruning": getattr(self, "pruning_report_", None),
-            "graduation": getattr(self, "graduation_validation_", None),
-        }
 
     def _expected_response(
         self, X: Any, exposure: Any | None, offset: "np.ndarray | None" = None
@@ -4483,6 +4501,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.pruning_report_["graduation_validation"] = self.graduation_validation_
         return model
 
+    def _checked_min_variance_share(self) -> float:
+        value = float(getattr(self, "prune_min_variance_share", _PRUNE_MIN_VARIANCE_SHARE_DEFAULT))
+        if not 0.0 <= value < 1.0:
+            raise ValueError(f"prune_min_variance_share must be in [0, 1), got {value!r}")
+        return value
+
     def _ranked_path_select(
         self, full_model: Any, full_supports: list[Any], share: dict[Any, Any], x32: np.ndarray,
         y32: np.ndarray, w_full: np.ndarray, expo_full: np.ndarray | None, cat_x: Any, obj: str,
@@ -4535,11 +4559,23 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         if not tol >= 0.0:
             raise ValueError(f"prune_path_tolerance must be >= 0, got {tol!r}")
         gain = devs[0] - devs[best]
+        min_step, i_frac, i_tol = best, None, None
         if gain > 0.0 and frac < 1.0:
             i_frac = next(i for i in range(len(devs)) if devs[0] - devs[i] >= frac * gain)
             i_tol = next(i for i in range(len(devs)) if devs[i] <= devs[best] * (1.0 + tol))
             best = max(i_frac, i_tol)
         keep_t = mains + seq[: sizes[best]]
+        # The variance-share floor (see `_PRUNE_MIN_VARIANCE_SHARE_DEFAULT`), as the native
+        # `drop_low_share`: keep the downward closure of the tables that clear the floor, so a
+        # small table a significant one is built on stays.
+        min_share = self._checked_min_variance_share()
+        total_share = sum(max(v, 0.0) for v in share.values())
+        dropped_low: list[Any] = []
+        if min_share > 0.0 and total_share > 0.0:
+            anchors = [set(u) for u in keep_t if (not prune_mains and len(u) == 1)
+                       or max(share.get(u, 0.0), 0.0) / total_share >= min_share]
+            dropped_low = [u for u in keep_t if not any(set(u) <= a for a in anchors)]
+            keep_t = [u for u in keep_t if u not in dropped_low]
         keep = [list(u) for u in keep_t]
         kept_set = set(keep_t)
         report = {
@@ -4548,8 +4584,20 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "effective_order": max((len(u) for u in keep_t), default=0),
             "main_effect_policy": "prunable" if prune_mains else "sticky",
             "n_candidates": len(supports),
+            # `best` is the cutoff: the later of the first step reaching `fraction` of the total
+            # OOB gain and the first within `tolerance` of the minimum (both None when the path
+            # never improves on the main effects, or `fraction` is 1). `sequence` lists the
+            # ranked tables in the order they enter, each with the step whose bank adds it.
             "path": {"sizes": sizes, "oob_deviance": devs, "best": best, "oob_rows": n_val,
-                     "fraction": frac, "tolerance": tol},
+                     "fraction": frac, "tolerance": tol, "total_gain": gain,
+                     "min_step": min_step, "fraction_step": i_frac, "tolerance_step": i_tol,
+                     "min_variance_share": min_share,
+                     "dropped_low_share": [list(u) for u in dropped_low],
+                     "sequence": [
+                         {"u": list(u),
+                          "step": next(g for g in range(1, len(sizes)) if i < sizes[g])}
+                         for i, u in enumerate(seq)
+                     ]},
             "table_scores": [
                 {"u": list(u), "order": len(u), "mean_gain": share.get(u, 0.0),
                  "variance_share": share.get(u, 0.0), "selected": u in kept_set,
@@ -7102,6 +7150,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         this tolerance, so a small fraction of a large improvement cannot cost more than this
         fraction of the deviance. Must be ``>= 0``; ignored when ``prune_path_fraction`` is
         ``1.0``.
+    prune_min_variance_share : float, default=0.0
+        Ranked path only: the smallest share of the candidate tables' total variance a table
+        may have and stay in the deployed bank, applied after the path's cutoff. A kept table
+        below it is dropped unless a kept table at or above it contains it (a significant table
+        keeps what it is built on); main effects are exempt unless ``prune_main_effects=True``.
+        For example ``1e-4`` drops tables explaining less than 0.01% of the variance. ``0``
+        turns it off. Must be in ``[0, 1)``.
     prune_path_steps : int, default=32
         Ranked path only: the number of prefixes scored, their sizes spaced geometrically
         between one table and all the candidates.
@@ -7413,13 +7468,18 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         object exposing column names — check with
         ``getattr(est, "feature_names_in_", None)``, per the sklearn convention, rather than
         assuming it is always present.
+    fitted_at_ : str
+        When the fit finished, as an ISO 8601 UTC timestamp. Saved with the model.
+    fit_duration_ : float
+        Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
         kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``. ``["selector"]`` names the selector that ran: ``"ranked_path"``, whose
-        prefixes and their out-of-bag deviances are under ``["path"]`` (``["selection"]`` on a
-        multiclass fit), or a fold vote, which the guard, slope and evidence fields below
-        describe.
+        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
+        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
+        admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
+        which the guard, slope and evidence fields below describe.
 
         ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
         slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
@@ -7921,13 +7981,14 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         """
         check_is_fitted(self, "_model")
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
-        x32, cat_x = self._serve_design(X)
+        # A table model takes categoricals as codes (the `predict` path, no per-value Python).
+        x32, cat_kw = self._serve_kwargs(X, self._model)
         weight32, exposure32 = self._explain_mass(sample_weight, exposure, self._model, joint=ref_measure == "joint")
         payload = self._model.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),
             basis_json=basis_json,
-            cat_x=cat_x,
+            **cat_kw,
             overflow=overflow,
             weight=weight32,
             exposure=exposure32,
@@ -8465,6 +8526,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         this tolerance, so a small fraction of a large improvement cannot cost more than this
         fraction of the deviance. Must be ``>= 0``; ignored when ``prune_path_fraction`` is
         ``1.0``.
+    prune_min_variance_share : float, default=0.0
+        Ranked path only: the smallest share of the candidate tables' total variance a table
+        may have and stay in the deployed bank, applied after the path's cutoff. A kept table
+        below it is dropped unless a kept table at or above it contains it (a significant table
+        keeps what it is built on); main effects are exempt unless ``prune_main_effects=True``.
+        For example ``1e-4`` drops tables explaining less than 0.01% of the variance. ``0``
+        turns it off. Must be in ``[0, 1)``.
     prune_path_steps : int, default=32
         Ranked path only: the number of prefixes scored, their sizes spaced geometrically
         between one table and all the candidates.
@@ -8793,13 +8861,18 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         object exposing column names — check with
         ``getattr(est, "feature_names_in_", None)``, per the sklearn convention, rather than
         assuming it is always present.
+    fitted_at_ : str
+        When the fit finished, as an ISO 8601 UTC timestamp. Saved with the model.
+    fit_duration_ : float
+        Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
         kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``. ``["selector"]`` names the selector that ran: ``"ranked_path"``, whose
-        prefixes and their out-of-bag deviances are under ``["path"]`` (``["selection"]`` on a
-        multiclass fit), or a fold vote, which the guard, slope and evidence fields below
-        describe.
+        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
+        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
+        admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
+        which the guard, slope and evidence fields below describe.
 
         ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
         slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
@@ -9045,6 +9118,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_path_steps: int = _PRUNE_PATH_STEPS_DEFAULT,
         prune_path_fraction: float = _PRUNE_PATH_FRACTION_DEFAULT,
         prune_path_tolerance: float = _PRUNE_PATH_TOLERANCE_DEFAULT,
+        prune_min_variance_share: float = _PRUNE_MIN_VARIANCE_SHARE_DEFAULT,
         prune_main_effects: bool = _PRUNE_MAIN_EFFECTS_DEFAULT,
         band_tolerance: float | None = _BAND_TOLERANCE_DEFAULT,
         band_deviance_cap: float = _BAND_DEVIANCE_CAP_DEFAULT,
@@ -9154,6 +9228,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             prune_path_steps=prune_path_steps,
             prune_path_fraction=prune_path_fraction,
             prune_path_tolerance=prune_path_tolerance,
+            prune_min_variance_share=prune_min_variance_share,
             prune_main_effects=prune_main_effects,
             band_tolerance=band_tolerance,
             band_deviance_cap=band_deviance_cap,
@@ -9502,6 +9577,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 path_steps=int(getattr(self, "prune_path_steps", _PRUNE_PATH_STEPS_DEFAULT)),
                 path_fraction=float(getattr(self, "prune_path_fraction", _PRUNE_PATH_FRACTION_DEFAULT)),
                 path_tolerance=float(getattr(self, "prune_path_tolerance", _PRUNE_PATH_TOLERANCE_DEFAULT)),
+                path_min_share=self._checked_min_variance_share(),
                 # See `_PRUNE_MAIN_EFFECTS_DEFAULT`: every multiclass selector honors it.
                 prune_main_effects=bool(
                     getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)
@@ -9890,17 +9966,19 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         """
         check_is_fitted(self)
         X, sample_weight, exposure = self._resolve_explain_inputs(X, sample_weight, exposure)
-        x32, cat_x = self._serve_design(X)
         mm = self._multi_model
         target: _MultiClassModel | _MultiClassTableModel | _Model | _TableModel = (
             mm if mm is not None else self._model
         )
+        # A single-output table model takes categoricals as codes (the `predict` path).
+        x32, cat_kw = (self._serve_kwargs(X, target) if isinstance(target, _TableModel)
+                       else (lambda d: (d[0], {"cat_x": d[1]}))(self._serve_design(X)))
         weight32, exposure32 = self._explain_mass(sample_weight, exposure, target, joint=ref_measure == "joint")
         payload = target.tables(
             x32,
             **self._export_measure_kwargs(ref_measure, laplace, measure_floor),
             basis_json=basis_json,
-            cat_x=cat_x,
+            **cat_kw,
             overflow=overflow,
             weight=weight32,
             exposure=exposure32,

@@ -53,9 +53,9 @@ def test_ae_weight_requirement_and_column_arguments():
         m.actual_vs_expected(df, y, exposure=e[:-1], sample_weight=w)
 
 
-def test_ae_covers_unpruned_fits_and_names_the_multiclass_limit():
+def test_ae_covers_unpruned_and_multiclass_fits():
     # Every fit deploys rating tables, so an unpruned fit has a grid too. Multiclass has one bank
-    # per class and is refused, with a reason that does not tell the caller to set prune=True.
+    # (and grid) per class: one-vs-rest entries per class and feature.
     from t_boost import TBoostClassifier
 
     x, y, e = fixture()
@@ -63,9 +63,10 @@ def test_ae_covers_unpruned_fits_and_names_the_multiclass_limit():
     assert m.actual_vs_expected(x, y, exposure=e)
     labels = np.digitize(x[:, 0], [-0.5, 0.5])
     multi = TBoostClassifier(n_trees=25, n_bags=3, n_jobs=1).fit(x, labels)
-    with pytest.raises(ValueError, match='multiclass') as err:
-        multi.actual_vs_expected(x, labels)
-    assert 'prune=True' not in str(err.value)
+    rows = multi.actual_vs_expected(x, labels)
+    assert {r['class'] for r in rows} == {0, 1, 2} and len(rows) == 3 * x.shape[1]
+    for r in rows:
+        assert sum(r['actual']) == pytest.approx(float(np.sum(labels == r['class'])))
 
 
 @pytest.mark.parametrize('grouped', [False, True])

@@ -431,6 +431,61 @@ impl TableModel {
         Ok(out)
     }
 
+    /// Per-row exact interventional Shapley value of every raw feature, row-major
+    /// (`n_rows × n_raw`, raw features in merged-grid order): each effect's value (as
+    /// [`TableModel::effect_contributions`] reports it) shared equally among the raw features it
+    /// involves. The tables are purified against a product reference measure, so the equal split
+    /// is the Shapley value; `bank.f0` plus a row's values is its raw score, up to the order of
+    /// the float sums.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] on a width mismatch or an output too large to address;
+    /// propagated cell-map and per-effect evaluation errors.
+    pub fn feature_contributions(&self, x: &BinnedMatrix) -> Result<Vec<f64>, PbError> {
+        self.validate_binned_matrix(x)?;
+        let maps =
+            crate::scoring::build_cell_maps(&self.bank.merged_grids, &self.schema.cat_encoders, x)?;
+        let n_features = self.bank.merged_grids.len();
+        let n_rows = x.n_rows as usize;
+        let len = n_rows
+            .checked_mul(n_features)
+            .ok_or_else(|| PbError::ShapeMismatch {
+                what: format!("{n_rows} rows x {n_features} features overflows the output"),
+            })?;
+        let mut out = vec![0.0_f64; len];
+        if n_features == 0 {
+            return Ok(out);
+        }
+        let sets = self.effect_feature_sets();
+        out.par_chunks_mut(n_features).enumerate().try_for_each(
+            |(row, dst)| -> Result<(), PbError> {
+                let mut cells = vec![0u32; n_features];
+                crate::scoring::fill_row_cells(x, &maps, row, &mut cells)?;
+                let values = self
+                    .bank
+                    .tables
+                    .iter()
+                    .map(|table| table.eval(&cells))
+                    .chain(self.bank.factored.iter().map(|effect| effect.eval(&cells)));
+                for (value, set) in values.zip(&sets) {
+                    let value = value?;
+                    if set.is_empty() {
+                        continue;
+                    }
+                    let share = value / set.len() as f64;
+                    for &f in set {
+                        let slot = dst.get_mut(f as usize).ok_or_else(|| PbError::Internal {
+                            what: format!("effect feature {f} outside the {n_features} features"),
+                        })?;
+                        *slot += share;
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        Ok(out)
+    }
+
     /// Raw (link-space) scores for an already-binned design, via the LUT-sum (`bank.score`,
     /// which includes any factored order-3 tables). `offset` is added before the inverse
     /// link, exactly as in [`Model`].
@@ -1068,6 +1123,43 @@ mod tests {
             for (row, served) in values.chunks(sets.len()).zip(&raw) {
                 let sum = row.iter().fold(tm.bank.f0, |acc, v| acc + v);
                 assert_eq!(sum as f32, *served);
+            }
+        }
+    }
+
+    /// Each feature's Shapley value is its effects' values shared equally among their features,
+    /// and `f0` plus a row's feature values is its score.
+    #[test]
+    fn feature_contributions_split_each_effect_equally() {
+        for (model, x) in [
+            (fixture_model(), fixture_serve()),
+            (fixture_multichannel_model(), fixture_multichannel_serve()),
+        ] {
+            let tm = TableModel::from_model(&model, &x, RefMeasure::Uniform).unwrap();
+            let sets = tm.effect_feature_sets();
+            let n_features = tm.bank.merged_grids.len();
+            let effects = tm.effect_contributions(&x.0).unwrap();
+            let features = tm.feature_contributions(&x.0).unwrap();
+            let raw = tm.score_raw(&x.0, None).unwrap();
+            assert_eq!(features.len(), raw.len() * n_features);
+            for ((by_effect, by_feature), served) in effects
+                .chunks(sets.len())
+                .zip(features.chunks(n_features))
+                .zip(&raw)
+            {
+                let mut want = vec![0.0_f64; n_features];
+                for (value, set) in by_effect.iter().zip(&sets) {
+                    for &f in set {
+                        if let Some(slot) = want.get_mut(f as usize) {
+                            *slot += value / set.len() as f64;
+                        }
+                    }
+                }
+                for (got, want) in by_feature.iter().zip(&want) {
+                    assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+                }
+                let sum = by_feature.iter().fold(tm.bank.f0, |acc, v| acc + v);
+                assert!((sum - f64::from(*served)).abs() < 1e-5);
             }
         }
     }

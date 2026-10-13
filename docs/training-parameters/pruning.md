@@ -128,6 +128,31 @@ float
 
 0.001
 
+## prune_min_variance_share {#prune_min_variance_share}
+
+#### Description
+
+The smallest share of the candidate tables' total variance a table may have and stay in the
+deployed model. After the path's cutoff, a kept table below this share is dropped, unless a kept
+table at or above the share contains it: a significant table keeps the smaller tables it is built
+on, so the deployed tables stay closed under heredity.
+
+The path decides by the out-of-bag gain of whole prefixes, so a table with a negligible share
+can still sit before the cutoff. This floor removes such tables. For example, `1e-4` drops the
+tables that explain less than 0.01% of the variance. The shares are those of the
+[pruning report](../model-analysis/model-report.md#build). Main effects are
+subject to the floor only when [`prune_main_effects`](#prune_main_effects) is set. 0 turns the
+floor off.
+The value must be in the range $[0; 1)$. Used only by the `ranked_path` selector.
+
+**Type**
+
+float
+
+**Default value**
+
+0.0 (off)
+
 ## prune_path_steps {#prune_path_steps}
 
 #### Description

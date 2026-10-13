@@ -4362,7 +4362,7 @@ impl PyBooster {
     /// Fit native-softmax on the complement of `sel_rows`, then prune the per-class banks with a
     /// shared keep-set selected on those held-out rows. The full design crosses the Python boundary
     /// once; row gathering, fitting, full-data serving, and pruning run on one bounded Rayon pool.
-    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false))]
+    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn fit_multiclass_pruned(
         &self,
@@ -4439,6 +4439,8 @@ impl PyBooster {
         path_tolerance: f64,
         // Main effects are candidates in every selector (`PruneConfig::prune_main_effects`).
         prune_main_effects: bool,
+        // The ranked path's variance-share floor (`t_boost_core::prune::drop_low_share`).
+        path_min_share: f64,
     ) -> PyResult<(PyMultiClassTableModel, String)> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4507,6 +4509,7 @@ impl PyBooster {
                     band_deviance_cap,
                     path_tolerance,
                     prune_main_effects,
+                    path_min_share,
                 )
             })
             .map_err(py_err)?;
@@ -6091,6 +6094,43 @@ impl PyTableModel {
         Ok((self.model.bank.f0, values, feature_sets))
     }
 
+    /// Each row's exact Shapley value per raw feature (`TableModel::feature_contributions`):
+    /// `(f0, values)`, `values` shaped `(n_rows, n_raw)` in `raw_feature_names` order — every
+    /// effect shared equally among its features.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
+    fn feature_contributions<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
+    ) -> PyResult<(f64, Bound<'py, PyArray2<f64>>)> {
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let (values, n_rows) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    let ts = table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(&model, columns, cats, Some(&ts.cats))?;
+                    Ok((
+                        model.feature_contributions(&binned)?,
+                        binned.n_rows as usize,
+                    ))
+                })
+            })
+            .map_err(py_err)?;
+        let values = values
+            .into_pyarray(py)
+            .reshape([n_rows, self.model.bank.merged_grids.len()])
+            .map_err(|err| {
+                InternalError::new_err(format!("could not reshape contribution array: {err}"))
+            })?;
+        Ok((self.model.bank.f0, values))
+    }
+
     /// Sobol share `σ²(f_u)/σ²(F)` of every deployed effect under the bank's reference measure,
     /// as `(raw feature ids, share)` sorted by share descending. Read from the cached table
     /// variances: no data needed.
@@ -6145,12 +6185,15 @@ impl PyTableModel {
     /// Merged-grid cell index of every row on every raw feature — a `(n_rows, n_raw_features)`
     /// uint32 array in raw-feature order, the very cells `predict` reads. What an
     /// actual-versus-expected by rating-factor level aggregates over (2026-09-06).
-    #[pyo3(signature = (x, cat_x=None))]
+    /// Categoricals come as labels (`cat_x`) or as codes into distinct labels (`cat_codes`,
+    /// the form `predict` takes).
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None))]
     fn cell_indices<'py>(
         &self,
         py: Python<'py>,
         x: PyReadonlyArray2<'_, f32>,
         cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
     ) -> PyResult<Bound<'py, PyArray2<u32>>> {
         if x.shape().first() == Some(&0) {
             return Ok(PyArray2::<u32>::zeros(
@@ -6160,16 +6203,16 @@ impl PyTableModel {
             ));
         }
         let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
         let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
         let rows = py
             .detach(move || {
-                let binned = serve_binned_for_tables(&model, columns, cat_x, None)?;
-                model.row_cells(&binned)
+                let ts = table_serve(&model, &serve)?;
+                table_row_cells(&model, columns, cats, &ts.cats)
             })
             .map_err(py_err)?;
-        PyArray::from_vec2(py, &rows).map_err(|err| {
-            InternalError::new_err(format!("could not allocate cell-index array: {err}"))
-        })
+        cell_index_array(py, &rows)
     }
 
     /// Each dense table's cell of every row: one `(n_rows, order)` uint32 array per table,
@@ -6329,39 +6372,17 @@ impl PyTableModel {
 
     /// One display name per raw feature, in the raw-feature order `cell_indices` uses.
     fn raw_feature_names(&self) -> PyResult<Vec<String>> {
-        let m = &self.model;
-        (0..m.bank.merged_grids.len())
-            .map(|raw| {
-                let axis = t_boost_core::serialize::representative_axis_for_raw(
-                    &m.provenance,
-                    t_boost_core::data::FeatureId(raw as u32),
-                )
-                .map_err(py_err)?;
-                m.schema.feature_names.get(axis).cloned().ok_or_else(|| {
-                    py_err(PbError::ShapeMismatch {
-                        what: format!("schema missing feature name for raw {raw}"),
-                    })
-                })
-            })
-            .collect()
+        table_raw_feature_names(&self.model).map_err(py_err)
     }
 
     /// The merged grid of every raw feature as a JSON list of rating-table axes, in the
     /// raw-feature order `cell_indices` uses (see `TableBank::merged_axis_exports`): the
     /// cells and categorical levels `cell_indices` reports, never a table's bands.
     fn merged_axes(&self) -> PyResult<String> {
-        let m = &self.model;
-        m.bank
-            .merged_axis_exports(&m.schema, &m.provenance, &m.schema.cat_encoders)
-            .and_then(|axes| {
-                serde_json::to_string(&axes).map_err(|err| {
-                    PbError::Serialization(format!("could not serialize merged axes: {err}"))
-                })
-            })
-            .map_err(py_err)
+        table_merged_axes_json(&self.model).map_err(py_err)
     }
 
-    #[pyo3(signature = (x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None))]
+    #[pyo3(signature = (x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None, cat_codes=None))]
     #[allow(clippy::too_many_arguments, unused_variables)]
     fn tables(
         &self,
@@ -6374,6 +6395,7 @@ impl PyTableModel {
         overflow: Option<String>,
         weight: Option<PyReadonlyArray1<'_, f32>>,
         exposure: Option<PyReadonlyArray1<'_, f32>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
     ) -> PyResult<String> {
         // The bank was purified on the training rows at fit. A call-time `weight`/`exposure`
         // re-centres it on the rows of `x` (`TableBank::recentre_on`), and a `ref_measure`
@@ -6387,10 +6409,14 @@ impl PyTableModel {
             .map_err(py_err)?;
         let mass = combined_explain_weight(weight, exposure)?;
         let binned = match x {
-            Some(x) => Some(
-                serve_binned_for_tables(m, raw_columns_from_array(x)?, cat_x, None)
-                    .map_err(py_err)?,
-            ),
+            Some(x) => {
+                let cats = serve_cats(cat_x, cat_codes)?;
+                let ts = table_serve(m, &self.serve).map_err(py_err)?;
+                Some(
+                    serve_binned_tables_any(m, raw_columns_from_array(x)?, cats, Some(&ts.cats))
+                        .map_err(py_err)?,
+                )
+            }
             _ => None,
         };
         let bank = export_bank(
@@ -6987,6 +7013,17 @@ struct PyMultiClassTableModel {
     serve: Arc<OnceLock<MultiClassTableServe>>,
 }
 
+impl PyMultiClassTableModel {
+    fn class_model(&self, class_index: usize) -> PyResult<&TableModel> {
+        self.model.classes.get(class_index).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "class_index {class_index} out of range for {} classes",
+                self.model.classes.len()
+            ))
+        })
+    }
+}
+
 #[pymethods]
 impl PyMultiClassTableModel {
     /// `categorical_labels` merged over every class's encoders (each label once per feature).
@@ -7169,6 +7206,55 @@ impl PyMultiClassTableModel {
             .collect()
     }
 
+    /// `_TableModel.feature_contributions` for every class logit: one `(f0, values)` per class,
+    /// in `class_labels` order.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, n_jobs=None))]
+    fn feature_contributions<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        n_jobs: Option<usize>,
+    ) -> PyResult<Vec<(f64, Bound<'py, PyArray2<f64>>)>> {
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let (per_class, n_rows) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                        what: "multiclass tables model has no classes".into(),
+                    })?;
+                    let ts = multiclass_table_serve(&model, &serve)?;
+                    let binned = serve_binned_tables_any(first, columns, cats, Some(&ts.cats))?;
+                    let per_class = model
+                        .classes
+                        .iter()
+                        .map(|tm| tm.feature_contributions(&binned))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok((per_class, binned.n_rows as usize))
+                })
+            })
+            .map_err(py_err)?;
+        per_class
+            .into_iter()
+            .zip(&self.model.classes)
+            .map(|(values, tm)| {
+                let values = values
+                    .into_pyarray(py)
+                    .reshape([n_rows, tm.bank.merged_grids.len()])
+                    .map_err(|err| {
+                        InternalError::new_err(format!(
+                            "could not reshape contribution array: {err}"
+                        ))
+                    })?;
+                Ok((tm.bank.f0, values))
+            })
+            .collect()
+    }
+
     /// `_TableModel.sobol` for every class logit, in `class_labels` order.
     fn sobol(&self) -> Vec<Vec<(Vec<u32>, f64)>> {
         self.model
@@ -7244,6 +7330,52 @@ impl PyMultiClassTableModel {
         }
         serde_json::to_string_pretty(&serde_json::Value::Object(map))
             .map_err(|err| InternalError::new_err(format!("multiclass tables JSON: {err}")))
+    }
+
+    /// `_TableModel.cell_indices` on class `class_index`'s bank: each class bank has its own
+    /// merged grid, so a class's cells index that class's tables and `merged_axes`.
+    #[pyo3(signature = (x, cat_x=None, cat_codes=None, class_index=0))]
+    fn cell_indices<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f32>,
+        cat_x: Option<Vec<Vec<String>>>,
+        cat_codes: Option<Vec<(PyReadonlyArray1<'_, u32>, Vec<String>)>>,
+        class_index: usize,
+    ) -> PyResult<Bound<'py, PyArray2<u32>>> {
+        let n_raw = self.class_model(class_index)?.bank.merged_grids.len();
+        if x.shape().first() == Some(&0) {
+            return Ok(PyArray2::<u32>::zeros(py, [0, n_raw], false));
+        }
+        let columns = raw_columns_from_array(x)?;
+        let cats = serve_cats(cat_x, cat_codes)?;
+        let model = Arc::clone(&self.model);
+        let serve = Arc::clone(&self.serve);
+        let rows = py
+            .detach(move || {
+                let ts = multiclass_table_serve(&model, &serve)?;
+                let tm = model
+                    .classes
+                    .get(class_index)
+                    .ok_or_else(|| PbError::Internal {
+                        what: format!("class index {class_index} vanished"),
+                    })?;
+                table_row_cells(tm, columns, cats, &ts.cats)
+            })
+            .map_err(py_err)?;
+        cell_index_array(py, &rows)
+    }
+
+    /// One display name per raw feature, in the raw-feature order `cell_indices` uses (the
+    /// classes share their provenance and schema).
+    fn raw_feature_names(&self) -> PyResult<Vec<String>> {
+        table_raw_feature_names(self.class_model(0)?).map_err(py_err)
+    }
+
+    /// `_TableModel.merged_axes` of class `class_index`'s bank.
+    #[pyo3(signature = (class_index=0))]
+    fn merged_axes(&self, class_index: usize) -> PyResult<String> {
+        table_merged_axes_json(self.class_model(class_index)?).map_err(py_err)
     }
 
     fn to_json(&self) -> PyResult<String> {
@@ -8549,6 +8681,7 @@ fn fit_multiclass_pruned_owned(
     band_deviance_cap: f64,
     path_tolerance: f64,
     prune_main_effects: bool,
+    path_min_share: f64,
 ) -> Result<(MultiClassTableModel, String), PbError> {
     let n = y.len();
     if n == 0 {
@@ -8736,7 +8869,7 @@ fn fit_multiclass_pruned_owned(
                 )
             })?;
             drop(serve);
-            let (keep, path_json) = match sel {
+            let (keep, mut path_json) = match sel {
                 Some((keep, path)) => (
                     keep,
                     serde_json::to_value(&path).map_err(|err| {
@@ -8748,6 +8881,25 @@ fn fit_multiclass_pruned_owned(
                     serde_json::json!({ "skipped": "no out-of-bag evidence: full bank kept" }),
                 ),
             };
+            // The variance-share floor, after the path's cutoff (`prune_min_variance_share`).
+            let (keep, dropped_low) = t_boost_core::prune::drop_low_share(
+                &keep,
+                &supports,
+                path_min_share,
+                prune_main_effects,
+            );
+            if let Some(obj) = path_json.as_object_mut() {
+                obj.insert(
+                    "min_variance_share".into(),
+                    serde_json::json!(path_min_share),
+                );
+                obj.insert(
+                    "dropped_low_share".into(),
+                    serde_json::to_value(&dropped_low).map_err(|err| {
+                        PbError::Serialization(format!("could not serialize dropped tables: {err}"))
+                    })?,
+                );
+            }
             ranked_used = true;
             let kept_set: std::collections::BTreeSet<FeatureSet> = keep.iter().cloned().collect();
             let table_scores: Vec<PruneTableScore> = supports
@@ -9835,6 +9987,58 @@ fn serve_binned_tables_any(
 /// Row count from which serve binning runs its columns in parallel (see `bin_serve_columns_with`).
 const SERVE_PAR_MIN_ROWS: usize = 16_384;
 
+/// Merged-grid cell of every row on every raw feature (`TableModel::row_cells`), from raw
+/// numeric columns and categorical labels.
+fn table_row_cells(
+    tm: &TableModel,
+    columns: Vec<Vec<f32>>,
+    cats: ServeCatsInput,
+    cat_maps: &CatServeMaps,
+) -> Result<Vec<Vec<u32>>, PbError> {
+    let binned = serve_binned_tables_any(tm, columns, cats, Some(cat_maps))?;
+    tm.row_cells(&binned)
+}
+
+fn cell_index_array<'py>(
+    py: Python<'py>,
+    rows: &[Vec<u32>],
+) -> PyResult<Bound<'py, PyArray2<u32>>> {
+    PyArray::from_vec2(py, rows).map_err(|err| {
+        InternalError::new_err(format!("could not allocate cell-index array: {err}"))
+    })
+}
+
+/// One display name per raw feature, in raw-feature order.
+fn table_raw_feature_names(tm: &TableModel) -> Result<Vec<String>, PbError> {
+    (0..tm.bank.merged_grids.len())
+        .map(|raw| {
+            let raw = u32::try_from(raw).map_err(|_| PbError::Internal {
+                what: "raw feature index exceeded u32".into(),
+            })?;
+            let axis = t_boost_core::serialize::representative_axis_for_raw(
+                &tm.provenance,
+                t_boost_core::data::FeatureId(raw),
+            )?;
+            tm.schema
+                .feature_names
+                .get(axis)
+                .cloned()
+                .ok_or_else(|| PbError::ShapeMismatch {
+                    what: format!("schema missing feature name for raw {raw}"),
+                })
+        })
+        .collect()
+}
+
+/// `TableBank::merged_axis_exports` as JSON.
+fn table_merged_axes_json(tm: &TableModel) -> Result<String, PbError> {
+    let axes = tm
+        .bank
+        .merged_axis_exports(&tm.schema, &tm.provenance, &tm.schema.cat_encoders)?;
+    serde_json::to_string(&axes)
+        .map_err(|err| PbError::Serialization(format!("could not serialize merged axes: {err}")))
+}
+
 fn serve_binned_for_tables(
     tm: &TableModel,
     numeric_cols: Vec<Vec<f32>>,
@@ -10419,6 +10623,178 @@ fn invariant_message(invariant: Invariant) -> String {
     invariant.to_string()
 }
 
+fn f64_slice<'a>(a: &'a PyReadonlyArray1<'_, f64>, what: &str) -> PyResult<&'a [f64]> {
+    a.as_slice()
+        .map_err(|e| PyValueError::new_err(format!("{what} must be contiguous float64: {e}")))
+}
+
+/// One feature's per-cell sums as numpy arrays: `(actual, expected, mass, rows, variance)`.
+type CellSumArrays<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<u64>>,
+    Bound<'py, PyArray1<f64>>,
+);
+
+/// Per-cell actual-versus-expected sums for every raw feature (`t_boost_core::report::cell_sums`):
+/// `cells` is the `(n_rows, n_raw)` array `cell_indices` returns. One `(actual, expected, mass,
+/// rows, variance)` tuple of arrays per feature.
+#[pyfunction]
+#[pyo3(signature = (cells, n_cells, y, pred, weight, exposure, variance=None))]
+#[allow(clippy::too_many_arguments)] // JUSTIFIED: one array per per-row input.
+fn _report_cell_sums<'py>(
+    py: Python<'py>,
+    cells: PyReadonlyArray2<'_, u32>,
+    n_cells: Vec<u32>,
+    y: PyReadonlyArray1<'_, f64>,
+    pred: PyReadonlyArray1<'_, f64>,
+    weight: PyReadonlyArray1<'_, f64>,
+    exposure: PyReadonlyArray1<'_, f64>,
+    variance: Option<PyReadonlyArray1<'_, f64>>,
+) -> PyResult<Vec<CellSumArrays<'py>>> {
+    if cells.shape().get(1).copied() != Some(n_cells.len()) {
+        return Err(PyValueError::new_err(
+            "cells must have one column per entry of n_cells",
+        ));
+    }
+    let flat = cells
+        .as_slice()
+        .map_err(|e| PyValueError::new_err(format!("cells must be C-contiguous uint32: {e}")))?;
+    let rows = t_boost_core::report::RowValues {
+        y: f64_slice(&y, "y")?,
+        pred: f64_slice(&pred, "pred")?,
+        weight: f64_slice(&weight, "weight")?,
+        exposure: f64_slice(&exposure, "exposure")?,
+        variance: variance
+            .as_ref()
+            .map(|v| f64_slice(v, "variance"))
+            .transpose()?,
+    };
+    let sums = py
+        .detach(|| t_boost_core::report::cell_sums(flat, &n_cells, rows))
+        .map_err(py_err)?;
+    Ok(sums
+        .into_iter()
+        .map(|c| {
+            (
+                c.actual.into_pyarray(py),
+                c.expected.into_pyarray(py),
+                c.mass.into_pyarray(py),
+                c.rows.into_pyarray(py),
+                c.variance.into_pyarray(py),
+            )
+        })
+        .collect())
+}
+
+/// One feature's per-cell statistics as numpy arrays: `(weight, mean, quantiles)`, `quantiles`
+/// shaped `(cells, len(qs))`.
+type CellQuantileArrays<'py> = (
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray1<f64>>,
+    Bound<'py, PyArray2<f64>>,
+);
+
+/// Per-cell weighted mean and quantiles of a per-row value for every raw feature
+/// (`t_boost_core::report::cell_quantiles`): `cells` and `values` are `(n_rows, n_raw)`, `weight`
+/// one value per row. One `(weight, mean, quantiles)` tuple of arrays per feature.
+#[pyfunction]
+#[pyo3(signature = (cells, n_cells, values, weight, qs))]
+fn _report_cell_quantiles<'py>(
+    py: Python<'py>,
+    cells: PyReadonlyArray2<'_, u32>,
+    n_cells: Vec<u32>,
+    values: PyReadonlyArray2<'_, f64>,
+    weight: PyReadonlyArray1<'_, f64>,
+    qs: Vec<f64>,
+) -> PyResult<Vec<CellQuantileArrays<'py>>> {
+    if cells.shape().get(1).copied() != Some(n_cells.len()) || values.shape() != cells.shape() {
+        return Err(PyValueError::new_err(
+            "cells and values must both be (n_rows, len(n_cells)) arrays",
+        ));
+    }
+    let flat = cells
+        .as_slice()
+        .map_err(|e| PyValueError::new_err(format!("cells must be C-contiguous uint32: {e}")))?;
+    let vals = values
+        .as_slice()
+        .map_err(|e| PyValueError::new_err(format!("values must be C-contiguous float64: {e}")))?;
+    let w = f64_slice(&weight, "weight")?;
+    let stats = py
+        .detach(|| t_boost_core::report::cell_quantiles(flat, &n_cells, vals, w, &qs))
+        .map_err(py_err)?;
+    stats
+        .into_iter()
+        .map(|c| {
+            let k = c.weight.len();
+            let quantiles = c
+                .quantiles
+                .into_pyarray(py)
+                .reshape([k, qs.len()])
+                .map_err(|err| {
+                    InternalError::new_err(format!("could not reshape quantile array: {err}"))
+                })?;
+            Ok((
+                c.weight.into_pyarray(py),
+                c.mean.into_pyarray(py),
+                quantiles,
+            ))
+        })
+        .collect()
+}
+
+/// Lorenz Gini, perfect-ranking Gini, equal-mass lift bands and the sampled Lorenz curve of
+/// predicted `rate` against actual `y_rate` under `mass` (`t_boost_core::report::ranking`).
+/// `lift` holds `(rows, mass, actual, predicted, rate_min, rate_max, variance)` per band;
+/// `variance` (per row, of the actual total) is summed per band when given.
+#[pyfunction]
+#[pyo3(signature = (rate, y_rate, mass, bands=10, points=101, variance=None))]
+fn _report_ranking<'py>(
+    py: Python<'py>,
+    rate: PyReadonlyArray1<'_, f64>,
+    y_rate: PyReadonlyArray1<'_, f64>,
+    mass: PyReadonlyArray1<'_, f64>,
+    bands: usize,
+    points: usize,
+    variance: Option<PyReadonlyArray1<'_, f64>>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let (r, y, m) = (
+        f64_slice(&rate, "rate")?,
+        f64_slice(&y_rate, "y_rate")?,
+        f64_slice(&mass, "mass")?,
+    );
+    let v = variance
+        .as_ref()
+        .map(|v| f64_slice(v, "variance"))
+        .transpose()?;
+    let out = py
+        .detach(|| t_boost_core::report::ranking(r, y, m, v, bands, points))
+        .map_err(py_err)?;
+    let dict = PyDict::new(py);
+    dict.set_item("rows", out.rows)?;
+    dict.set_item("gini", out.gini)?;
+    dict.set_item("gini_perfect", out.gini_perfect)?;
+    let lift: Vec<(u64, f64, f64, f64, f64, f64, f64)> = out
+        .lift
+        .iter()
+        .map(|b| {
+            (
+                b.rows,
+                b.mass,
+                b.actual,
+                b.predicted,
+                b.rate_min,
+                b.rate_max,
+                b.variance,
+            )
+        })
+        .collect();
+    dict.set_item("lift", lift)?;
+    dict.set_item("lorenz", out.lorenz)?;
+    Ok(dict)
+}
+
 /// The compiled extension module `t_boost._t_boost` (§02.7).
 #[pymodule]
 fn _t_boost(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -10436,6 +10812,9 @@ fn _t_boost(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTableBank>()?;
     m.add_class::<PyTableModel>()?;
     m.add_class::<PyMultiClassTableModel>()?;
+    m.add_function(wrap_pyfunction!(_report_cell_sums, m)?)?;
+    m.add_function(wrap_pyfunction!(_report_cell_quantiles, m)?)?;
+    m.add_function(wrap_pyfunction!(_report_ranking, m)?)?;
     // Timing tripwire: lets Python callers detect an unoptimized debug build (typically
     // 5-30x slower) before trusting any benchmark numbers.
     m.add(

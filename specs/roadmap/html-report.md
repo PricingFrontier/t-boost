@@ -1,6 +1,6 @@
 # HTML model report — plan
 
-Status: plan, revision 2 (2026-10-13), not started. Branch `html-report` off `main` @ 1f480c2.
+Status: implemented 2026-10-13 on branch `html-report` (see "As built" at the end).
 Revision 2 folds in two read-only reviews (Fable 5.1; Codex gpt-6-astra, ultra effort); the
 review findings are summarised at the end.
 
@@ -368,3 +368,113 @@ incumbent model (rustystats' `base_predictions`), split/date provenance — see 
 
 1. No comparison with an incumbent model yet (`baseline=` deferred).
 2. Persist `pruning_report_` and `graduation_validation_`; do not persist `evals_result_`.
+
+## As built (2026-10-13)
+
+- `pricing_report` v2 (`python/t_boost/_report.py`), `report_html` (`_html_report.py`),
+  `html_report` on both estimators, `fitted_at_`/`fit_duration_`, persisted `pruning_report_` and
+  `graduation_validation_` (envelope schema 6), ranked-path `total_gain`/`min_step`/
+  `fraction_step`/`tolerance_step`/`sequence`, multiclass `cell_indices`/`raw_feature_names`/
+  `merged_axes` and one-vs-rest `actual_vs_expected`, `metrics.mean_binomial_deviance` and
+  `mean_multinomial_deviance`.
+- Performance (user, mid-implementation: "make any calculation in the rust side"): the per-row
+  work is native. New `t_boost_core::report` (`cell_sums`, parallel over features; `ranking`:
+  Gini, perfect Gini, equal-mass lift, Lorenz from one sort) exposed as `_report_cell_sums` /
+  `_report_ranking`; `cell_indices` (both models) and `_TableModel.tables` take `cat_codes`, so
+  the report and `tables()` use the coded categorical path `predict` uses. 1M rows × 15
+  features: `pricing_report` 12.0 s → 0.76 s (the label path's per-value Python was 7 s).
+- Factor A/E flag gained a credibility condition, `factor_z` (default 3): with only
+  `factor_ae`/`factor_min_mass`, ordinary Poisson noise on ~150-claim levels flagged nearly every
+  model. z uses the objective's variance function and the Pearson dispersion.
+- Rendering: no JavaScript at all; SVG `<title>` hovers; CSS-only dataset/class selectors
+  (verified with JS disabled in headless Chromium); heatmaps are SVG `<rect>`s coloured with
+  `color-mix()` so one markup serves both themes. Checked at 1280 px and 390 px: no horizontal
+  scroll.
+- Datasets (user, 2026-10-13: "train / validation / test terminology … accept train / validation,
+  or train / validation / test"): `eval_set` takes one pair or a list of up to two
+  (validation, test), `eval_*` vectors as matching lists; labels default
+  `("train", "validation", "test")`; thresholds `ae_train`/`ae_validation`/`ae_test`/`train_gap`
+  (replacing `ae_eval`/`train_eval_gap`); PSI from train to each later dataset; an info flag when
+  the fit early-stopped on an `eval_set`. Also fixed `binding_report_` flagging the DEFAULT
+  `validation_fraction` as INERT on every eval_set fit (it made `check_bindings` raise).
+- `prune_min_variance_share` (user, 2026-10-13: the ranked path kept tables with ~0.001% variance
+  share; "users should be able to set a min variance share"): after the path cutoff, drop kept
+  candidates below the share of the candidates' total variance, plus their supersets; mains exempt
+  unless `prune_main_effects`; default 0 (off). Core `prune::drop_low_share` (multiclass, native)
+  mirrored in `_ranked_path_select`; recorded as `path.min_variance_share`/`dropped_low_share`.
+  freMTPL2 (60/20/20): 0 → 72 tables, test dev 0.304806; 1e-4 → 52 (+0.04%); 1e-3 → 28 (+0.18%);
+  5e-3 → 19 (+0.30%).
+- Tests: `python/tests/conftest.py` clears the cached constructor defaults around every test (ten
+  modules patch `__kwdefaults__`, which leaked into `binding_report_`).
+  `test_callback_true_stops_and_exceptions_propagate` is a pre-existing flake (~1 in 6 on
+  origin/main too), not touched.
+- Floor rule changed the same day: the first rule (drop a low table and everything containing it)
+  dropped VehAge x VehGas (1.29%) once mains were prunable (VehGas main 0.085%). Now the kept set
+  is the downward closure of the tables clearing the floor: a low table stays when a kept table at
+  or above the floor is built on it. freMTPL2, 0.1% floor + `prune_main_effects=True`: 31 tables,
+  test deviance 0.305104 (+0.10% vs no floor; old rule 24 tables, 0.305837); only Area's main
+  effect dropped. Default stays 0 (user: "default off").
+- Model-card review (Fable 5.1 + Codex gpt-6-astra ultra, 2026-10-13) applied: page order
+  Review → Fit quality → Structure → Rating factors → Data checks → Pruning → Training → Appendix
+  → Tables; header with base rate, table counts and a dataset × (deviance explained, Gini, A/E)
+  grid; charts default to the last dataset; pruning/training/defaults/secondary metrics collapsed;
+  one-line data checks; factor summary table; Structure rows link to Tables; categorical features
+  as points; relativity axes span ≥ ±5%; no axis below zero; ranked tables grouped and collapsible.
+  The factor A/E check now reads ≤ 10 equal-mass bands per feature (train bins, shared by every
+  dataset; `bands` in the report) — per-cell checking covered only 6.4% of Density's exposure.
+- Team review round 2 (six agents incl. Fable 5.1 and Codex Astra, 2026-10-13; user: "everything
+  they need to make judgement on the model, without being overwhelmed, without scrolling up and
+  down, and visuals they can use to summarise in meetings") implemented the same day. The page is
+  now CSS-only tabs (radio inputs first in `.app`, labels in a sticky bar) with one page-wide
+  dataset switch (default: the last dataset) and, for multiclass, one class switch:
+  - **Overview** fits 1440 × 900 without scrolling: headline table (datasets × exposure, claims,
+    A/E, deviance explained, Gini), the open review flags grouped by check (one line each,
+    ellipsised, full text on hover), decile calibration (actual/predicted on top, A/E of every
+    dataset below with the selected one's ±2σ), feature importance (own one-way table vs through
+    interactions), the four largest one-way tables as small multiples on one log scale (thin
+    cells faded), and the pruning gain path (Lorenz curve when no path was recorded). Titles are
+    takeaways computed from the data ("Top decile 8.2× the bottom; test decile A/E 0.94–1.08").
+  - **Performance**: full metrics table, full-width calibration (decile table collapsed), Lorenz
+    beside an all-features A/E-by-band chart, spread of predictions; class matrices.
+  - **Factors**: a rail of features (importance bar, worst band on the selected dataset) selects
+    one figure per feature on one x-axis: relativity (log scale, thin cells faded), A/E by the
+    review's bands for every dataset (±`factor_ae` dashed, ±2σ shaded) and train exposure (a
+    dominant bar clipped and labelled); categorical levels ordered by effect; the feature's
+    findings above; per-level numbers collapsed.
+  - **Tables**: list (share, range, smoothing) selects a table shown as numbers beside it.
+  - **Build**: gain path; every candidate as a column of its variance share in path order (kept /
+    below the floor / past the cutoff, floor line); ranked groups; graduation strengths; training
+    curve with the band where the bags stopped.
+  - **Checks**: all flags, passed checks and thresholds collapsed; data; parameters; model; how to
+    read (collapsed).
+  - **Slides**: five charts as standalone light-palette SVG images (base64 data URIs, drawn at 2×,
+    takeaway title and subtitle inside the image) to copy into a deck.
+  Alignment: every chart is drawn at the inner pixel width of its card (558 half, 1166 full, 910
+  factor) so 12 px text renders at 12 px and stacked panels share their left/right edges; titles
+  and captions are one line; numeric columns right-aligned with one format per column; integer
+  features labelled as integers (`51`, `22–25`, `≥ 189`, shared with the report's band labels via
+  `run_label`); log ticks chosen to span the axis. Report additions: decile `ae`/`sd`/`z`, factor
+  band `sd`, `features` section, `fit.graduation_tables`, `graduation_report_` persisted, review
+  checks `decile_ae` (+ near misses), `missing_level`, `thin_cells`, `graduation`, thresholds
+  `decile_ae`, `near_miss_z`, `missing_effect`, `thin_cell_mass`. The multiclass pruning report
+  keeps its path under `selection` (no `sequence`): drawn kept-first.
+- Round 3 (user, 2026-10-13: "as well as main effects for the factors, can we get a view of PDP or
+  Shap to take into account other factors. And then also some more info on interactions … light
+  pastel green (high) yellow low … I dont think we need the slides view"):
+  - **SHAP, not PDP.** t-boost's interaction tables are centred on the train exposure marginals
+    (freMTPL2 DrivAge × BonusMalus: |mean over the partner| ≤ 0.0005 on a table spanning −0.98 to
+    +0.75), so a PDP equals the one-way table. The report now stores, on the first dataset's A/E
+    entries, each merged cell's exposure-weighted mean and 10th/90th percentile of the feature's
+    exact Shapley value (`shap`), from two native kernels: `TableModel::feature_contributions`
+    (each effect split equally over its raw features; `_TableModel.feature_contributions`, per
+    class on the multiclass model) and `report::cell_quantiles` (`_report_cell_quantiles`,
+    weighted lower quantiles per cell, parallel over features). +0.11 s on 406k rows. The factor
+    chart draws the SHAP mean (dashed) and the 80% band over the one-way table.
+  - **Interactions tab** (replacing Slides): `interactions` section in the report (share, range,
+    support-weighted 5th–95th percentile `spread`, smoothing); a rail by share and, per table,
+    the first feature's one-way table (dashed) plus the table averaged over ≤ 4 bands of equal
+    exposure of the partner (third feature averaged out), thin bands faded. The 40 largest are
+    drawn (page size; all are in Tables).
+  - **Tables tints**: five-step light green (above no effect) / yellow (below) per cell on the
+    square root of |log effect| / the table's largest; grey for no exposure.
+  - Slides tab, slide images and the takeaway variants for them removed.

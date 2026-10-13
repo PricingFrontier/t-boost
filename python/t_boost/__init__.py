@@ -41,6 +41,7 @@ if TYPE_CHECKING:
         TBoostRegressor,
         recommended_recipe,
     )
+    from ._html_report import report_html
 
 __all__ = [
     "ContributionMatrix",
@@ -48,6 +49,7 @@ __all__ = [
     "TBoostRegressor",
     "PrecisionWarning",
     "recommended_recipe",
+    "report_html",
     "_Booster",
     "_Model",
     "_MultiClassModel",
@@ -69,6 +71,10 @@ except PackageNotFoundError:  # not installed as a distribution (e.g. a bare sou
 
 
 def __getattr__(name: str) -> object:
+    if name == "report_html":
+        from ._html_report import report_html
+
+        return report_html
     if name in {
         "ContributionMatrix",
         "TBoostClassifier",

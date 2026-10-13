@@ -93,8 +93,11 @@ empty cells included:
 - `ae` — `actual / expected` (`nan` where `expected` is 0).
 
 Exact balance by factor level is not a general property of boosted models, so the ratios show
-where the model and the data disagree. For a classifier, only binary classification is
-supported.
+where the model and the data disagree.
+
+A multiclassification model has one grid per class: the list holds one entry per class and
+feature, with a `class` key, one-vs-rest — `actual` $= \sum w \cdot [t = class]$ and
+`expected` $= \sum w \cdot P(class)$. It accepts no exposure or offset.
 
 ## Usage examples {#usage-examples}
 

@@ -19,6 +19,9 @@ __all__ = [
     "_MultiClassTableModel",
     "_TableBank",
     "_TableModel",
+    "_report_cell_quantiles",
+    "_report_cell_sums",
+    "_report_ranking",
 ]
 
 BUILD_PROFILE: str
@@ -185,6 +188,7 @@ class _Booster:
         band_deviance_cap: float = 0.001,
         path_tolerance: float = 0.0,
         prune_main_effects: bool = False,
+        path_min_share: float = 0.0,
     ) -> tuple[_MultiClassTableModel, str]: ...
 
     def fit_prune_folds(
@@ -460,7 +464,10 @@ class _TableModel:
     def deployed_census(self) -> dict[str, Any]: ...
     def deployed_supports(self) -> list[list[int]]: ...
     def cell_indices(
-        self, x: np.ndarray, cat_x: Sequence[Sequence[str]] | None = None
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
     ) -> np.ndarray: ...
     def raw_feature_names(self) -> list[str]: ...
     def merged_axes(self) -> str: ...
@@ -478,6 +485,13 @@ class _TableModel:
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
         n_jobs: int | None = None,
     ) -> tuple[float, np.ndarray, list[list[int]]]: ...
+    def feature_contributions(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
+    ) -> tuple[float, np.ndarray]: ...
     def sobol(self) -> list[tuple[list[int], float]]: ...
     def band(
         self,
@@ -575,6 +589,7 @@ class _TableModel:
         overflow: str | None = None,
         weight: np.ndarray | None = None,
         exposure: np.ndarray | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
     ) -> str: ...
 
     def to_json(self) -> str: ...
@@ -742,6 +757,16 @@ class _MultiClassTableModel:
         n_jobs: int | None = None,
     ) -> np.ndarray: ...
 
+    def cell_indices(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        class_index: int = 0,
+    ) -> np.ndarray: ...
+    def raw_feature_names(self) -> list[str]: ...
+    def merged_axes(self, class_index: int = 0) -> str: ...
+
     def predict_raw(
         self,
         x: np.ndarray,
@@ -756,6 +781,13 @@ class _MultiClassTableModel:
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
         n_jobs: int | None = None,
     ) -> list[tuple[float, np.ndarray, list[list[int]]]]: ...
+    def feature_contributions(
+        self,
+        x: np.ndarray,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
+        n_jobs: int | None = None,
+    ) -> list[tuple[float, np.ndarray]]: ...
     def sobol(self) -> list[list[tuple[list[int], float]]]: ...
 
     def tables(
@@ -789,3 +821,28 @@ class _TableBank:
     def score_cells(self, cells: Sequence[int]) -> float: ...
 
     def sobol(self) -> list[tuple[list[int], float]]: ...
+
+def _report_cell_sums(
+    cells: np.ndarray,
+    n_cells: Sequence[int],
+    y: np.ndarray,
+    pred: np.ndarray,
+    weight: np.ndarray,
+    exposure: np.ndarray,
+    variance: np.ndarray | None = None,
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]: ...
+def _report_cell_quantiles(
+    cells: np.ndarray,
+    n_cells: Sequence[int],
+    values: np.ndarray,
+    weight: np.ndarray,
+    qs: Sequence[float],
+) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]: ...
+def _report_ranking(
+    rate: np.ndarray,
+    y_rate: np.ndarray,
+    mass: np.ndarray,
+    bands: int = 10,
+    points: int = 101,
+    variance: np.ndarray | None = None,
+) -> dict[str, Any]: ...

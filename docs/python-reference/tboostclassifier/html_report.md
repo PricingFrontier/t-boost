@@ -1,0 +1,1 @@
+--8<-- "_snippets/methods/html_report.md"

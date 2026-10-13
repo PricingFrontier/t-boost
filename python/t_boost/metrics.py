@@ -6,7 +6,9 @@ NaN/degenerate inputs degrade to 0 just like the Rust (`finite_or_zero`).
 
 The deviance metrics (`mean_tweedie_deviance` and its Poisson/Gamma wrappers) use the standard
 GLM unit-deviance definitions — numerically identical to scikit-learn's functions of the same
-names — so evaluating a t-boost fit needs nothing outside this package.
+names — so evaluating a t-boost fit needs nothing outside this package. The binomial and
+multinomial deviances are twice the negative log-likelihood, with probabilities clipped to
+``[1e-12, 1 - 1e-12]`` as the fit's own deviance is.
 """
 
 from __future__ import annotations
@@ -23,6 +25,8 @@ __all__ = [
     "mean_tweedie_deviance",
     "mean_poisson_deviance",
     "mean_gamma_deviance",
+    "mean_binomial_deviance",
+    "mean_multinomial_deviance",
 ]
 
 _EPS = float(np.finfo(np.float64).eps)
@@ -230,3 +234,55 @@ def mean_gamma_deviance(y: Any, pred: Any, weight: Any | None = None) -> float:
     """Weight-averaged Gamma unit deviance — `mean_tweedie_deviance` at ``power=2``, the
     goodness-of-fit for ``objective="gamma"`` severity models."""
     return mean_tweedie_deviance(y, pred, weight, power=2.0)
+
+
+_PROB_CLIP = 1e-12
+
+
+def _deviance_weight(weight: Any | None, n: int) -> "np.ndarray":
+    w = np.ones(n, dtype=np.float64) if weight is None else np.asarray(weight, dtype=np.float64)
+    if w.shape != (n,):
+        raise ValueError(f"weight must contain {n} values")
+    if not np.all(np.isfinite(w)) or np.any(w < 0) or w.sum() <= 0:
+        raise ValueError("weight must be finite and non-negative with positive total mass")
+    return w
+
+
+def mean_binomial_deviance(y: Any, pred: Any, weight: Any | None = None) -> float:
+    """Weight-averaged binomial unit deviance ``-2·[y·log p + (1-y)·log(1-p)]`` of predicted
+    probabilities `pred` against outcomes `y` in ``[0, 1]`` — the goodness-of-fit of a binary
+    ``objective="logistic"`` model. Lower is better; domain violations raise ``ValueError``."""
+    y = np.asarray(y, dtype=np.float64)
+    p = np.asarray(pred, dtype=np.float64)
+    if y.ndim != 1 or p.ndim != 1 or y.size == 0:
+        raise ValueError("y and pred must be nonempty vectors")
+    if p.shape != y.shape:
+        raise ValueError(f"pred has {p.shape[0]} rows but y has {y.shape[0]}")
+    w = _deviance_weight(weight, y.shape[0])
+    if not (np.all(np.isfinite(y)) and np.all(np.isfinite(p))):
+        raise ValueError("y and pred must be finite")
+    if np.any((y < 0) | (y > 1)) or np.any((p < 0) | (p > 1)):
+        raise ValueError("y and pred must lie in [0, 1]")
+    p = np.clip(p, _PROB_CLIP, 1.0 - _PROB_CLIP)
+    dev = -2.0 * (y * np.log(p) + (1.0 - y) * np.log(1.0 - p))
+    return float(np.average(dev, weights=w))
+
+
+def mean_multinomial_deviance(y: Any, proba: Any, weight: Any | None = None) -> float:
+    """Weight-averaged multinomial unit deviance ``-2·log p[y]`` of class probabilities `proba`
+    (shape ``(n, K)``, rows summing to 1) against class indices `y` in ``0..K-1`` (the column
+    order of `proba`, e.g. the position in ``classes_``). Lower is better; domain violations
+    raise ``ValueError``."""
+    p = np.asarray(proba, dtype=np.float64)
+    if p.ndim != 2 or p.shape[0] == 0 or p.shape[1] < 2:
+        raise ValueError("proba must have shape (n, K) with n >= 1 and K >= 2")
+    codes = np.asarray(y)
+    if codes.shape != (p.shape[0],) or not np.issubdtype(codes.dtype, np.integer):
+        raise ValueError(f"y must contain {p.shape[0]} integer class indices")
+    if np.any((codes < 0) | (codes >= p.shape[1])):
+        raise ValueError(f"y must lie in 0..{p.shape[1] - 1}")
+    w = _deviance_weight(weight, p.shape[0])
+    if not np.all(np.isfinite(p)) or np.any((p < 0) | (p > 1)):
+        raise ValueError("proba must be finite and lie in [0, 1]")
+    picked = np.clip(p[np.arange(p.shape[0]), codes], _PROB_CLIP, 1.0)
+    return float(np.average(-2.0 * np.log(picked), weights=w))

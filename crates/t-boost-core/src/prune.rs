@@ -3818,6 +3818,42 @@ pub struct GuardArms {
     pub f0: Vec<Vec<f64>>,
 }
 
+/// The ranked path's variance-share floor (`prune_min_variance_share`): from `keep`, drop every
+/// candidate whose share of the total candidate variance (`supports`' variances summed) is below
+/// `min_share`, unless a kept table at or above the floor contains it. The kept set is the
+/// downward closure of the tables that clear the floor, so it stays closed under heredity and a
+/// small table that a significant one is built on stays. Sticky main effects
+/// (`prune_main_effects` false) always clear it. Returns `(kept, dropped)`, both in `keep`'s
+/// order; `min_share <= 0` keeps everything.
+#[must_use]
+pub fn drop_low_share(
+    keep: &[FeatureSet],
+    supports: &[(FeatureSet, f64)],
+    min_share: f64,
+    prune_main_effects: bool,
+) -> (Vec<FeatureSet>, Vec<FeatureSet>) {
+    let total: f64 = supports.iter().map(|(_, v)| v.max(0.0)).sum();
+    // NaN-safe: a NaN floor or total counts as "off".
+    if min_share.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+        || total.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+    {
+        return (keep.to_vec(), Vec::new());
+    }
+    let share: BTreeMap<&FeatureSet, f64> = supports
+        .iter()
+        .map(|(u, v)| (u, v.max(0.0) / total))
+        .collect();
+    let anchors: Vec<&FeatureSet> = keep
+        .iter()
+        .filter(|u| {
+            (!prune_main_effects && u.order() == 1)
+                || share.get(u).copied().unwrap_or(0.0) >= min_share
+        })
+        .collect();
+    let needed = |u: &FeatureSet| anchors.iter().any(|a| u.0.iter().all(|f| a.contains(*f)));
+    keep.iter().cloned().partition(|u| needed(u))
+}
+
 /// The ranked path's admission order and prefix grid (shared by every selector that walks it).
 ///
 /// Interaction supports are ranked by `variance` (descending, ids break ties) and admitted subject to
@@ -6015,5 +6051,41 @@ mod tests {
         let one = run(1);
         assert_eq!(one, run(2));
         assert_eq!(one, run(8));
+    }
+}
+
+#[cfg(test)]
+mod min_share_tests {
+    use super::*;
+
+    fn fs(ids: &[u32]) -> FeatureSet {
+        FeatureSet::new(ids)
+    }
+
+    #[test]
+    fn drop_low_share_keeps_what_a_significant_table_is_built_on() {
+        let supports = vec![
+            (fs(&[0]), 50.0),
+            (fs(&[1]), 0.001),
+            (fs(&[2]), 0.9985),
+            (fs(&[0, 1]), 0.0005),
+            (fs(&[0, 2]), 30.0),
+            (fs(&[1, 2]), 0.0005),
+            (fs(&[0, 1, 2]), 19.0),
+            (fs(&[3]), 0.00001),
+            (fs(&[0, 3]), 0.00001),
+        ];
+        let keep: Vec<FeatureSet> = supports.iter().map(|(u, _)| u.clone()).collect();
+        // [0,1] and [1,2] are below 0.01% but the triple [0,1,2] (19%) is built on them: kept.
+        // [0,3] is below the floor and nothing significant contains it: dropped.
+        let (kept, dropped) = drop_low_share(&keep, &supports, 0.0001, false);
+        assert_eq!(dropped, vec![fs(&[0, 3])]);
+        assert!(kept.contains(&fs(&[0, 1])) && kept.contains(&fs(&[3])));
+        // Prunable mains: [3] goes too; [1] stays (the triple needs it).
+        let (kept, dropped) = drop_low_share(&keep, &supports, 0.0001, true);
+        assert_eq!(dropped, vec![fs(&[3]), fs(&[0, 3])]);
+        assert!(kept.contains(&fs(&[1])));
+        // Off.
+        assert_eq!(drop_low_share(&keep, &supports, 0.0, false).0, keep);
     }
 }

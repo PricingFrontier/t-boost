@@ -54,6 +54,30 @@ models.
 
 **Return value:** float
 
+### mean_binomial_deviance {#mean_binomial_deviance}
+
+```python
+mean_binomial_deviance(y, pred, weight=None)
+```
+
+The weighted mean of $-2[y \log p + (1 - y) \log(1 - p)]$ for outcomes `y` and predicted
+probabilities `pred` in $[0, 1]$, with the probabilities clipped to $[10^{-12}, 1 - 10^{-12}]$:
+the goodness-of-fit of a binary `objective="logistic"` model.
+
+**Return value:** float
+
+### mean_multinomial_deviance {#mean_multinomial_deviance}
+
+```python
+mean_multinomial_deviance(y, proba, weight=None)
+```
+
+The weighted mean of $-2 \log p_{y}$ for class indices `y` in $0..K-1$ (the column order of
+`proba`, for example the position in `classes_`) and class probabilities `proba` of shape
+`(object_count, K)`: the goodness-of-fit of a multiclassification model.
+
+**Return value:** float
+
 ## Ranking metrics {#ranking-metrics}
 
 The ranking metrics measure how well the predictions order the objects. They are weight-aware,

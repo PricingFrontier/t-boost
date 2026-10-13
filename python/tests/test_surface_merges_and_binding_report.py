@@ -159,15 +159,32 @@ def test_prune_knobs_are_reported_INERT_when_pruning_is_off(data):
 
 
 @pytest.mark.parametrize("wire", ["bytes", "json"])
-def test_prune_knobs_on_a_loaded_model_are_UNAVAILABLE_not_INERT(data, wire):
-    # The pruning report is not saved with the model: a loaded pruned fit cannot tell whether a
-    # prune knob bound, and must not claim "prune=False" (it was True) nor pass check_bindings.
+def test_prune_knobs_on_a_loaded_model_keep_their_status(data, wire):
+    # The pruning report is saved with the model, so a loaded fit reports what the live one did.
+    X, y = data
+    m = _mk(n_trees=80, prune=True, prune_table_budget=100_000).fit(X, y)
+    loaded = (TBoostRegressor.from_bytes(m.to_bytes()) if wire == "bytes"
+              else TBoostRegressor.from_json(m.to_json()))
+    assert loaded.binding_report_ == m.binding_report_
+
+
+def _without_fit_evidence(blob: str) -> str:
+    """A JSON envelope as a t-boost from before the pruning report was saved wrote it."""
+    import json
+
+    doc = json.loads(blob)
+    doc.pop("fit_evidence", None)
+    return json.dumps(doc)
+
+
+def test_prune_knobs_on_an_older_loaded_model_are_UNAVAILABLE_not_INERT(data):
+    # A model saved without its pruning report cannot tell whether a prune knob bound, and must
+    # not claim "prune=False" (it was True) nor pass check_bindings.
     X, y = data
     m = _mk(n_trees=80, prune=True, prune_table_budget=100_000).fit(X, y)
     assert next(r for r in m.binding_report_ if r["param"] == "prune_table_budget")["status"] \
         == "INERT"
-    loaded = (TBoostRegressor.from_bytes(m.to_bytes()) if wire == "bytes"
-              else TBoostRegressor.from_json(m.to_json()))
+    loaded = TBoostRegressor.from_json(_without_fit_evidence(m.to_json()))
     assert loaded.prune is True and not getattr(loaded, "pruning_report_", None)
     row = next(r for r in loaded.binding_report_ if r["param"] == "prune_table_budget")
     assert row["status"] == "UNAVAILABLE" and row["overridden_by"] is None
@@ -361,3 +378,16 @@ def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
         defaults = cls.__init__.__kwdefaults__
         monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)
+
+
+def test_validation_fraction_is_reported_only_when_set_with_an_eval_set(data):
+    # The default validation_fraction is unused when eval_set supplies the early-stopping rows;
+    # only a value the caller set is INERT. A default eval_set fit passes check_bindings.
+    X, y = data
+    Xe, ye = X.iloc[:200], y[:200]
+    m = _mk(n_trees=40).fit(X, y, eval_set=(Xe, ye))
+    assert not [r for r in m.binding_report_ if r["param"] == "validation_fraction"]
+    m.check_bindings()
+    m = _mk(n_trees=40, validation_fraction=0.2).fit(X, y, eval_set=(Xe, ye))
+    row = next(r for r in m.binding_report_ if r["param"] == "validation_fraction")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "eval_set")
