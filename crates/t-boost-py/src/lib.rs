@@ -6346,6 +6346,21 @@ impl PyTableModel {
             .collect()
     }
 
+    /// The merged grid of every raw feature as a JSON list of rating-table axes, in the
+    /// raw-feature order `cell_indices` uses (see `TableBank::merged_axis_exports`): the
+    /// cells and categorical levels `cell_indices` reports, never a table's bands.
+    fn merged_axes(&self) -> PyResult<String> {
+        let m = &self.model;
+        m.bank
+            .merged_axis_exports(&m.schema, &m.provenance, &m.schema.cat_encoders)
+            .and_then(|axes| {
+                serde_json::to_string(&axes).map_err(|err| {
+                    PbError::Serialization(format!("could not serialize merged axes: {err}"))
+                })
+            })
+            .map_err(py_err)
+    }
+
     #[pyo3(signature = (x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None))]
     #[allow(clippy::too_many_arguments, unused_variables)]
     fn tables(

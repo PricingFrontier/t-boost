@@ -151,3 +151,34 @@ def test_heredity_sequence_reproduces_the_pass_loop_order() -> None:
         mains = [u for u in sorted(sup) if len(u) == 1]
         inter = sorted((u for u in sup if len(u) > 1), key=lambda u: (-share[u], u))
         assert _heredity_sequence(mains, inter) == _heredity_passes(mains, inter)
+
+
+def test_pricing_report_level_labels_index_the_merged_grid_of_a_banded_feature():
+    import polars as pl
+
+    rng = np.random.default_rng(7)
+    n = 30000
+    levels = [f"L{i}" for i in range(12)]
+    veh = rng.choice(levels, n)
+    age = rng.integers(18, 80, n).astype(float)
+    effect = np.array([int(v[1:]) for v in veh]) * 0.05
+    exposure = rng.uniform(0.1, 1, n)
+    mu = np.exp(-2 + 0.01 * (age - 40) ** 2 / 40 + effect + (age > 50) * (effect - 0.3))
+    X = pl.DataFrame({"age": age, "veh": veh})
+    y = rng.poisson(mu * exposure)
+    m = TBoostRegressor(objective='poisson', n_trees=300, n_jobs=1).fit(X, y, exposure=exposure)
+    bank = json.loads(m.tables(X))
+    banded = [a for t in bank['tables'] for a in t['axes']
+              if a['name'] == 'veh' and len(t['axes']) > 1]
+    assert banded and banded[0]['cells'] < 13, 'the fixture must band the veh axis'
+    report = m.pricing_report(X, y, exposure=exposure)
+    factor = next(f for f in report['actual_vs_expected'] if f['feature'] == 'veh')
+    x32, cat_x = m._serve_design(X)
+    raw = m._model.raw_feature_names().index('veh')
+    cells = np.asarray(m._model.cell_indices(x32, cat_x=cat_x))[:, raw]
+    assert factor['axis']['cells'] == len(factor['rows'])
+    for level in factor['axis']['levels']:
+        rows = veh == level['label']
+        if rows.any():
+            assert set(cells[rows]) == {level['cell']}, level
+            assert factor['rows'][level['cell']] == int(rows.sum()), level

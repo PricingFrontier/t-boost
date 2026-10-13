@@ -1410,7 +1410,68 @@ fn axis_band(axis: &AxisId, cell: u32) -> Result<u32, PbError> {
         })
 }
 
+/// One table axis as exported: schema name, borders, cell count and categorical levels.
+/// A banded ordinal axis exports its band borders (cells == borders + 2 as ever); a banded
+/// categorical axis keeps its level -> band mapping in `levels`.
+fn axis_export(
+    axis: &AxisId,
+    schema: &ModelSchema,
+    provenance: &[AxisProvenance],
+    cat_encoders: &CatEncoderStore,
+) -> Result<AxisExport, PbError> {
+    let schema_axis = representative_axis_for_raw(provenance, axis.raw)?;
+    let name = schema
+        .feature_names
+        .get(schema_axis)
+        .ok_or_else(|| PbError::ShapeMismatch {
+            what: format!("schema missing feature name for raw {}", axis.raw.0),
+        })?
+        .clone();
+    Ok(AxisExport {
+        raw: axis.raw.0,
+        name,
+        borders: axis.band_borders().unwrap_or_else(|| axis.borders.clone()),
+        cells: axis.cells,
+        levels: cat_level_export(axis, provenance, cat_encoders)?,
+        default_cell: cat_default_cell_export(axis, provenance, cat_encoders)?,
+    })
+}
+
 impl TableBank {
+    /// The merged grid of every raw feature, in raw order, exported like a table axis: the
+    /// cell space `TableModel::row_cells` reports, never banded. Its `levels` map each
+    /// categorical label to its merged cell, whereas a banded table's own axis maps it to
+    /// the band.
+    ///
+    /// # Errors
+    /// [`PbError::ShapeMismatch`] if the schema lacks a raw feature's name;
+    /// [`PbError::Internal`] if a grid is too large or a categorical axis's rebuilt cell
+    /// space disagrees with the merged grid (see [`cat_level_export`]).
+    pub fn merged_axis_exports(
+        &self,
+        schema: &ModelSchema,
+        provenance: &[AxisProvenance],
+        cat_encoders: &CatEncoderStore,
+    ) -> Result<Vec<AxisExport>, PbError> {
+        self.merged_grids
+            .iter()
+            .enumerate()
+            .map(|(raw, grid)| {
+                let raw = u32::try_from(raw).map_err(|_| PbError::Internal {
+                    what: "raw feature index exceeded u32 exporting merged axes".into(),
+                })?;
+                let axis = AxisId {
+                    raw: FeatureId(raw),
+                    borders: grid.borders.clone(),
+                    cells: u32::from(grid.n_bins),
+                    joint_channels: None,
+                    band_of: None,
+                };
+                axis_export(&axis, schema, provenance, cat_encoders)
+            })
+            .collect()
+    }
+
     /// Export this exact bank as a rating-table artifact. `provenance` (`model.provenance`/
     /// `TableModel.provenance`) resolves each raw feature's schema name — needed because
     /// `schema.feature_names` is axis-indexed, and a P1 multi-channel raw feature's axis
@@ -1516,28 +1577,11 @@ impl TableBank {
                     .clone();
                 feature_names.push(name);
             }
-            let mut axes = Vec::with_capacity(table.axes.len());
-            for axis in &table.axes {
-                let schema_axis = representative_axis_for_raw(provenance, axis.raw)?;
-                let name = schema
-                    .feature_names
-                    .get(schema_axis)
-                    .ok_or_else(|| PbError::ShapeMismatch {
-                        what: format!("schema missing feature name for raw {}", axis.raw.0),
-                    })?
-                    .clone();
-                let levels = cat_level_export(axis, provenance, cat_encoders)?;
-                // A banded ordinal axis exports its band borders (cells == borders + 2 as ever);
-                // a banded categorical axis keeps its level -> band mapping in `levels`.
-                axes.push(AxisExport {
-                    raw: axis.raw.0,
-                    name,
-                    borders: axis.band_borders().unwrap_or_else(|| axis.borders.clone()),
-                    cells: axis.cells,
-                    levels,
-                    default_cell: cat_default_cell_export(axis, provenance, cat_encoders)?,
-                });
-            }
+            let axes = table
+                .axes
+                .iter()
+                .map(|axis| axis_export(axis, schema, provenance, cat_encoders))
+                .collect::<Result<Vec<_>, PbError>>()?;
             // The rating export's whole contract is "the number deployed is the number
             // audited" (§1) — every tensor read here is `try_values()`, propagating a
             // sparse-to-dense conversion failure instead of silently shipping an empty

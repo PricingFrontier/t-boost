@@ -403,3 +403,17 @@ def test_pickles_from_older_releases_are_refused() -> None:
     # An unfitted estimator pickles and unpickles as before.
     fresh = pickle.loads(pickle.dumps(TBoostRegressor(n_trees=7)))
     assert fresh.get_params()["n_trees"] == 7
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_multiclass_ae_flags_record_the_fit_weight_and_survive_a_round_trip(weighted):
+    # Multiclass fits used to leave `_ae_requires_weight_` unset, skipping the explicit-weight
+    # rule the single-output fits enforce. Multiclass refuses exposure and offset outright.
+    rng = np.random.default_rng(5)
+    x = rng.normal(size=(300, 3))
+    y = rng.integers(0, 3, 300)
+    w = rng.uniform(0.5, 2.0, 300) if weighted else None
+    m = TBoostClassifier(n_trees=10, n_bags=2, n_jobs=1).fit(x, y, sample_weight=w)
+    for est in (m, TBoostClassifier.from_bytes(m.to_bytes())):
+        assert est._ae_requires_weight_ is weighted
+        assert est._ae_requires_exposure_ is False and est._ae_requires_offset_ is False

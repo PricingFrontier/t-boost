@@ -158,6 +158,32 @@ def test_prune_knobs_are_reported_INERT_when_pruning_is_off(data):
     assert (row["status"], row["overridden_by"]) == ("INERT", "prune")
 
 
+@pytest.mark.parametrize("wire", ["bytes", "json"])
+def test_prune_knobs_on_a_loaded_model_are_UNAVAILABLE_not_INERT(data, wire):
+    # The pruning report is not saved with the model: a loaded pruned fit cannot tell whether a
+    # prune knob bound, and must not claim "prune=False" (it was True) nor pass check_bindings.
+    X, y = data
+    m = _mk(n_trees=80, prune=True, prune_table_budget=100_000).fit(X, y)
+    assert next(r for r in m.binding_report_ if r["param"] == "prune_table_budget")["status"] \
+        == "INERT"
+    loaded = (TBoostRegressor.from_bytes(m.to_bytes()) if wire == "bytes"
+              else TBoostRegressor.from_json(m.to_json()))
+    assert loaded.prune is True and not getattr(loaded, "pruning_report_", None)
+    row = next(r for r in loaded.binding_report_ if r["param"] == "prune_table_budget")
+    assert row["status"] == "UNAVAILABLE" and row["overridden_by"] is None
+    assert "not stored with a saved model" in row["reason"]
+    with pytest.raises(ValueError, match="UNAVAILABLE"):
+        loaded.check_bindings()
+
+
+def test_prune_knobs_on_a_loaded_unpruned_model_stay_INERT(data):
+    X, y = data
+    m = _mk(prune=False, prune_min_stability=1.0).fit(X, y)
+    loaded = TBoostRegressor.from_bytes(m.to_bytes())
+    row = next(r for r in loaded.binding_report_ if r["param"] == "prune_min_stability")
+    assert (row["status"], row["overridden_by"]) == ("INERT", "prune")
+
+
 def test_a_cap_above_the_bank_is_reported_INERT(data):
     X, y = data
     m = _mk(n_trees=80, prune=True, prune_table_budget=100_000).fit(X, y)

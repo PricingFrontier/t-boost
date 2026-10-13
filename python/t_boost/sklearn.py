@@ -85,6 +85,12 @@ _FIT_REPORT_ATTRS = (
 )
 
 
+# Per-row vectors a fit used, which `actual_vs_expected` then requires explicitly (never
+# reusing the fit-time values: a matching row count does not prove the rows are the same).
+# Persisted in the serialization envelope and cleared with the fit.
+_AE_REQUIRES = ("_ae_requires_weight_", "_ae_requires_exposure_", "_ae_requires_offset_")
+
+
 def _round_observer(callbacks: list[Callable[..., Any]], n_bags: int) -> Callable[..., bool]:
     """Adapt the public `callbacks` (each called with an info dict, truthy = stop) to the
     native observer's positional signature."""
@@ -1430,7 +1436,7 @@ def _estimator_metadata(est: "_BaseTBoost") -> dict[str, Any]:
     n_axes = getattr(fitted, "n_features", None) if fitted is not None else None
     if n_in is not None and n_axes is not None and int(n_axes) != int(n_in):
         md["n_features_in_"] = int(n_in)
-    for key in ("_ae_requires_weight_", "_ae_requires_exposure_"):
+    for key in _AE_REQUIRES:
         if getattr(est, key, False):
             md[key] = True
     user = getattr(est, "_metadata", None)
@@ -1564,7 +1570,7 @@ def _restore_metadata(est: "_BaseTBoost", md: dict[str, Any]) -> None:
         est.objective = str(md["objective"])
     if "tweedie_rho" in md:
         est.tweedie_rho = float(md["tweedie_rho"])
-    for key in ("_ae_requires_weight_", "_ae_requires_exposure_"):
+    for key in _AE_REQUIRES:
         setattr(est, key, bool(md.get(key, False)))
     if md.get("cat_indices") is not None:
         est._cat_indices_ = [int(i) for i in md["cat_indices"]]
@@ -2639,8 +2645,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "graduation_report_",
             "_fit_sample_weight_",
             "_fit_exposure_",
-            "_ae_requires_weight_",
-            "_ae_requires_exposure_",
+            *_AE_REQUIRES,
             "graduation_validation_",
             *_FIT_REPORT_ATTRS,
             *_COLUMN_SPECS,
@@ -2666,8 +2671,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "graduation_report_",
             "_fit_sample_weight_",
             "_fit_exposure_",
-            "_ae_requires_weight_",
-            "_ae_requires_exposure_",
+            *_AE_REQUIRES,
             "graduation_validation_",
             *_FIT_REPORT_ATTRS,
         ):
@@ -2776,9 +2780,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         One row per parameter set away from its default:
 
-            status = HONOURED    it did what it says
-                     INERT       it was reachable but had no effect on this fit
-                     OVERRIDDEN  another knob's value voided it — named in `overridden_by`
+            status = HONOURED     it did what it says
+                     INERT        it was reachable but had no effect on this fit
+                     OVERRIDDEN   another knob's value voided it — named in `overridden_by`
+                     UNAVAILABLE  cannot be determined: a prune knob on a loaded model, whose
+                                  pruning report was not saved with it
 
         This exists because ~43% of this library's surface is CONDITIONALLY live: whether a knob
         does anything depends on the task, the objective, the prune path and on other knobs, and
@@ -2795,6 +2801,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         defaults = _ctor_defaults(type(self))
         rep = getattr(self, "pruning_report_", None) or {}
         pruning_on = bool(getattr(self, "prune", False)) and bool(rep)
+        # A pruned fit always records its report, but the report is not stored with a saved
+        # model: on a loaded one whether a prune knob bound cannot be told, which is not INERT.
+        report_lost = bool(getattr(self, "prune", False)) and not rep
+        lost_reason = ("the pruning report is not stored with a saved model, so whether this "
+                       "parameter bound cannot be determined; check binding_report_ before saving")
 
         def add(name: str, status: str, reason: str, overridden_by: str | None = None) -> None:
             rows.append({
@@ -2826,7 +2837,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         for gate in ("prune_min_stability", "prune_min_mean_gain"):
             if gate not in defaults or getattr(self, gate, None) == defaults[gate]:
                 continue
-            if not pruning_on:
+            if report_lost:
+                add(gate, "UNAVAILABLE", lost_reason)
+            elif not pruning_on:
                 add(gate, "INERT", "prune=False, so no table selection ran", "prune")
             elif not fold_vote:
                 continue
@@ -2844,7 +2857,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             for name in defaults:
                 if name.startswith("prune_") and getattr(self, name, None) != defaults[name] \
                         and not any(r["param"] == name for r in rows):
-                    add(name, "INERT", "prune=False, so the prune stage did not run", "prune")
+                    if report_lost:
+                        add(name, "UNAVAILABLE", lost_reason)
+                    else:
+                        add(name, "INERT", "prune=False, so the prune stage did not run",
+                            "prune")
 
         # the knobs of the selector that did not run (see `_FOLD_VOTE_KNOBS`)
         def add_unread(names: tuple[str, ...], reason: str, by: str | None) -> None:
@@ -2938,13 +2955,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
 
     def check_bindings(self) -> None:
-        """Raise if anything you set was INERT or OVERRIDDEN on this fit.
+        """Raise if anything you set was INERT, OVERRIDDEN or UNAVAILABLE on this fit.
 
         The strict counterpart of `binding_report_`, for a fit whose parameters are part of a
         filed or otherwise defended model, where a silently ignored setting is a defect rather
         than a curiosity. A benchmark sweep would not call this; a deployment should.
         """
-        bad = [r for r in self.binding_report_ if r["status"] in ("INERT", "OVERRIDDEN")]
+        bad = [r for r in self.binding_report_
+               if r["status"] in ("INERT", "OVERRIDDEN", "UNAVAILABLE")]
         if bad:
             detail = "; ".join(
                 f"{r['param']}={r['value']!r} {r['status']}"
@@ -3687,23 +3705,26 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         *,
         sample_weight: Any | None = None,
         exposure: Any | None = None,
+        offset: Any | None = None,
     ) -> list[dict[str, Any]]:
         """Actual versus expected by rating-factor level, for every feature (2026-09-06).
 
         One entry per raw feature, aggregated over the merged-grid cells the deployed tables
         actually use (cell 0 is the missing-value cell), with ``actual`` = Σ weight·y,
-        ``expected`` = Σ weight·prediction (the prediction already carries ``exposure`` for
-        log-link fits), ``mass`` = Σ weight·exposure and ``rows`` per cell. ``ae`` is
+        ``expected`` = Σ weight·prediction (the prediction already carries ``exposure`` and
+        ``offset``), ``mass`` = Σ weight·exposure and ``rows`` per cell, one value for every
+        cell of the grid (empty cells included). ``ae`` is
         ``actual / expected`` (``nan`` where expected is zero). Exact factor-level balance is
         not a general property of boosted models or of every GLM/link/penalty combination, so
         the ratios show where observed and predicted totals differ.
 
         Available for regression and binary classification, pruned or not: every fit deploys
         rating tables with a fixed grid. A multiclass (K>=3) fit, which has one table bank per
-        class, is not supported. Pass ``sample_weight`` and ``exposure`` explicitly
+        class, is not supported. Pass ``sample_weight``, ``exposure`` and ``offset`` explicitly
         when the fit used them, including on the training data. Row count does not establish
-        alignment: fitted vectors are never silently reused. Use explicit unit vectors when
-        an unweighted or unit-exposure evaluation is intended. ``y`` may name a polars column.
+        alignment: fitted vectors are never silently reused. Use explicit unit vectors (or a
+        zero offset) when an unweighted, unit-exposure or offset-free evaluation is intended.
+        ``y`` and the per-row vectors may name polars columns.
         """
         model = getattr(self, "_model", None)
         if model is None or not hasattr(model, "cell_indices"):
@@ -3717,12 +3738,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 )
             )
         X, vectors = self._resolve_fit_vectors(
-            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure}
+            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
         )
-        y, sample_weight, exposure = (vectors[k] for k in ("y", "sample_weight", "exposure"))
+        y, sample_weight, exposure, offset = (
+            vectors[k] for k in ("y", "sample_weight", "exposure", "offset")
+        )
         for name, value, flag in (
             ("sample_weight", sample_weight, "_ae_requires_weight_"),
             ("exposure", exposure, "_ae_requires_exposure_"),
+            ("offset", offset, "_ae_requires_offset_"),
         ):
             if value is None and getattr(self, flag, False):
                 raise ValueError(f"actual_vs_expected requires explicit {name} aligned to X")
@@ -3756,13 +3780,16 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 raise ValueError(f"{name} must contain {n} finite values")
             if name != "y" and np.any(values < 0):
                 raise ValueError(f"{name} must be non-negative")
-        pred = np.asarray(self._expected_response(X, exposure), dtype=np.float64)
+        off = None if offset is None else _offset_array(offset, n)
+        pred = np.asarray(self._expected_response(X, exposure, off), dtype=np.float64)
         cells = np.asarray(model.cell_indices(x32, cat_x=cat_x), dtype=np.int64)
         names = list(model.raw_feature_names())
+        # Every cell of the merged grid, so the lists index the grid's borders and levels.
+        n_cells = [int(axis["cells"]) for axis in json.loads(model.merged_axes())]
         out: list[dict[str, Any]] = []
         for j, name in enumerate(names):
             c = cells[:, j]
-            k = int(c.max()) + 1 if c.size else 0
+            k = n_cells[j]
             actual = np.bincount(c, weights=w * yv, minlength=k)
             expected = np.bincount(c, weights=w * pred, minlength=k)
             mass = np.bincount(c, weights=w * e, minlength=k)
@@ -3782,33 +3809,37 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
     def pricing_report(
         self, X: Any, y: Any, *, sample_weight: Any | None = None,
-        exposure: Any | None = None, ref_measure: str | None = None,
+        exposure: Any | None = None, offset: Any | None = None,
+        ref_measure: str | None = None,
     ) -> dict[str, Any]:
         """Return rating tables, labelled A/E cells and stage diagnostics for review.
 
-        Pass aligned weights/exposure explicitly, as for ``actual_vs_expected``.
+        Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``.
         The report describes the supplied evaluation data; it is not evidence that
         those data were held out. Save it beside the serialized model.
         """
-        ae = self.actual_vs_expected(X, y, sample_weight=sample_weight, exposure=exposure)
+        ae = self.actual_vs_expected(
+            X, y, sample_weight=sample_weight, exposure=exposure, offset=offset
+        )
         design, vectors = self._resolve_fit_vectors(
-            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure}
+            X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
         )
         bank = json.loads(self.tables(
             design, ref_measure=ref_measure, sample_weight=vectors["sample_weight"],
             exposure=vectors["exposure"],
         ))
-        axes = {int(a["raw"]): a for t in bank["tables"] for a in t["axes"]}
-        deployed = json.loads(self._model.to_json())["model"]["bank"]
-        for raw, grid in enumerate(deployed["merged_grids"]):
-            axis = axes.get(raw, {"raw": raw})
-            if not axis.get("joint_channels"):
-                axes[raw] = {**axis, "borders": grid["borders"], "cells": grid["n_bins"],
-                             "band_of": None}
+        # Each factor's axis is its merged grid, the cells its A/E lists index. A banded
+        # table's own axis is coarser and maps categorical levels to bands, so it is not used.
+        # (`actual_vs_expected` above has refused every model without a table bank.)
+        model = cast(_TableModel, self._model)
+        merged = json.loads(annotate_unseen_cells(
+            json.dumps({"axes": json.loads(model.merged_axes())}),
+            getattr(self, "unknown_category", "rare"),
+        ))["axes"]
         for factor in ae:
             # Undefined ratios have an explicit JSON null in the portable report.
             factor["ae"] = [float(v) if np.isfinite(v) else None for v in factor["ae"]]
-            factor["axis"] = axes.get(int(factor["raw"]))
+            factor["axis"] = {**merged[int(factor["raw"])], "band_of": None}
         return {
             "report_version": 1, "prediction_units": (
                 "per unit exposure" if getattr(self, "_ae_requires_exposure_", False)
@@ -3821,8 +3852,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             "graduation": getattr(self, "graduation_validation_", None),
         }
 
-    def _expected_response(self, X: Any, exposure: Any | None) -> "np.ndarray":
-        """The fitted mean response per row on the scale of ``y`` (subclasses)."""
+    def _expected_response(
+        self, X: Any, exposure: Any | None, offset: "np.ndarray | None" = None
+    ) -> "np.ndarray":
+        """The fitted mean response per row on the scale of ``y``, with the exposure and the
+        link-scale offset the caller supplied (subclasses)."""
         raise NotImplementedError
 
     def _export_measure_kwargs(
@@ -4289,6 +4323,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # _clear_stale_fit_state so they never leak across a refit).
         self._ae_requires_weight_ = weight32 is not None
         self._ae_requires_exposure_ = exposure32 is not None
+        self._ae_requires_offset_ = offset is not None
         if weight32 is not None:
             self._fit_sample_weight_ = weight32
         if exposure32 is not None:
@@ -7508,10 +7543,14 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         _restore_metadata(est, md)
         return est
 
-    def _expected_response(self, X: Any, exposure: Any | None) -> "np.ndarray":
+    def _expected_response(
+        self, X: Any, exposure: Any | None, offset: "np.ndarray | None" = None
+    ) -> "np.ndarray":
         # `predict` returns the mean per unit exposure for the log-link objectives (exposure
-        # entered the fit as an offset), so the expected total is prediction × exposure.
-        pred = np.asarray(self.predict(X), dtype=np.float64)
+        # entered the fit as an offset), so the expected total is prediction × exposure. The
+        # link-scale offset enters as in `fit`: a target shift under the identity link, a
+        # multiplier under the log link — both are `inverse_link(raw + offset)`.
+        pred = np.asarray(self.predict(X, offset=offset), dtype=np.float64)
         if exposure is not None and self.link == "log":
             pred = pred * _as_float32_1d(exposure, "exposure").astype(np.float64)
         return pred
@@ -9125,19 +9164,23 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             prune_slope_min_z=prune_slope_min_z,
         )
 
-    def _expected_response(self, X: Any, exposure: Any | None) -> "np.ndarray":
-        proba = np.asarray(self.predict_proba(X), dtype=np.float64)
-        if proba.ndim == 2 and proba.shape[1] == 2:
-            if exposure is None:
-                return proba[:, 1]
+    def _expected_response(
+        self, X: Any, exposure: Any | None, offset: "np.ndarray | None" = None
+    ) -> "np.ndarray":
+        if len(self.classes_) != 2:
+            raise ValueError("actual_vs_expected is defined for regression and binary fits only")
+        if exposure is None and offset is None:
+            return np.asarray(self.predict_proba(X), dtype=np.float64)[:, 1]
+        # Exposure and offset both enter the logit as in `fit`: raw + offset + log(exposure).
+        raw = np.asarray(self.decision_function(X, offset=offset), dtype=np.float64)
+        if exposure is not None:
             e = _as_float32_1d(exposure, "exposure").astype(np.float64)
             if not np.all(np.isfinite(e) & (e > 0)):
                 raise ValueError("exposure must be finite and strictly positive")
-            raw = np.asarray(self.decision_function(X), dtype=np.float64)
             if e.shape != raw.shape:
                 raise ValueError("exposure must be aligned to X")
-            return _inverse_link(raw + np.log(e), "logit")
-        raise ValueError("actual_vs_expected is defined for regression and binary fits only")
+            raw = raw + np.log(e)
+        return _inverse_link(raw, "logit")
 
     @_atomic_fit
     def fit(
@@ -9405,6 +9448,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # sample_weight can exist here); `tables()` defaults to it, call-time args override.
         if weight32 is not None:
             self._fit_sample_weight_ = weight32
+        self._ae_requires_weight_ = weight32 is not None
+        self._ae_requires_exposure_ = self._ae_requires_offset_ = False
         monotone = self._resolve_monotone(n_features, feature_names)
         if self.graduation_high_order_alpha > 0 and monotone and any(monotone):
             raise ValueError("higher-order smoothing does not support monotone constraints")

@@ -199,3 +199,71 @@ def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
         defaults = cls.__init__.__kwdefaults__
         monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)
+
+
+def _offset_fixture(n=800, seed=63):
+    rng = np.random.default_rng(seed)
+    x = rng.normal(size=(n, 2)).astype(np.float32)
+    exposure = rng.uniform(0.1, 0.8, n).astype(np.float32)
+    offset = rng.normal(scale=0.5, size=n)
+    return x, exposure, offset, rng
+
+
+@pytest.mark.parametrize('wire', ['live', 'bytes'])
+@pytest.mark.parametrize('objective', ['poisson', 'squared_error', 'logistic'])
+def test_ae_requires_and_applies_the_fit_offset(objective, wire):
+    from t_boost import TBoostClassifier
+
+    x, e, o, rng = _offset_fixture()
+    if objective == 'poisson':
+        y = rng.poisson(e * np.exp(0.3 * x[:, 0] + o)).astype(np.float32)
+        m, fit_kw, ae_kw = estimator(objective='poisson'), {'exposure': e}, {'exposure': e}
+    elif objective == 'squared_error':
+        y = (x[:, 0] + o + rng.normal(scale=0.3, size=len(o))).astype(np.float32)
+        m, fit_kw, ae_kw = estimator(objective='squared_error'), {}, {}
+    else:
+        y = (rng.uniform(size=len(o)) < 1 / (1 + np.exp(-(0.5 * x[:, 0] + o)))).astype(int)
+        m = TBoostClassifier(n_trees=25, n_bags=3, prune_n_folds=2,
+                             validation_fraction=None, n_jobs=1)
+        fit_kw = ae_kw = {}
+    m.fit(x, y, offset=o, **fit_kw)
+    if wire == 'bytes':
+        m = type(m).from_bytes(m.to_bytes())
+    with pytest.raises(ValueError, match='explicit offset'):
+        m.actual_vs_expected(x, y, **ae_kw)
+    report = m.actual_vs_expected(x, y, offset=o, **ae_kw)
+    if objective == 'poisson':
+        want = m.predict(x, offset=o) * e
+    elif objective == 'squared_error':
+        want = m.predict(x, offset=o)
+    else:
+        want = m.predict_proba(x, offset=o)[:, 1]
+    for factor in report:
+        assert sum(factor['expected']) == pytest.approx(float(np.sum(want)), rel=1e-9)
+    # An explicit zero offset is the offset-free evaluation, not a missing argument.
+    zero = m.actual_vs_expected(x, y, offset=np.zeros(len(o)), **ae_kw)[0]
+    assert sum(zero['expected']) != pytest.approx(sum(report[0]['expected']), rel=1e-6)
+    pricing = m.pricing_report(x, y, offset=o, **ae_kw)['actual_vs_expected']
+    assert sum(pricing[0]['expected']) == pytest.approx(sum(report[0]['expected']), rel=1e-12)
+
+
+def test_ae_offset_is_not_required_without_a_fit_offset():
+    x, y, e = fixture()
+    m = estimator(objective='poisson').fit(x, y, exposure=e)
+    assert m._ae_requires_offset_ is False
+    m.actual_vs_expected(x, y, exposure=e)
+
+
+def test_ae_lists_cover_every_grid_cell_even_when_the_top_cells_are_empty():
+    x, y, e = fixture(n=1500)
+    m = estimator(objective='poisson').fit(x, y, exposure=e)
+    low = x[:, 0] < np.quantile(x[:, 0], 0.3)
+    report = m.pricing_report(x[low], y[low], exposure=e[low])
+    for factor in report['actual_vs_expected']:
+        cells = factor['axis']['cells']
+        assert cells == len(factor['axis']['borders']) + 2
+        for key in ('actual', 'expected', 'mass', 'rows', 'ae'):
+            assert len(factor[key]) == cells, (factor['feature'], key)
+    first = report['actual_vs_expected'][0]
+    assert first['rows'][-1] == 0 and first['ae'][-1] is None
+

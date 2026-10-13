@@ -11,7 +11,7 @@ Save it beside the serialized model. Regression and binary classification only.
 ## Method call format {#call-format}
 
 ```python
-pricing_report(X, y, *, sample_weight=None, exposure=None, ref_measure=None)
+pricing_report(X, y, *, sample_weight=None, exposure=None, offset=None, ref_measure=None)
 ```
 
 ## Parameters {#parameters}
@@ -35,11 +35,11 @@ The target values of the objects. A string names a column of a polars `X`.
 
 Required parameter
 
-### sample_weight, exposure
+### sample_weight, exposure, offset
 
 #### Description
 
-The weight and the exposure of each object, passed explicitly as for
+The weight, the exposure and the offset of each object, passed explicitly as for
 [actual_vs_expected](actual_vs_expected.md).
 
 **Possible types**
@@ -76,7 +76,8 @@ A dictionary:
   numbers.
 - `tables` — The rating tables, as returned by [tables](tables.md).
 - `actual_vs_expected` — The cells returned by [actual_vs_expected](actual_vs_expected.md), each
-  feature with its axis.
+  feature with its axis: the borders, the number of cells and the categorical levels of the
+  grid the cells index. A banded table's own axis is coarser and is not used here.
 - `pruning` — The `pruning_report_` attribute.
 - `graduation` — The diagnostics of graduation.
 
