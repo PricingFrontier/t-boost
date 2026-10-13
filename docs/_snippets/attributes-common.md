@@ -140,11 +140,34 @@ Output format:
 
 with one list per bag. The `"eval"` curve (the validation objects) costs nothing extra. The
 `"train"` curve takes an extra pass per iteration, so it is calculated only when `callbacks` are
-given. Without either, the dictionary is empty.
+given. Without either, the dictionary is empty. It is not saved with the model.
 
 #### Type
 
 dict
+
+## fitted_at_ {#fitted_at_}
+
+#### Purpose
+
+When the training finished, as an ISO 8601 UTC timestamp (for example
+`"2026-10-13T14:02:11+00:00"`). Saved with the model; `None` for a model saved by an older
+t-boost.
+
+#### Type
+
+string
+
+## fit_duration_ {#fit_duration_}
+
+#### Purpose
+
+How long the training took, in seconds of wall-clock time. Saved with the model; `None` for a
+model saved by an older t-boost.
+
+#### Type
+
+float
 
 ## pruning_report_ {#pruning_report_}
 
@@ -153,7 +176,15 @@ dict
 The record of the table selection: the selector used (`selector`), the candidate tables and
 their scores (`table_scores`), the kept tables (`kept`), the scored path (`path`) and, when they
 ran, the reports of banding (`banding`) and of the budgets (`table_budget`, `box_budget`). Only
-set when `prune=True`.
+set when `prune=True`. Saved with the model.
+
+For the ranked-path selector, `path` holds the bank sizes (`sizes`) and their out-of-bag
+deviance (`oob_deviance`), the total gain over the main-effects bank (`total_gain`), the step of
+the minimum (`min_step`), the first step reaching `prune_path_fraction` of the gain
+(`fraction_step`), the first within `prune_path_tolerance` of the minimum (`tolerance_step`),
+the chosen cutoff (`best`, the later of the two), the variance floor (`min_variance_share`) with
+the tables it removed (`dropped_low_share`), and the ranked tables with the step each one enters
+the bank (`sequence`). A multiclassification model records its path under `selection`.
 
 #### Type
 
@@ -164,7 +195,8 @@ dict
 #### Purpose
 
 The graduation diagnostics, one entry per table: the features, the smoothing strength (`alpha`)
-and whether the smoothing was rejected. Only set when graduation is turned on.
+and whether the smoothing was rejected. Only set when graduation is turned on. Saved with the
+model.
 
 #### Type
 

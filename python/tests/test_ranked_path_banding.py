@@ -9,7 +9,9 @@ import json
 import numpy as np
 import pytest
 
-from t_boost import TBoostRegressor
+from sklearn.base import clone
+
+from t_boost import TBoostClassifier, TBoostRegressor
 
 
 def _book(n: int = 6000, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
@@ -151,3 +153,136 @@ def test_heredity_sequence_reproduces_the_pass_loop_order() -> None:
         mains = [u for u in sorted(sup) if len(u) == 1]
         inter = sorted((u for u in sup if len(u) > 1), key=lambda u: (-share[u], u))
         assert _heredity_sequence(mains, inter) == _heredity_passes(mains, inter)
+
+
+def test_pricing_report_level_labels_index_the_merged_grid_of_a_banded_feature():
+    import polars as pl
+
+    rng = np.random.default_rng(7)
+    n = 30000
+    levels = [f"L{i}" for i in range(12)]
+    veh = rng.choice(levels, n)
+    age = rng.integers(18, 80, n).astype(float)
+    effect = np.array([int(v[1:]) for v in veh]) * 0.05
+    exposure = rng.uniform(0.1, 1, n)
+    mu = np.exp(-2 + 0.01 * (age - 40) ** 2 / 40 + effect + (age > 50) * (effect - 0.3))
+    X = pl.DataFrame({"age": age, "veh": veh})
+    y = rng.poisson(mu * exposure)
+    m = TBoostRegressor(objective='poisson', n_trees=300, n_jobs=1).fit(X, y, exposure=exposure)
+    bank = json.loads(m.tables(X))
+    banded = [a for t in bank['tables'] for a in t['axes']
+              if a['name'] == 'veh' and len(t['axes']) > 1]
+    assert banded and banded[0]['cells'] < 13, 'the fixture must band the veh axis'
+    report = m.pricing_report(X, y, exposure=exposure)
+    factor = next(f for f in report['actual_vs_expected'] if f['feature'] == 'veh')
+    x32, cat_x = m._serve_design(X)
+    raw = m._model.raw_feature_names().index('veh')
+    cells = np.asarray(m._model.cell_indices(x32, cat_x=cat_x))[:, raw]
+    assert factor['axis']['cells'] == len(factor['rows'])
+    for level in factor['axis']['levels']:
+        rows = veh == level['label']
+        if rows.any():
+            assert set(cells[rows]) == {level['cell']}, level
+            assert factor['rows'][level['cell']] == int(rows.sum()), level
+
+
+def _floor_fixture(n=6000, seed=3):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(size=(n, 5))
+    eta = 0.4 * X[:, 0] - 0.3 * X[:, 1] + 0.25 * X[:, 0] * X[:, 1] + 0.02 * X[:, 2] * X[:, 3]
+    return X, rng.poisson(np.exp(eta - 1.0)), rng
+
+
+def test_min_variance_share_drops_only_small_tables_nothing_kept_needs():
+    X, y, _ = _floor_fixture()
+    base = TBoostRegressor(objective="poisson", n_trees=150, n_jobs=1, seed=0,
+                           band_tolerance=None)
+    off = clone(base).fit(X, y)
+    path = off.pruning_report_["path"]
+    assert path["min_variance_share"] == 0.0 and path["dropped_low_share"] == []
+    scores = {tuple(s["u"]): s["variance_share"] for s in off.pruning_report_["table_scores"]}
+    total = sum(max(v, 0.0) for v in scores.values())
+    share = {u: max(v, 0.0) / total for u, v in scores.items()}
+    kept_inter = [tuple(u) for u in off.pruning_report_["kept"] if len(u) > 1]
+    assert kept_inter, "the fixture must keep interactions"
+    floor = sorted(share[u] for u in kept_inter)[len(kept_inter) // 2] + 1e-12
+    on = clone(base).set_params(prune_min_variance_share=floor).fit(X, y)
+    rep = on.pruning_report_
+    dropped = {tuple(u) for u in rep["path"]["dropped_low_share"]}
+    kept = {tuple(u) for u in rep["kept"]}
+    assert dropped and not dropped & kept
+    anchors = [set(u) for u in kept if len(u) == 1 or share[u] >= floor]
+    for u in dropped:  # below the floor, and no kept table at or above it is built on it
+        assert share[u] < floor and not any(set(u) <= a for a in anchors)
+    for u in kept:  # clears the floor, or a table that does is built on it
+        assert any(set(u) <= a for a in anchors)
+        assert all(tuple(sorted(v)) in kept for v in _proper_subsets(u))  # heredity
+    deployed = {tuple(int(name[1:]) for name in key) for key in on.cell_indices(X)}
+    assert not dropped & deployed
+    assert on.get_params()["prune_min_variance_share"] == floor
+    html = on.html_report(X, y)
+    assert "below the floor" in html and "prune_min_variance_share" in html
+
+
+def _proper_subsets(u):
+    from itertools import combinations
+
+    return [c for k in range(1, len(u)) for c in combinations(u, k)]
+
+
+def test_min_variance_share_keeps_a_small_main_a_significant_pair_needs():
+    # Prunable mains: a main effect under the floor stays when a kept interaction above it
+    # contains it (dropping it would have to drop the interaction too).
+    rng = np.random.default_rng(11)
+    n = 8000
+    X = rng.normal(size=(n, 4))
+    eta = 0.5 * X[:, 0] + 0.4 * X[:, 0] * np.sign(X[:, 1])  # x1 matters only through the pair
+    y = rng.poisson(np.exp(eta - 1.0))
+    m = TBoostRegressor(objective="poisson", n_trees=150, n_jobs=1, seed=0, band_tolerance=None,
+                        prune_main_effects=True, prune_min_variance_share=0.02).fit(X, y)
+    scores = {tuple(s["u"]): s["variance_share"] for s in m.pruning_report_["table_scores"]}
+    total = sum(max(v, 0.0) for v in scores.values())
+    kept = {tuple(u) for u in m.pruning_report_["kept"]}
+    if (0, 1) in kept and scores[(0, 1)] / total >= 0.02:
+        assert (1,) in kept
+
+
+@pytest.mark.parametrize("bad", [-0.1, 1.0, 2.0])
+def test_min_variance_share_is_validated(bad):
+    X, y, _ = _floor_fixture(n=1500)
+    with pytest.raises(ValueError, match="prune_min_variance_share"):
+        TBoostRegressor(objective="poisson", n_trees=40, n_jobs=1,
+                        prune_min_variance_share=bad).fit(X, y)
+
+
+def test_min_variance_share_multiclass_and_binding():
+    X, _, rng = _floor_fixture(n=3000)
+    y = np.where(X[:, 0] * X[:, 1] > 0.3, 2, (X[:, 2] > 0).astype(int))
+    m = TBoostClassifier(n_trees=60, n_jobs=1, seed=0, band_tolerance=None,
+                         prune_min_variance_share=0.05).fit(X, y)
+    sel = m.pruning_report_["selection"]
+    assert sel["min_variance_share"] == 0.05 and "dropped_low_share" in sel
+    for u in m.pruning_report_["kept"]:
+        assert u not in sel["dropped_low_share"]
+    fv = TBoostRegressor(objective="poisson", n_trees=40, n_jobs=1, prune_selector="fold_vote",
+                         prune_min_variance_share=0.01).fit(X, rng.poisson(1.0, len(X)))
+    row = next(r for r in fv.binding_report_ if r["param"] == "prune_min_variance_share")
+    assert row["status"] == "INERT"
+
+
+def test_min_variance_share_leaves_a_skipped_multiclass_path_alone():
+    # One bag leaves no out-of-bag rows, so the path is skipped and the full bank kept: the floor
+    # must not drop tables then (the single-output path does not), as `binding_report_` says.
+    rng = np.random.default_rng(1)
+    X = rng.normal(size=(120, 3))
+    y = rng.integers(0, 3, 120)
+    fits = [TBoostClassifier(n_trees=12, n_bags=1, n_jobs=1, seed=0, validation_fraction=None,
+                             prune_min_variance_share=share).fit(X, y) for share in (0.0, 0.99)]
+    assert "skipped" in fits[1].pruning_report_["selection"]
+    assert "dropped_low_share" not in fits[1].pruning_report_["selection"]
+    banks = [{c: [(t["feature_names"], t["values"]) for t in b["tables"]]
+              for c, b in json.loads(m.tables(X)).items()} for m in fits]
+    assert banks[1] == banks[0]
+    np.testing.assert_array_equal(fits[1].predict_proba(X), fits[0].predict_proba(X))
+    row = next(r for r in fits[1].binding_report_ if r["param"] == "prune_min_variance_share")
+    assert row["status"] == "INERT"

@@ -30,6 +30,10 @@ The dense result of `predict_contributions(return_format="matrix")`.
 
 Return an estimator configured with the benchmark recipe.
 
+### [report_html](report-html.md)
+
+Render a model report as one self-contained HTML page.
+
 ## Modules {#modules}
 
 ### [metrics](metrics.md)

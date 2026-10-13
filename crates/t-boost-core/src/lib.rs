@@ -49,6 +49,7 @@ pub mod explain;
 pub mod joint;
 pub mod loss;
 pub mod prune;
+pub mod report;
 pub(crate) mod sched;
 pub mod scoring;
 pub mod serialize;

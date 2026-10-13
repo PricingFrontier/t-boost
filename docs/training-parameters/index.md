@@ -330,6 +330,13 @@ The deployed prefix is the larger of the smallest prefix that captures
 [`prune_path_fraction`](pruning.md#prune_path_fraction) of the improvement and the smallest prefix within
 this tolerance.
 
+### [prune_min_variance_share](pruning.md#prune_min_variance_share)
+
+The smallest share of the candidate tables' total variance a table may have and stay in the
+deployed model. After the path's cutoff, a kept table below this share is dropped, unless a kept
+table at or above the share contains it: a significant table keeps the smaller tables it is built
+on, so the deployed tables stay closed under heredity.
+
 ### [prune_path_steps](pruning.md#prune_path_steps)
 
 The number of prefixes scored on the ranked path. The prefix sizes are spaced geometrically

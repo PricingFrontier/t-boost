@@ -8,7 +8,8 @@ For each feature, the objects are aggregated over the cells of the grid the depl
 (cell 0 holds missing values):
 
 - $actual = \sum w_i t_i$
-- $expected = \sum w_i \mu_i$, where $\mu_i$ includes the exposure for a model with a log link
+- $expected = \sum w_i \mu_i$, where $\mu_i$ includes the offset and, for a model with a log
+  link, the exposure
 - $A/E = actual / expected$
 
 ```python
@@ -17,22 +18,18 @@ for factor in ae:
     print(factor["feature"], factor["ae"])
 ```
 
-If the model was trained with a sample weight or an exposure, pass them explicitly, even on the
-training data. See [actual_vs_expected](../python-reference/tboostregressor/actual_vs_expected.md).
+If the model was trained with a sample weight, an exposure or an offset, pass them explicitly,
+even on the training data. See [actual_vs_expected](../python-reference/tboostregressor/actual_vs_expected.md).
 
-## Pricing report {#pricing-report}
+## Multiclassification {#multiclassification}
 
-[pricing_report](../python-reference/tboostregressor/pricing_report.md) collects, in one document
-for review, the rating tables, the actual versus expected cells with their axes, and the
-diagnostics of pruning and graduation:
+A multiclassification model has one table bank, and so one grid, per class. Its actual versus
+expected is one-vs-rest: one entry per class and feature, with a `class` key,
+$actual = \sum w_i [t_i = class]$ and $expected = \sum w_i P_i(class)$.
 
-```python
-import json
+## Model report {#model-report}
 
-report = model.pricing_report(test_data, "ClaimCount", exposure="Exposure")
-with open("freq_report.json", "w") as f:
-    json.dump(report, f)
-```
-
-The report describes the data passed to it; it is not evidence that the data were held out.
-Save it beside the serialized model.
+[pricing_report](../python-reference/tboostregressor/pricing_report.md) and
+[html_report](../python-reference/tboostregressor/html_report.md) put the actual versus expected
+of one or two datasets, with a z-score per level, beside the fit metrics, the structure and the
+review flags. See [Model report](model-report.md).

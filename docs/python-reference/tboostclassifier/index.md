@@ -112,8 +112,12 @@ Calculate actual versus expected totals by rating-factor level (binary classific
 
 ### [pricing_report](pricing_report.md)
 
-Return the rating tables, the actual versus expected cells and the stage diagnostics for review
-(binary classification).
+Return the model report: fit quality, structure, pruning, rating tables, actual versus expected,
+drift and review flags.
+
+### [html_report](html_report.md)
+
+Return the model report as one self-contained HTML page.
 
 ### [unseen_values](unseen_values.md)
 

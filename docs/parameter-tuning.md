@@ -76,7 +76,7 @@ The following parameters give fewer or smaller tables:
   cell rests on a handful of objects.
 - Call [check_bindings](python-reference/tboostregressor/check_bindings.md) after the fit to make
   sure the parameters you set took effect.
-- Save the [pricing report](model-analysis/actual-vs-expected.md#pricing-report) beside the
+- Save the [pricing report](model-analysis/model-report.md) beside the
   serialized model, and record your context in the `metadata` attribute.
 
 ## Methods for hyperparameter search {#defining-optimal-parameter-values}

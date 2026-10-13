@@ -131,6 +131,8 @@ def test_fit_predict_tables_byte_identical_c_order_vs_fortran_order_x() -> None:
 
     est_c = small_regressor().fit(x_c, y)
     est_f = small_regressor().fit(x_f, y)
+    # The header records when each fit ran; everything else must match byte for byte.
+    est_f.fitted_at_, est_f.fit_duration_ = est_c.fitted_at_, est_c.fit_duration_
     assert est_c.to_bytes() == est_f.to_bytes()
     np.testing.assert_array_equal(est_c.predict(x_c), est_c.predict(x_f))
     assert est_c.tables(x_c, ref_measure="uniform") == est_c.tables(x_f, ref_measure="uniform")

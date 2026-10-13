@@ -14,12 +14,15 @@ check_bindings()
 ## Return value {#output-format}
 
 None. Raises `ValueError` listing every parameter whose status in `binding_report_` is `INERT`
-(it had no effect on this fit) or `OVERRIDDEN` (another parameter's value voided it).
+(it had no effect on this fit), `OVERRIDDEN` (another parameter's value voided it) or
+`UNAVAILABLE` (whether it had an effect cannot be determined). Call it before saving the model:
+the pruning report is not stored with a saved model, so on a loaded model every pruning
+parameter set away from its default is `UNAVAILABLE`.
 
 ## binding_report_ {#binding_report_}
 
 One entry per checked parameter set away from its default, with `param`, `value`, `status`
-(`HONOURED`, `INERT` or `OVERRIDDEN`), `reason` and `overridden_by`.
+(`HONOURED`, `INERT`, `OVERRIDDEN` or `UNAVAILABLE`), `reason` and `overridden_by`.
 
 The report covers parameters whose effect depends on other settings: the pruning gates and
 limits (for example, every pruning parameter when `prune=False`, and the parameters of the

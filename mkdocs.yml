@@ -126,6 +126,7 @@ nav:
           - from_bytes: python-reference/tboostregressor/from_bytes.md
           - from_json: python-reference/tboostregressor/from_json.md
           - get_params: python-reference/tboostregressor/get_params.md
+          - html_report: python-reference/tboostregressor/html_report.md
           - predict_contributions: python-reference/tboostregressor/predict_contributions.md
           - pricing_report: python-reference/tboostregressor/pricing_report.md
           - score: python-reference/tboostregressor/score.md
@@ -147,6 +148,7 @@ nav:
           - from_bytes: python-reference/tboostclassifier/from_bytes.md
           - from_json: python-reference/tboostclassifier/from_json.md
           - get_params: python-reference/tboostclassifier/get_params.md
+          - html_report: python-reference/tboostclassifier/html_report.md
           - predict_contributions: python-reference/tboostclassifier/predict_contributions.md
           - pricing_report: python-reference/tboostclassifier/pricing_report.md
           - score: python-reference/tboostclassifier/score.md
@@ -157,6 +159,7 @@ nav:
           - unseen_values: python-reference/tboostclassifier/unseen_values.md
       - ContributionMatrix: python-reference/contribution-matrix.md
       - recommended_recipe: python-reference/recommended-recipe.md
+      - report_html: python-reference/report-html.md
       - metrics: python-reference/metrics.md
       - Exceptions and warnings: python-reference/exceptions.md
   - Objectives and metrics:
@@ -170,6 +173,7 @@ nav:
       - Prediction contributions: model-analysis/contributions.md
       - Feature importance: model-analysis/feature-importance.md
       - Actual versus expected: model-analysis/actual-vs-expected.md
+      - Model report: model-analysis/model-report.md
   - Algorithm details:
       - How training is performed: algorithm/index.md
       - Choosing the tree structure: algorithm/tree-structure.md

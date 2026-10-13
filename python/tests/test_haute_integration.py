@@ -281,8 +281,11 @@ def test_eval_set_stops_each_bag_at_its_best_eval_round(split) -> None:
     for kept, curve, reason in zip(model.n_trees_per_bag_, history, model.stopping_reason_per_bag_):
         assert kept == int(np.argmin(curve)) + 1
         assert reason in ("early_stopping", "max_trees")
+    # The default validation_fraction is simply unused with an eval_set: not a binding finding
+    # (a validation_fraction the caller set is reported INERT, overridden by eval_set).
     report = {row["param"]: row for row in model.binding_report_}
-    assert report["validation_fraction"]["overridden_by"] == "eval_set"
+    assert "validation_fraction" not in report
+    model.check_bindings()
 
 
 def test_eval_rows_never_reach_training(split) -> None:
