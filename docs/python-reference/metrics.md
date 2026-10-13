@@ -74,7 +74,8 @@ mean_multinomial_deviance(y, proba, weight=None)
 
 The weighted mean of $-2 \log p_{y}$ for class indices `y` in $0..K-1$ (the column order of
 `proba`, for example the position in `classes_`) and class probabilities `proba` of shape
-`(object_count, K)`: the goodness-of-fit of a multiclassification model.
+`(object_count, K)`, each row summing to 1 (to within $10^{-4}$): the goodness-of-fit of a
+multiclassification model. A row that does not sum to 1 raises `ValueError`.
 
 **Return value:** float
 

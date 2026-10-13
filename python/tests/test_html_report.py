@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import types
 
 import numpy as np
 import pandas as pd
@@ -12,8 +13,9 @@ import pytest
 
 from t_boost import TBoostClassifier, TBoostRegressor, report_html
 from t_boost import metrics
-from t_boost._html_report import (_W_FACTOR, _W_FULL, _W_HALF, _Log, cell_labels, run_label,
-                                   span_label)
+from t_boost import _report
+from t_boost._html_report import (_W_FACTOR, _W_FULL, _W_HALF, _Log, _table_cells, cell_labels,
+                                   run_label, span_label)
 from t_boost._t_boost import _report_cell_quantiles, _report_cell_sums, _report_ranking
 
 FAST = dict(n_trees=60, n_bags=3, n_jobs=1, seed=0)
@@ -115,6 +117,12 @@ def test_native_cell_sums_match_bincount():
         np.testing.assert_allclose(var, np.bincount(c, w * v, minlength=[4, 7][j]))
     with pytest.raises(Exception):
         _report_cell_sums(cells, [3, 7], y, p, w, e)  # a cell outside its grid
+    # The kernels read rows in C order; a Fortran-ordered array would be misread, not refused.
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _report_cell_sums(np.asfortranarray(cells), [4, 7], y, p, w, e)
+    with pytest.raises(ValueError, match="C-contiguous"):
+        _report_cell_quantiles(np.asfortranarray(cells), [4, 7], np.asfortranarray(
+            rng.uniform(size=(n, 2))), w, [0.5])
 
 
 def _split(effects: np.ndarray, sets: list[list[int]], n_raw: int) -> np.ndarray:
@@ -449,9 +457,11 @@ def test_page_is_css_only_tabs_with_one_dataset_switch(poisson):
 
 
 def test_cell_labels_read_as_integers_on_an_integer_feature(poisson):
-    integer = {"cells": 6, "borders": [18.5, 20.0, 25.5, 99.0]}
+    integer = {"cells": 6, "borders": [18.5, 20.0, 25.5, 99.0], "integer": True}
     assert cell_labels(integer) == ["missing", "≤ 18", "19–20", "21–25", "26–99", "≥ 100"]
     assert run_label(integer, 2, 3) == "19–25"
+    # Half-integer borders alone do not make a feature integer: without the flag, intervals.
+    assert cell_labels({**integer, "integer": False})[1:3] == ["≤ 18.5", "(18.5, 20]"]
     continuous = {"cells": 4, "borders": [0.123456, 0.5]}
     assert cell_labels(continuous) == ["missing", "≤ 0.1235", "(0.1235, 0.5]", "> 0.5"]
     assert run_label(continuous, 1, 3) == "all" and span_label(None, None, True) == "all"
@@ -560,3 +570,124 @@ def test_tints_follow_the_effect_relative_to_the_largest():
     assert _tones([1.0, 2.0, 0.5, 1.2, 3.0], [1, 1, 1, 1, 0], True) == ["", "g5", "y5", "g3", "muted"]
     assert _tones([0.0, 0.4, -0.1], [1, 1, 1], False) == ["", "g5", "y3"]
     assert _tones([1.0, 1.0], [1, 1], True) == ["", ""]
+
+
+def test_integer_labels_need_whole_values_not_just_half_integer_borders():
+    # A continuous feature split at 0.5 (values 0.1 and 0.9) reads as intervals, not "≤ 0" and
+    # "≥ 1"; a whole-valued one as integers, with a categorical column before both.
+    rng = np.random.default_rng(4)
+    n = 2000
+    X = pl.DataFrame({"c": rng.choice(["a", "b"], n), "k": rng.integers(0, 6, n).astype(float),
+                      "x": rng.choice([0.1, 0.9], n)})
+    y = rng.poisson(np.exp(-1 + 0.3 * X["k"].to_numpy() + 0.8 * (X["x"].to_numpy() > 0.5)))
+    m = TBoostRegressor(objective="poisson", **FAST).fit(X, y)
+    report = m.pricing_report(X, y)
+    ae = {e["feature"]: e for e in report["datasets"][0]["actual_vs_expected"]}
+    assert ae["k"]["axis"]["integer"] is True and ae["x"]["axis"]["integer"] is False
+    assert "integer" not in ae["c"]["axis"]
+    labels = {b["label"] for b in ae["x"]["bands"]} - {"missing"}
+    assert labels and labels <= {"≤ 0.5", "> 0.5", "all"}
+    assert all(re.fullmatch(r"missing|≤ \d+|≥ \d+|\d+|\d+–\d+", b["label"])
+               for b in ae["k"]["bands"])
+    for t in report["tables"]["tables"]:
+        for a in t["axes"]:
+            if not a.get("levels"):
+                assert a["integer"] is (a["name"] == "k")
+    html = report_html(report)
+    assert "x ≤ 0.5" in html and "x ≤ 0:" not in html and "x ≥ 1:" not in html
+
+
+def test_merged_cells_map_to_table_cells_by_exact_borders():
+    merged = {"cells": 5, "borders": [5e-11, 1.5e-10, 2.5e-10]}
+    assert _table_cells(merged, dict(merged)) == [0, 1, 2, 3, 4]
+    assert _table_cells(merged, {"cells": 3, "borders": [1.5e-10]}) == [0, 1, 1, 2, 2]
+    # `merged_axes` writes float32's shortest form and `tables` the float64 of the same float32:
+    # the two parse to different floats, which an exact or a 1e-9-tolerant comparison mis-maps.
+    borders = np.unique(np.random.default_rng(9).normal(size=60).astype(np.float32))
+    short = {"cells": len(borders) + 2, "borders": [float(str(b)) for b in borders]}
+    wide = {"cells": len(borders) + 2, "borders": [float(b) for b in borders]}
+    assert short["borders"] != wide["borders"]
+    assert _table_cells(short, wide) == list(range(len(borders) + 2))
+    assert _table_cells(wide, short) == list(range(len(borders) + 2))
+
+
+@pytest.mark.parametrize("multiclass", [False, True])
+def test_shap_reads_the_bank_the_tables_are_exported_from(multiclass):
+    # With no interactions a feature's Shapley value is its one-way table, so on every level the
+    # report's SHAP mean equals the exported table, also when the report's data carry a mass the
+    # fit did not (the export then re-centres the tables on it).
+    rng = np.random.default_rng(6)
+    n = 3000
+    X = pl.DataFrame({"a": rng.normal(size=n), "c": rng.choice(["p", "q", "r"], n)})
+    q = (X["c"] == "q").to_numpy()
+    if multiclass:
+        y = np.where(X["a"].to_numpy() > 0.5, 2, q.astype(int))
+        m = TBoostClassifier(max_interaction_order=1, **FAST).fit(X, y)
+    else:
+        y = rng.poisson(np.exp(0.4 * X["a"].to_numpy() + 0.5 * q))
+        m = TBoostRegressor(objective="poisson", max_interaction_order=1, **FAST).fit(X, y)
+    heavy = np.where(X["c"].to_numpy() == "p", 50.0, 1.0)
+    values = {}
+    for weight in (None, heavy):
+        report = m.pricing_report(X, y, sample_weight=weight)
+        banks = report["tables"] if multiclass else {None: report["tables"]}
+        for e in report["datasets"][0]["actual_vs_expected"]:
+            t = next((t for t in banks[e.get("class")]["tables"]
+                      if t["feature_names"] == [e["feature"]]), None)
+            to_table = _table_cells(e["axis"], t["axes"][0]) if t is not None else None
+            for c, mass in enumerate(e["mass"]):
+                if mass > 0:  # a class with no table on the feature gives it no effect
+                    want = t["values"][to_table[c]] if t is not None else 0.0
+                    assert e["shap"]["mean"][c] == pytest.approx(want, abs=1e-9)
+            values[weight is None, e.get("class"), e["feature"]] = t and t["values"]
+    # The weights moved the tables, so the re-centred bank was exercised.
+    assert any(v != values[True, k, f] for (unweighted, k, f), v in values.items()
+               if not unweighted)
+
+
+def test_decile_and_factor_checks_with_the_z_condition_off():
+    # With `factor_z=None` the A/E tolerance alone flags a decile, as it does a factor band, and a
+    # band with no z (no variance) still gets its message.
+    rng = np.random.default_rng(7)
+    n = 3000
+    X = rng.normal(size=(n, 2))
+    y = (rng.random(n) < 1 / (1 + np.exp(-X[:, 0]))).astype(int)
+    m = TBoostClassifier(**FAST).fit(X, y)
+    emptied = y.copy()
+    emptied[np.argsort(m.predict_proba(X)[:, 1])[-n // 10:]] = 0  # no events in the top decile
+    report = m.pricing_report(X, emptied, thresholds={"factor_z": None})
+    decile = [f for f in report["review"] if f["check"] == "decile_ae"]
+    assert any(f["status"] == "warning" for f in decile)
+    assert not any(f["status"] == "pass" for f in decile)
+    for d in report["datasets"]:
+        for e in d["actual_vs_expected"]:
+            for b in e["bands"]:
+                b["z"] = None
+    th = _report.resolve_thresholds({"factor_z": None, "factor_ae": 1e-9})
+    factor = [f for f in _report.review(m, report, th) if f["check"] == "factor_ae"]
+    assert any(f["status"] == "warning" and ", z" not in f["message"] for f in factor)
+
+
+def test_logistic_null_deviance_with_a_large_offset():
+    # Under an offset of 5 the constant model is the intercept -5 (probability 0.5 on balanced
+    # outcomes); Newton from logit(mean) overshot it and stopped at probability 1.
+    n = 400
+    y = np.tile([0.0, 1.0], n // 2)
+    p = types.SimpleNamespace(y=y, w=np.ones(n), e=np.ones(n), offset=np.full(n, 5.0))
+    mu = _report._null_prediction("logistic", "logit", p, 0.0)
+    np.testing.assert_allclose(mu, 0.5, atol=1e-12)
+    assert metrics.mean_binomial_deviance(y, mu) == pytest.approx(2 * math.log(2), abs=1e-9)
+    # Row offsets, exposure and weights: the root of the intercept's score equation.
+    rng = np.random.default_rng(8)
+    w, yr = rng.uniform(0.5, 2.0, n), (rng.random(n) < 0.3).astype(float)
+    p = types.SimpleNamespace(y=yr, w=w, e=rng.uniform(0.2, 1.0, n), offset=rng.normal(0, 3, n))
+    mu = _report._null_prediction("logistic", "logit", p, 0.0)
+    assert float(np.sum(w * (yr - mu))) == pytest.approx(0.0, abs=1e-8)
+
+
+def test_multinomial_deviance_needs_probability_rows():
+    with pytest.raises(ValueError, match="sum to 1"):
+        metrics.mean_multinomial_deviance(np.array([0, 1]), [[1.0, 1.0], [1.0, 1.0]])
+    proba = np.array([[0.2, 0.8], [0.6, 0.4]], dtype=np.float32).astype(np.float64)
+    assert metrics.mean_multinomial_deviance(np.array([1, 0]), proba) == pytest.approx(
+        -math.log(0.8) - math.log(0.6), rel=1e-6)

@@ -6640,6 +6640,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         multi_bytes = state.pop("__t_boost_multi_bytes__", None)
         model_bytes = state.pop("__t_boost_model_bytes__", None)
         self.__dict__.update(state)
+        # A pickle from an earlier release lacks the constructor parameters added since: give
+        # them their defaults, which keep the earlier behaviour (`from_bytes` gets them by
+        # constructing the estimator before restoring its parameters).
+        for param, default in _ctor_defaults(type(self)).items():
+            self.__dict__.setdefault(param, default)
         if "_categorical_encoding_version_" not in state:
             self._categorical_encoding_version_ = 3 if version is not None and version >= 3 else 2
         if multi_bytes is not None:

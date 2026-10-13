@@ -142,7 +142,8 @@ can still sit before the cutoff. This floor removes such tables. For example, `1
 tables that explain less than 0.01% of the variance. The shares are those of the
 [pruning report](../model-analysis/model-report.md#build). Main effects are
 subject to the floor only when [`prune_main_effects`](#prune_main_effects) is set. 0 turns the
-floor off.
+floor off. A fit without the out-of-bag objects the path needs keeps the full set of tables, and
+the floor does not run either.
 The value must be in the range $[0; 1)$. Used only by the `ranked_path` selector.
 
 **Type**

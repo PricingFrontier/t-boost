@@ -237,6 +237,8 @@ def mean_gamma_deviance(y: Any, pred: Any, weight: Any | None = None) -> float:
 
 
 _PROB_CLIP = 1e-12
+# A row of class probabilities may miss 1 by float32 rounding (`predict_proba`), not by more.
+_ROW_SUM_TOL = 1e-4
 
 
 def _deviance_weight(weight: Any | None, n: int) -> "np.ndarray":
@@ -284,5 +286,7 @@ def mean_multinomial_deviance(y: Any, proba: Any, weight: Any | None = None) -> 
     w = _deviance_weight(weight, p.shape[0])
     if not np.all(np.isfinite(p)) or np.any((p < 0) | (p > 1)):
         raise ValueError("proba must be finite and lie in [0, 1]")
+    if np.any(np.abs(p.sum(axis=1) - 1.0) > _ROW_SUM_TOL):
+        raise ValueError("each row of proba must sum to 1")
     picked = np.clip(p[np.arange(p.shape[0]), codes], _PROB_CLIP, 1.0)
     return float(np.average(-2.0 * np.log(picked), weights=w))

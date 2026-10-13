@@ -6,9 +6,9 @@ and loads nothing: charts are inline SVG (hover values from SVG ``<title>``), th
 dataset, class, factor and table selectors are CSS-only radio buttons, and detail sits in
 ``<details>``. It opens offline, in MLflow's artifact viewer (sandboxed iframe) and prints.
 
-Layout: a sticky bar of tabs (Overview, Performance, Factors, Tables, Build, Checks, Slides) with
-one page-wide dataset switch. Every chart is drawn at the pixel width of the card that holds it,
-so its text keeps its size and panels that share an x-axis line up. Colour roles: blue is
+Layout: a sticky bar of tabs (Overview, Performance, Factors, Interactions, Tables, Build, Checks)
+with one page-wide dataset switch. Every chart is drawn at the pixel width of the card that holds
+it, so its text keeps its size and panels that share an x-axis line up. Colour roles: blue is
 observed data, orange is the model (predicted values, relativities, tables); the selected
 dataset is drawn in colour and the others in grey.
 
@@ -21,6 +21,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+import struct
 from html import escape
 from typing import Any, Callable, Iterable, Protocol, Sequence
 
@@ -306,8 +307,9 @@ def _border(b: float) -> str:
 
 
 def integer_grid(borders: Sequence[float]) -> bool:
-    """Every border a multiple of 0.5: the cuts of an integer feature (midpoints of adjacent
-    values, or whole numbers between values further apart), so its cells read as integers."""
+    """Every border a multiple of 0.5, as the cuts of an integer feature are (midpoints of
+    adjacent values, or whole numbers between values further apart). Necessary, not sufficient:
+    `run_label` also needs the report's ``integer`` flag on the axis."""
     return bool(borders) and all(abs(2 * b - round(2 * b)) < 1e-6 * max(1.0, abs(b))
                                  for b in borders)
 
@@ -332,19 +334,20 @@ def span_label(lo: float | None, hi: float | None, integer: bool) -> str:
 
 
 def run_label(axis: dict[str, Any], first: int, last: int) -> str:
-    """The values in a run of numeric cells ``first..last`` of ``axis`` (cell 0 is missing)."""
+    """The values in a run of numeric cells ``first..last`` of ``axis`` (cell 0 is missing),
+    as integers when the axis is flagged ``integer`` (its feature took only whole values)."""
     borders = [float(b) for b in axis.get("borders") or []]
     if not borders:
         return f"cell {first}" if first == last else f"cells {first}–{last}"
     lo = borders[first - 2] if first >= 2 else None
     hi = borders[last - 1] if last - 1 < len(borders) else None
-    return span_label(lo, hi, integer_grid(borders))
+    return span_label(lo, hi, bool(axis.get("integer")) and integer_grid(borders))
 
 
 def cell_labels(axis: dict[str, Any]) -> list[str]:
     """One label per cell: ``missing`` for cell 0, then the values the cell holds: integer
-    ranges (``≤ 18``, ``21``, ``22–25``, ``≥ 90``) on an integer feature, ``≤ b``, ``(a, b]`` and
-    ``> b`` on a continuous one, the member levels on a categorical one."""
+    ranges (``≤ 18``, ``21``, ``22–25``, ``≥ 90``) on an axis flagged ``integer``, ``≤ b``,
+    ``(a, b]`` and ``> b`` on any other numeric one, the member levels on a categorical one."""
     n = int(axis.get("cells") or 0)
     labels = [""] * n
     if n:
@@ -695,6 +698,11 @@ def _lift(d: dict[str, Any], k: int | None) -> list[dict[str, Any]]:
     return list(_metrics(d, k).get("lift") or [])
 
 
+def _f32(x: Any) -> float:
+    """``x`` rounded to the nearest float32."""
+    return float(struct.unpack("f", struct.pack("f", float(x)))[0])
+
+
 def _table_cells(axis: dict[str, Any], taxis: dict[str, Any]) -> list[int | None]:
     """For each cell of a feature's merged grid, the cell of a table axis that holds it."""
     n = int(axis.get("cells") or 0)
@@ -712,10 +720,14 @@ def _table_cells(axis: dict[str, Any], taxis: dict[str, Any]) -> list[int | None
         if dc is not None and tdc is not None and int(dc) < n and out[int(dc)] is None:
             out[int(dc)] = int(tdc)
         return out
-    mb = [float(b) for b in axis.get("borders") or []]
-    tb = [float(b) for b in taxis.get("borders") or []]
+    # Both lists hold the same float32 borders (a table's are a subset of the merged grid's),
+    # but `merged_axes` writes them in float32's shortest form and `tables` in float64, so they
+    # are compared once rounded back to float32: the cell up to border b is then the table cell
+    # after the borders below b, however close two borders are.
+    mb = [_f32(b) for b in axis.get("borders") or []]
+    tb = [_f32(b) for b in taxis.get("borders") or []]
     for c in range(1, n):
-        out[c] = 1 + (bisect.bisect_left(tb, mb[c - 1] - 1e-9) if c - 1 < len(mb) else len(tb))
+        out[c] = 1 + (bisect.bisect_left(tb, mb[c - 1]) if c - 1 < len(mb) else len(tb))
     return out
 
 

@@ -491,6 +491,11 @@ class _TableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
         n_jobs: int | None = None,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        measure_floor: float = 0.001,
+        weight: np.ndarray | None = None,
+        exposure: np.ndarray | None = None,
     ) -> tuple[float, np.ndarray]: ...
     def sobol(self) -> list[tuple[list[int], float]]: ...
     def band(
@@ -787,6 +792,11 @@ class _MultiClassTableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         cat_codes: Sequence[tuple[np.ndarray, Sequence[str]]] | None = None,
         n_jobs: int | None = None,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        measure_floor: float = 0.001,
+        weight: np.ndarray | None = None,
+        exposure: np.ndarray | None = None,
     ) -> list[tuple[float, np.ndarray]]: ...
     def sobol(self) -> list[list[tuple[list[int], float]]]: ...
 

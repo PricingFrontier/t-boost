@@ -112,7 +112,9 @@ Over the one-way table, the chart draws the feature's SHAP value per level on th
 mean (dashed) and the band holding 80% of the policies at that level (10th to 90th percentile,
 weighted by exposure). A policy's SHAP value for a feature is its one-way table plus an equal
 share of every interaction table the feature is in; with t-boost's centred tables this split is
-the exact interventional Shapley value, and the features' values add up to the score. The band
+the exact interventional Shapley value, and the features' values add up to the score. The values
+are read from the tables the report shows, so where the feature is in no interaction the mean is
+its one-way table. The band
 shows how much the other factors, through the interactions, move this feature's effect: narrow
 where the one-way table tells the whole story, wide where an interaction matters. A partial
 dependence plot is not drawn because here it would repeat the one-way table: every interaction
@@ -168,9 +170,10 @@ team can apply its own:
   drove early stopping);
 - whether any bag reached `n_trees` without [early stopping](../algorithm/early-stopping.md);
 - deciles of predicted rate whose A/E is off by more than `decile_ae` and at least `factor_z`
-  standard deviations;
+  standard deviations (with `factor_z` set to `None`, the tolerance alone);
 - factor bands whose A/E is off by more than `factor_ae`, among bands holding at least
-  `factor_min_mass` of the mass and at least `factor_z` standard deviations from balance. Each
+  `factor_min_mass` of the mass and at least `factor_z` standard deviations from balance (with
+  `factor_z` set to `None`, the tolerance alone). Each
   feature is read on up to ten bands of equal train exposure (the same bands for every dataset),
   and the passing check states the share of the exposure it covered. On out-of-sample data, bands
   and deciles past their tolerance with at least `near_miss_z` standard deviations are listed as

@@ -405,6 +405,26 @@ def test_pickles_from_older_releases_are_refused() -> None:
     assert fresh.get_params()["n_trees"] == 7
 
 
+def test_pickles_from_the_previous_release_take_new_parameters_at_their_defaults() -> None:
+    """A 0.8.1 pickle (schema 5) has no `prune_min_variance_share` nor fit time: it loads with
+    the parameter at its default (off, as 0.8.1 fitted) and every estimator method works."""
+    x, y = _small_regression_fixture()
+    reg = _small_regressor().fit(x, y)
+    state = reg.__getstate__()
+    for key in ("prune_min_variance_share", "fitted_at_", "fit_duration_"):
+        del state[key]
+    state["__t_boost_schema_version__"] = 5
+    old = TBoostRegressor.__new__(TBoostRegressor)
+    old.__setstate__(state)
+    assert old.get_params()["prune_min_variance_share"] == 0.0
+    assert clone(old).get_params() == reg.get_params()
+    assert repr(old) == repr(reg)
+    np.testing.assert_array_equal(old.predict(x), reg.predict(x))
+    np.testing.assert_array_equal(TBoostRegressor.from_bytes(old.to_bytes()).predict(x),
+                                  reg.predict(x))
+    assert old.pricing_report(x, y)["model"] is not None
+
+
 @pytest.mark.parametrize("weighted", [False, True])
 def test_multiclass_ae_flags_record_the_fit_weight_and_survive_a_round_trip(weighted):
     # Multiclass fits used to leave `_ae_requires_weight_` unset, skipping the explicit-weight

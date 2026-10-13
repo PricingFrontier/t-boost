@@ -169,7 +169,7 @@ The values in force are written to the report and printed next to every flag.
 | `ae_test` | 0.05 | overall A/E on the test data within 1 ± value |
 | `factor_ae` | 0.10 | factor bands whose A/E is off by more than value … |
 | `factor_min_mass` | 0.01 | … among bands holding at least this share of the mass … |
-| `factor_z` | 3.0 | … and at least this many standard deviations from balance |
+| `factor_z` | 3.0 | … and at least this many standard deviations from balance (`None`: the tolerance alone flags, for the deciles too) |
 | `decile_ae` | 0.05 | deciles of predicted rate whose A/E is off by more than value (and at least `factor_z` standard deviations) |
 | `near_miss_z` | 2.0 | out-of-sample bands and deciles past their tolerance with \|z\| at least value, but below `factor_z`, are listed as near misses |
 | `missing_effect` | 0.05 | a one-way table's missing-value level with no exposure whose effect is further than value from no effect |
@@ -209,8 +209,11 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
   and for a multiclassification model accuracy, a class matrix and per-class values),
   `actual_vs_expected` (each cell with a `z` score; on the first dataset, `shap`: each cell's
   exposure-weighted mean and 10th and 90th percentile of the feature's exact Shapley value, on
-  the link scale), `bands` (the factor check's bands per feature), missing values and unseen
-  values.
+  the link scale, read from the report's `tables`), `bands` (the factor check's bands per
+  feature), missing values and unseen values. Each cell's `axis` is its feature's merged grid; a
+  numeric axis carries `integer`, true when the feature took only whole values in the first
+  dataset, and its cells are then labelled as integers (`51`, `22–25`). The numeric axes of
+  `tables` carry the same flag.
 - `drift` — PSI per feature from the train data to each later dataset: a list of
   `{"reference", "compared", "features"}`.
 - `structure` — The deployed effects of each table bank with their variance shares.

@@ -60,8 +60,9 @@ THRESHOLD_DESCRIPTIONS: dict[str, str] = {
     "ae_test": "overall A/E on the test data within 1 ± value",
     "factor_ae": "factor bands whose A/E is off by more than value",
     "factor_min_mass": "only bands holding at least this share of the mass",
-    "factor_z": "only bands whose A - E is at least value standard deviations from 0",
-    "decile_ae": "predicted-rate deciles whose A/E is off by more than value (and z ≥ factor_z)",
+    "factor_z": ("only bands and deciles whose A - E is at least value standard deviations "
+                 "from 0 (None: the tolerance alone)"),
+    "decile_ae": "predicted-rate deciles whose A/E is off by more than value (and |z| ≥ factor_z)",
     "near_miss_z": "bands and deciles off by more than their tolerance with z ≥ value (below "
                    "factor_z) are listed as near misses",
     "missing_effect": "a missing-value level with no exposure whose effect differs from no "
@@ -366,13 +367,30 @@ def factor_ae(p: Prepared, bank: int = 0, *, actual: np.ndarray | None = None,
     return out
 
 
-def shap_by_cell(est: "_BaseTBoost", p: Prepared) -> list[list[dict[str, Any]]]:
+def table_measure(est: "_BaseTBoost", X: Any, sample_weight: Any | None, exposure: Any | None,
+                  ref_measure: str | None) -> dict[str, Any]:
+    """The measure arguments ``est.tables(X, ref_measure=..., sample_weight=..., exposure=...)``
+    hands the native export (resolved the same way, fit-time fallbacks included), so the
+    Shapley values can be read from the bank the report's tables come from."""
+    model, _ = _bank_models(est)
+    X, sample_weight, exposure = est._resolve_explain_inputs(X, sample_weight, exposure)
+    weight32, exposure32 = est._explain_mass(sample_weight, exposure, model,
+                                             joint=ref_measure == "joint")
+    return {**est._export_measure_kwargs(ref_measure, 1.0, None),
+            "weight": weight32, "exposure": exposure32}
+
+
+def shap_by_cell(est: "_BaseTBoost", p: Prepared,
+                 measure: dict[str, Any]) -> list[list[dict[str, Any]]]:
     """Per class bank and raw feature: each merged-grid cell's exposure-weighted mean and 10th
     and 90th percentile of the feature's exact Shapley value (every table shared equally among
     its features, on the link scale) over the rows in that cell. The spread is what the other
-    factors, through the interactions, do to the feature's effect across these policies."""
+    factors, through the interactions, do to the feature's effect across these policies.
+    ``measure`` (`table_measure`) reads them from the bank the report's tables are exported
+    from, so with no interactions the mean is the one-way table."""
     model, multiclass = _bank_models(est)
-    banks = model.feature_contributions(p.x32, **p.cat_kw, n_jobs=est._resolve_n_jobs())
+    banks = model.feature_contributions(p.x32, **p.cat_kw, n_jobs=est._resolve_n_jobs(),
+                                        **measure)
     weight = _f64(p.w * p.e)
     out = []
     for k, (_, values) in enumerate(banks if multiclass else [banks]):
@@ -430,23 +448,46 @@ def _null_prediction(obj: str, link: str, p: Prepared, rho: float) -> np.ndarray
         if w.sum() <= 0:
             return None
         return np.asarray(np.full_like(y, float(np.sum(w * (y - o)) / np.sum(w))) + o)
-    # logit: Newton on the intercept, with the offset and log-exposure as fixed terms
+    # logit: the intercept c solving Σ w (y - σ(c + base)) = 0, with the offset and
+    # log-exposure as fixed terms. The sum falls strictly in c, so the root is bracketed and
+    # Newton steps that leave the bracket (a large offset saturates σ) bisect instead.
     base = o + np.log(np.where(e > 0, e, 1.0))
     mean = float(np.sum(w * y) / np.sum(w)) if w.sum() > 0 else 0.0
     if not 0.0 < mean < 1.0:
         return None
-    c = math.log(mean / (1.0 - mean))
-    for _ in range(50):
-        mu = 1.0 / (1.0 + np.exp(-(c + base)))
-        grad = float(np.sum(w * (y - mu)))
+
+    def sigmoid(c: float) -> np.ndarray:
+        return np.asarray(0.5 * (1.0 + np.tanh(0.5 * (c + base))))
+
+    def grad(c: float) -> float:
+        return float(np.sum(w * (y - sigmoid(c))))
+
+    c = math.log(mean / (1.0 - mean)) - float(np.sum(w * base) / np.sum(w))
+    lo, hi, step = c, c, 1.0
+    while grad(lo) <= 0.0 and step < 1e6:
+        lo, step = lo - step, step * 2.0
+    step = 1.0
+    while grad(hi) >= 0.0 and step < 1e6:
+        hi, step = hi + step, step * 2.0
+    for _ in range(100):
+        mu = sigmoid(c)
+        g = float(np.sum(w * (y - mu)))
+        if g == 0.0:
+            break
+        if g > 0.0:
+            lo = c
+        else:
+            hi = c
         hess = float(np.sum(w * mu * (1.0 - mu)))
-        if hess <= 0:
+        nxt = c + g / hess if hess > 0.0 else math.nan
+        if not lo < nxt < hi:
+            nxt = 0.5 * (lo + hi)
+        tol = 1e-12 * max(1.0, abs(c))
+        done = abs(nxt - c) <= tol or hi - lo <= tol
+        c = nxt
+        if done:
             break
-        step = grad / hess
-        c += step
-        if abs(step) < 1e-12:
-            break
-    return np.asarray(1.0 / (1.0 + np.exp(-(c + base))))
+    return sigmoid(c)
 
 
 def _deviance(obj: str, y: np.ndarray, mu: np.ndarray, w: np.ndarray, rho: float) -> float:
@@ -607,6 +648,30 @@ def _psi_bins(mass: np.ndarray, levels: list[dict[str, Any]] | None,
     return [[0]] + groups
 
 
+def whole_valued(p: Prepared) -> list[bool]:
+    """Per numeric column of the scored design (the raw feature ids of the numeric axes):
+    whether every value present is a whole number."""
+    x = p.x32
+    if x is None:
+        return []
+    out = []
+    for j in range(x.shape[1]):
+        col = x[:, j]
+        col = col[np.isfinite(col)]
+        out.append(bool(col.size) and bool(np.all(col == np.round(col))))
+    return out
+
+
+def mark_integer_axes(axes: list[dict[str, Any]], whole: list[bool]) -> None:
+    """Set ``integer`` on each numeric axis: its feature took only whole values in the first
+    dataset, so its cells read as integers (``51``, ``22–25``). Borders alone cannot tell: 0.1
+    and 0.9 split at 0.5 too."""
+    for a in axes:
+        raw = a.get("raw")
+        if not a.get("levels") and raw is not None:
+            a["integer"] = 0 <= int(raw) < len(whole) and whole[int(raw)]
+
+
 def band_label(cells: list[int], axis: dict[str, Any]) -> str:
     """A band's label: ``missing``; the values of a run of numeric cells (``51``, ``22–25``,
     ``≤ 18`` on an integer feature, ``(a, b]`` on a continuous one); the level names (or
@@ -712,7 +777,8 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                         continue
                     text = f"decile {b['band']} A/E {ae_b:.3f}" + (
                         f" (z {z_b:+.1f})" if z_b is not None else "")
-                    if fz is not None and z_b is not None and abs(z_b) >= fz:
+                    # As for the factor bands: with `factor_z` off, the tolerance alone flags.
+                    if fz is None or (z_b is not None and abs(z_b) >= fz):
                         flags.append(_flag("decile_ae", "warning", text, value=ae_b,
                                            threshold=dtol, dataset=label, cls=cls))
                     elif (nz is not None and z_b is not None and abs(z_b) >= nz
@@ -753,7 +819,8 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                         "factor_ae", "warning",
                         f"{len(bad)} band(s) off by more than {ftol:g}"
                         + (f" and at least {fz:g} standard deviations" if fz is not None else "")
-                        + f" (worst: {worst['label']}, A/E {worst['ae']:.3f}, z {worst['z']:.1f})",
+                        + f" (worst: {worst['label']}, A/E {worst['ae']:.3f}"
+                        + (f", z {worst['z']:.1f})" if worst["z"] is not None else ")"),
                         value=len(bad), threshold=ftol, dataset=label,
                         feature=factor["feature"], cls=factor.get("class")))
             if not any(f["status"] == "warning" for f in flags[flagged:]):
@@ -1216,6 +1283,9 @@ def build_report(
         ))["axes"]
         for k in range(n_banks)
     ]
+    whole = whole_valued(first)
+    for bank_axes in axes:
+        mark_integer_axes(bank_axes, whole)
     class_labels = [str(c) for c in est.classes_] if multiclass else [None]
 
     from .sklearn import _canonical_objective
@@ -1274,10 +1344,15 @@ def build_report(
     for d in datasets:
         for e in d.get("actual_vs_expected") or []:
             e.pop("_var", None)
+    design, vectors = est._resolve_fit_vectors(
+        X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
+    )
     # Shapley values per level on the first dataset (train): one per (class bank, raw feature),
-    # the order `ae_lists` lays the entries out in.
+    # the order `ae_lists` lays the entries out in, from the bank the tables below come from.
     if datasets[0].get("error") is None:
-        shap = [cell for per_bank in shap_by_cell(est, first) for cell in per_bank]
+        measure = table_measure(est, design, vectors["sample_weight"], vectors["exposure"],
+                                ref_measure)
+        shap = [cell for per_bank in shap_by_cell(est, first, measure) for cell in per_bank]
         for e, stats in zip(datasets[0]["actual_vs_expected"], shap):
             e["shap"] = stats
 
@@ -1290,14 +1365,14 @@ def build_report(
                           "features": psi(base, d["actual_vs_expected"][: len(first.names)],
                                           axes[0])})
 
-    design, vectors = est._resolve_fit_vectors(
-        X, {"y": y, "sample_weight": sample_weight, "exposure": exposure, "offset": offset}
-    )
     exported = json.loads(est.tables(
         design, ref_measure=ref_measure, sample_weight=vectors["sample_weight"],
         exposure=vectors["exposure"],
     ))
     banks = exported if multiclass else {"": exported}
+    for bank in banks.values():
+        for t in bank.get("tables", []):
+            mark_integer_axes(t.get("axes") or [], whole)
 
     report: dict[str, Any] = {
         "report_version": REPORT_VERSION,
