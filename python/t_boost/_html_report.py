@@ -131,6 +131,7 @@ svg .ib0,svg .ib1,svg .ib2,svg .ib3{stroke-width:2;fill:none;stroke-linejoin:rou
 svg .ib0{stroke:var(--i0)}svg .ib1{stroke:var(--i1)}svg .ib2{stroke:var(--i2)}svg .ib3{stroke:var(--i3)}
 svg .fade{opacity:.3}
 svg .shapmean{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
+svg .hbar{fill:var(--model-soft)}
 svg .flagdot{fill:var(--crit);stroke:var(--surface);stroke-width:1.5}
 svg .neardot{fill:var(--warn);stroke:var(--surface);stroke-width:1.5}
 svg .bandbox{fill:var(--band)}
@@ -1147,54 +1148,76 @@ def lorenz_chart(r: dict[str, Any], k: int | None, w: float, h: float) -> str:
 
 
 def spread_chart(r: dict[str, Any], w: float) -> str:
-    """The spread of predictions per dataset: p1–p99, p5–p95 and p25–p75, and the median."""
+    """The spread of the predictions as a histogram: each dataset's share of exposure (or weight)
+    by predicted rate on the bins every dataset shares, the selected dataset as bars and the
+    others as grey outlines, so a shift between them shows."""
     scored = _scored(r)
-    rows: list[tuple[int, str, dict[str, float]]] = []
-    for i, d in enumerate(scored):
-        pct = _metrics(d, None).get("predicted_rate_percentiles")
-        if pct:
-            rows.append((i, str(d["label"]), pct))
-    if not rows:
+    hists = [(i, _metrics(d, None).get("predicted_rate_histogram")) for i, d in enumerate(scored)]
+    found = [(i, h) for i, h in hists if h and h.get("mass") and h.get("edges")]
+    if not found:
         return _none()
-    vals = _fv(v for _, _, p in rows for v in p.values())
-    name_w = max(_text_w(str(lbl)) for _, lbl, _ in rows) + 14
-    row_h = 26.0
-    left, right, top = name_w, w - 14, 24.0
-    bottom = top + row_h * len(rows)
-    h = bottom + 22
-    use_log = min(vals) > 0 and max(vals) / min(vals) > 8
-    e0, e1 = (math.log10(min(vals)), math.log10(max(vals))) if use_log else (0.0, 1.0)
-    pad = (e1 - e0) * 0.04
-    lin = _Lin(min(vals), max(vals), left, right, n=5)
+    edges = [float(e) for e in found[0][1]["edges"]]
+    use_log = bool(found[0][1].get("log")) and edges[0] > 0
+    share = {i: [float(m) / (sum(h["mass"]) or 1.0) for m in h["mass"]] for i, h in found}
+    peak = max(max(v) for v in share.values()) or 1.0
+    right, top = w - 8, 30.0
+    bottom = top + 190.0
+    h = bottom + 40
+    ys = _Lin(0.0, peak, bottom, top, pad=0.05, zero=True, n=4)
+    step = (ys.ticks[1] - ys.ticks[0]) * 100 if len(ys.ticks) > 1 else 1.0
+    places = 0 if abs(step - round(step)) < 1e-9 else 1  # 2.5% steps keep their decimal
 
-    def xs(v: float) -> float:
-        if not use_log:
-            return lin(v)
-        lv = math.log10(max(v, 1e-12))
-        return left + (lv - (e0 - pad)) / ((e1 + pad) - (e0 - pad)) * (right - left)
+    def y_label(v: float) -> str:
+        return _pct(v, places)
 
+    left = _label_w(ys, y_label) + 14
     if use_log:
-        cands = [m * 10.0 ** e for e in range(math.floor(e0) - 1, math.ceil(e1) + 1) for m in (1, 2, 5)]
-        ticks = [t for t in cands if e0 - pad <= math.log10(t) <= e1 + pad]
+        e0, e1 = math.log10(edges[0]), math.log10(edges[-1])
+
+        def xs(v: float) -> float:
+            return left + (math.log10(max(v, 1e-300)) - e0) / (e1 - e0) * (right - left)
+
+        cands = [m * 10.0 ** e for e in range(math.floor(e0) - 1, math.ceil(e1) + 1)
+                 for m in (1, 2, 5)]
+        ticks = [t for t in cands if e0 <= math.log10(t) <= e1]
     else:
-        ticks = lin.ticks
+        lin = _Lin(edges[0], edges[-1], left, right, pad=0.0, n=6)
+        xs = lin
+        ticks = [t for t in lin.ticks if edges[0] <= t <= edges[-1]]
     svg = _Svg(w, h, "spread of the predictions")
+    basis = "exposure" if r["model"]["link"] == "log" else "weight"
+    _legend(svg, left, 12, [("box", "hbar", "selected dataset"), ("line", "dsl", "other datasets")]
+            if len(found) > 1 else [("box", "hbar", str(scored[found[0][0]]["label"]))])
+    _yaxis(svg, ys, left, right, y_label)
+    svg.text(right, 12, f"share of {basis} per bin", anchor="end", cls="lbl")
     for t in ticks:
-        svg.vline(xs(t), top, bottom, "gl")
-        svg.text(xs(t), bottom + 16, _num(t, 2), anchor="middle")
-    svg.text(left, 12, f"predicted {_rate_name(r)}" + (", log scale" if use_log else ""), cls="lbl")
-    for j, (i, lbl, p) in enumerate(rows):
-        y = top + (j + 0.5) * row_h
-        svg.text(left - 10, y + 4, str(lbl), anchor="end", cls="lbl")
-        for lo_q, hi_q, width in (("1", "99", 1.5), ("5", "95", 4.0), ("25", "75", 10.0)):
-            if lo_q in p and hi_q in p:
-                svg.add(f'<line class="dsl dsl-{i}" x1="{xs(p[lo_q]):.1f}" x2="{xs(p[hi_q]):.1f}" '
-                        f'y1="{y:.1f}" y2="{y:.1f}" style="stroke-width:{width}"/>')
-        if "50" in p:
-            svg.add(f'<line class="mk" x1="{xs(p["50"]):.1f}" x2="{xs(p["50"]):.1f}" '
-                    f'y1="{y - 8:.1f}" y2="{y + 8:.1f}" style="stroke:var(--ink);stroke-width:2"/>')
-        tip = f"{lbl}: " + ", ".join(f"p{q} {_num(v, 3)}" for q, v in p.items())
-        svg.hit(left, y - row_h / 2, right - left, row_h, tip)
+        svg.text(xs(t), bottom + 16, _num(t, 3), anchor="middle")
+    svg.text((left + right) / 2, bottom + 34, f"predicted {_rate_name(r)}"
+             + (", log scale" if use_log else ""), anchor="middle", cls="lbl")
+    svg.hline(left, right, bottom, "ax")
+
+    def outline(v: list[float]) -> list[tuple[float, float]]:
+        return [(xs(edges[j] if e == 0 else edges[j + 1]), ys(s))
+                for j, s in enumerate(v) for e in (0, 1)]
+
+    for i, _ in found:
+        bars = [_bar("hbar", xs(edges[j]) + 0.5, ys(v), max(xs(edges[j + 1]) - xs(edges[j]) - 1, 0.5),
+                     bottom, r=1.0) for j, v in enumerate(share[i])]
+        svg.group(f"ds ds-{i}", bars)
+    if len(found) > 1:
+        for i, _ in found:
+            svg.path(outline(share[i]), "dsl")
+    for i, _ in found:
+        g = _Svg(w, h, "")
+        g.path(outline(share[i]), "model")
+        svg.group(f"ds ds-{i}", g.parts)
+    last = len(edges) - 2
+    for j in range(len(edges) - 1):
+        lo, hi = _num(edges[j], 3), _num(edges[j + 1], 3)
+        span = f"≤ {hi}" if j == 0 else f"≥ {lo}" if j == last else f"{lo}–{hi}"
+        lines = [f"predicted {_rate_name(r)} {span}"]
+        lines += [f"{scored[i]['label']}: {_pct(share[i][j], 1)} of the {basis}" for i, _ in found]
+        svg.hit(xs(edges[j]), top, xs(edges[j + 1]) - xs(edges[j]), bottom - top, "\n".join(lines))
     return svg.render()
 
 
@@ -2121,7 +2144,8 @@ def _performance(r: dict[str, Any], classes: _Radio | None) -> str:
                            + "<details><summary>Percentiles</summary>"
                            + _table(["dataset"] + [f"p{q}" for q in keys], pct_rows,
                                     numeric=range(1, len(keys) + 1)) + "</details>",
-                           what=f"Percentiles of the predicted {_rate_name(r)} per dataset"))
+                           what=(f"Share of {'exposure' if log else 'weight'} by predicted "
+                                 f"{_rate_name(r)}, on bins shared by every dataset")))
     else:
         for i, d in enumerate(scored):
             cm = d["metrics"]["class_matrix"]

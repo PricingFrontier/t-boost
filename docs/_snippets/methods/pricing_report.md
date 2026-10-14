@@ -210,6 +210,8 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
   `binding_report_`, each with whether it is available on this model.
 - `datasets` — Per dataset: its label, rows, `metrics` (deviance, null deviance, deviance
   explained, Gini, A/E, lift bands with their A/E, standard error `sd` and `z`, Lorenz curve,
+  percentiles of the predicted rate and its histogram (`predicted_rate_histogram`: bin `edges`
+  shared by every dataset, the `mass` in each and whether the bins are `log`-spaced),
   and for a multiclassification model accuracy, a class matrix and per-class values),
   `actual_vs_expected` (each cell with a `z` score; on the first dataset, `shap`: each cell's
   exposure-weighted mean and 10th and 90th percentile of the feature's exact Shapley value, on

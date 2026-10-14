@@ -99,7 +99,9 @@ shared scale, each band as wide as its share of exposure: the selected dataset i
 standard deviations shaded, the `factor_ae` tolerance dashed, the bands the review flags in red
 and its near misses in amber, and each feature's band furthest from balance named above its
 chart. The scale is set by the bands the review checks (`factor_min_mass`); thinner ones are
-clipped at its edge. Below, the spread of the predictions. A multiclassification model has
+clipped at its edge. Below, the spread of the predictions as a histogram: the share of exposure
+by predicted rate, on bins every dataset shares (log-spaced when the rates span more than a
+factor of 3), the selected dataset as bars and the others outlined. A multiclassification model has
 a class switch, one-vs-rest views per class and the class matrices.
 
 ### Factors {#factors}

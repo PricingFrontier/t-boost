@@ -757,3 +757,19 @@ def test_balance_chart_marks_the_bands_the_review_flags(poisson):
                    for e in d["actual_vs_expected"] for b in e["bands"])
     assert not any(f["check"] == "factor_ae" and f["status"] == "warning" for f in relaxed)
 
+
+def test_prediction_histogram_bins_every_dataset_alike(poisson):
+    # The spread of the predictions is a histogram on bins every dataset shares, holding all of
+    # each dataset's exposure (rates beyond the bins fall in the end bins).
+    _, _, _, report = poisson
+    hists = [d["metrics"]["predicted_rate_histogram"] for d in report["datasets"]]
+    assert all(h["edges"] == hists[0]["edges"] for h in hists)
+    assert len(hists[0]["edges"]) == len(hists[0]["mass"]) + 1 == 41
+    edges = hists[0]["edges"]
+    assert all(np.diff(edges) > 0)
+    assert hists[0]["log"] is (edges[0] > 0 and edges[-1] / edges[0] > 3)  # log for a wide spread
+    for d, h in zip(report["datasets"], hists):
+        assert sum(h["mass"]) == pytest.approx(d["metrics"]["mass"])
+    html = report_html(report)
+    assert html.count('class="hbar"') >= 40 and "share of exposure per bin" in html
+

@@ -79,6 +79,7 @@ _LORENZ_POINTS = 101
 _PSI_BINS = 10
 _PSI_FLOOR = 1e-4
 _PERCENTILES = (1, 5, 25, 50, 75, 95, 99)
+_HISTOGRAM_BINS = 40
 # The spread of each level's Shapley value across policies, and of an interaction's effect
 # across exposure.
 _SHAP_QUANTILES = (0.1, 0.9)
@@ -557,6 +558,34 @@ def _ranking(link: str, p: Prepared, pred: np.ndarray, y: np.ndarray,
         if kept.size else None
     )
     return out
+
+
+def prediction_histograms(est: "_BaseTBoost", prepared: list[Prepared],
+                          datasets: list[dict[str, Any]]) -> None:
+    """Each scored single-output dataset's mass by predicted rate, on bins every dataset shares
+    (``metrics["predicted_rate_histogram"]``): from the first dataset's 0.5th to 99.5th
+    percentile, log-spaced when the rates are positive and span more than a factor of 3, with
+    rates beyond in the end bins."""
+    parts = []
+    for p, d in zip(prepared, datasets):
+        if p.error is None and p.pred is not None and d.get("metrics"):
+            rate, _, mass, keep = _rate_and_mass(est.link, p, p.pred, p.y)
+            parts.append((d, rate[keep], mass[keep]))
+    if not parts or parts[0][0] is not datasets[0] or not parts[0][1].size:
+        return
+    first = parts[0][1]
+    lo, hi = (float(v) for v in np.quantile(first, [0.005, 0.995]))
+    if hi <= lo:
+        lo, hi = float(np.min(first)), float(np.max(first))
+    if hi <= lo:  # constant predictions: one narrow range
+        hi = lo + (abs(lo) * 0.1 or 1.0)
+    log = lo > 0 and hi / lo > 3
+    edges = (np.geomspace(lo, hi, _HISTOGRAM_BINS + 1) if log
+             else np.linspace(lo, hi, _HISTOGRAM_BINS + 1))
+    for d, rate, mass in parts:
+        counts, _ = np.histogram(np.clip(rate, edges[0], edges[-1]), bins=edges, weights=mass)
+        d["metrics"]["predicted_rate_histogram"] = {
+            "edges": edges.tolist(), "mass": counts.tolist(), "log": bool(log)}
 
 
 def single_output_metrics(est: "_BaseTBoost", p: Prepared) -> dict[str, Any]:
@@ -1357,6 +1386,8 @@ def build_report(
                 for f in entry["actual_vs_expected"][: len(p.names)]
             ]
         datasets.append(entry)
+    if not multiclass:
+        prediction_histograms(est, prepared, datasets)
 
     # Factor bands: at most `_PSI_BINS` per feature, from the first dataset's mass, applied to
     # every dataset, so the factor check and the level summary read the same groups everywhere.
