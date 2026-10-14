@@ -124,9 +124,10 @@ def test_estimator_fit_default_noop_and_enabled_reporting():
     rng = np.random.default_rng(24)
     x = rng.normal(size=(2000, 3)).astype(np.float32)
     y = (3 * np.all(x > 0, axis=1) + rng.normal(size=len(x))).astype(np.float32)
+    # Unbanded, so the three-way effects stay factored for the diffusion to smooth.
     params = dict(n_trees=6, n_bags=1, n_jobs=1, validation_fraction=None,
                   prune_n_folds=2, graduation_alpha=0, interaction_gain_hurdle=0,
-                  leaf_refine_steps=0, colsample_bytree=1)
+                  leaf_refine_steps=0, colsample_bytree=1, band_tolerance=None)
     default = TBoostRegressor(**params).fit(x, y)
     zero = TBoostRegressor(**params, graduation_high_order_alpha=0).fit(x, y)
     assert model_bytes(default) == model_bytes(zero)

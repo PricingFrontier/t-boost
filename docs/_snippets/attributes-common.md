@@ -175,9 +175,9 @@ float
 
 The record of the table selection: the selector used (`selector`), the candidate tables and
 their scores (`table_scores`), the kept tables (`kept`), the scored path (`path`) and, when they
-ran, the reports of banding (`banding`) and of the budgets (`table_budget`, `box_budget`). On an
-unpruned model (`prune=False`) the selector is `"none"` and every table is kept. Saved with the
-model.
+ran, the reports of the rebalance (`rebalance`), of banding (`banding`) and of the budgets
+(`table_budget`, `box_budget`). On an unpruned model (`prune=False`) the selector is `"none"`
+and every table is kept. Saved with the model.
 
 For the ranked-path selector, `path` holds the bank sizes (`sizes`) and their out-of-bag
 deviance (`oob_deviance`), the total gain over the main-effects bank (`total_gain`), the step of

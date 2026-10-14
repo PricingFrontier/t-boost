@@ -437,7 +437,7 @@ class _Model:
         cat_x: Sequence[Sequence[str]] | None = None,
         table_budget: int = 0,
         table_min_arity: int = 3,
-    ) -> tuple[_TableModel, str, str]: ...
+    ) -> tuple[_TableModel, str, str, str | None]: ...
 
     def bag_bank_jsons(
         self,

@@ -15,9 +15,8 @@ Two selectors are available (see [`prune_selector`](#prune_selector)):
   Its parameters are listed in [Fold vote pruning settings](pruning-fold-vote.md).
 
 The ranked path needs out-of-bag objects: `n_bags` of at least 2, and at least
-[`prune_guard_min_rows`](#prune_guard_min_rows) objects that are out of bag for some bag. For
-regression and binary classification, a fit without them falls back to `fold_vote`. For
-multiclassification, it keeps the full set of tables.
+[`prune_guard_min_rows`](#prune_guard_min_rows) objects that are out of bag for some bag. A fit
+without them falls back to `fold_vote`.
 
 The selection is recorded in the `pruning_report_` attribute.
 
@@ -143,8 +142,8 @@ can still sit before the cutoff. This floor removes such tables. For example, `1
 tables that explain less than 0.01% of the variance. The shares are those of the
 [pruning report](../model-analysis/model-report.md#build). Main effects are
 subject to the floor only when [`prune_main_effects`](#prune_main_effects) is set. 0 turns the
-floor off. A fit without the out-of-bag objects the path needs keeps the full set of tables, and
-the floor does not run either.
+floor off. A fit without the out-of-bag objects the path needs falls back to `fold_vote`, which
+does not apply the floor.
 The value must be in the range $[0; 1)$. Used only by the `ranked_path` selector.
 
 **Type**
@@ -191,8 +190,9 @@ int
 
 After tables are dropped, re-solve the values of the remaining tables for the smaller structure
 (one ridge IRLS step, followed by purification). The new values are kept only if they lower the
-held-out deviance. Models with multi-channel categorical features (see
-[`cat_channels`](categorical.md#cat_channels)) are not rebalanced.
+held-out deviance. Tables on a categorical feature encoded by several channels (see
+[`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
+two-way interaction is re-solved. The outcome is recorded in `pruning_report_["rebalance"]`.
 
 `False` deploys the remaining tables with their values unchanged.
 

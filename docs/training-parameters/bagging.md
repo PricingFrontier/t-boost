@@ -14,9 +14,9 @@ The number of bags. Each bag is trained on its own sample of the objects, with i
 stopping, and the bags are averaged into one model. Training costs about `n_bags`
 times as much as training a single model.
 
-1 turns bagging off. Without bagging there are no out-of-bag objects: banding is skipped, and
-pruning falls back to the cross-validated selector, or keeps the full set of tables for
-multiclassification (see [Pruning settings](pruning.md)).
+1 turns bagging off. Without bagging there are no out-of-bag objects, so pruning falls back to
+the cross-validated selector (see [Pruning settings](pruning.md)), and no spread between bags,
+so the deviance cap alone bounds [banding](banding.md).
 
 **Type**
 

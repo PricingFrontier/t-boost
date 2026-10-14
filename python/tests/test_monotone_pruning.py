@@ -100,12 +100,12 @@ def test_the_repaired_model_round_trips_and_its_exports_agree(fitted, data) -> N
 
 
 def test_a_single_bag_fit_keeps_its_factored_effects_and_is_repaired(data) -> None:
-    # One bag: no out-of-bag rows, so the fold vote selects and banding is skipped, which
-    # leaves the three-way effects in factored form for the repair to account for.
+    # One bag: no out-of-bag rows, so the fold vote selects. Unbanded, the three-way effects
+    # stay in factored form for the repair to account for.
     X, y = data
     est = TBoostRegressor(objective="poisson", n_trees=150, n_bags=1, seed=2, n_jobs=2,
-                          monotone_constraints=SIGNS).fit(X, y)
-    assert "banding" not in est.pruning_report_
+                          band_tolerance=None, monotone_constraints=SIGNS).fit(X, y)
+    assert est.pruning_report_["selector"] != "ranked_path"
     assert json.loads(est.tables(X[:50]))["factored"], "the fixture must carry factored effects"
     assert est.pruning_report_["monotone"]["certified"] is False, "the fixture must need repair"
     _assert_monotone(est)

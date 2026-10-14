@@ -47,9 +47,9 @@ use t_boost_core::loss::{
 };
 use t_boost_core::prune::{
     bag_banks_for_keepset, bag_oob_evidence_available, bag_oob_group_sums_with,
-    bag_raw_scores_for_rows, multiclass_bag_oob_evidence_available, multiclass_full_tables,
-    multiclass_ranked_path, multiclass_realized_supports, prune_model_to_keepset,
-    prune_model_to_tables, prune_model_to_tables_pinned, prune_multiclass_to_keepset,
+    bag_raw_scores_for_rows, multiclass_full_tables, multiclass_ranked_path,
+    multiclass_realized_supports, prune_model_to_keepset, prune_model_to_tables,
+    prune_model_to_tables_pinned, prune_multiclass_to_keepset,
     prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, PruneConfig, PruneReport,
     PruneTableScore, DEFAULT_TABLE_MIN_ARITY,
 };
@@ -2034,16 +2034,10 @@ mod cat_channels_fit_path_tests {
     /// sklearn.py DEFAULT, `prune_rebalance=True`) -> predict -> tables -> serialize save ->
     /// load -> predict-after-load -> shap.
     ///
-    /// `rebalance: true` here (previously `false`, see the git history for that draft) now
-    /// exercises `rebalance_kept_cells`'s multi-channel SKIP (bug #5's follow-up fix): a
-    /// separate subsystem (`cell_refit::fit_cell_correction` -> `correction_scaffold`) has its
-    /// own independent row-to-cell representation with no notion of a joint axis, plus an
-    /// unrelated raw-id-vs-axis-id conflation bug only latent pre-P1 -- rather than growing
-    /// joint support through that whole ridge-regression pipeline (out of scope, a redesign,
-    /// per the team lead), `rebalance_kept_cells` now detects any multi-channel raw feature
-    /// ANYWHERE in the model and skips rebalance for the entire model, falling back to the
-    /// already-proven-lossless unrebalanced deploy — which is exactly what this test's
-    /// `rebalance: true` request now silently (and correctly) becomes.
+    /// The deploy runs twice: with `rebalance: true` (the sklearn default), which re-solves the
+    /// numeric feature's tables and leaves every table touching the multi-channel categorical
+    /// as fitted (`cell_refit`'s correction has no joint axis), and with `rebalance: false`,
+    /// whose lossless bank the later steps check against the ensemble.
     #[test]
     fn full_deploy_lifecycle_survives_a_nonseparable_overflowing_joint_axis() {
         let (numeric, cat_high, y) = overflow_fixture();
@@ -2127,8 +2121,7 @@ mod cat_channels_fit_path_tests {
         .expect("CV prune-select must succeed on the overflowing feature");
         assert!(reports.iter().any(Option::is_some));
 
-        // STEP 2: apply_keepset (deploy) -- keep every realized support, `rebalance: false`
-        // (see the KNOWN GAP doc above).
+        // STEP 2: apply_keepset (deploy) -- keep every realized support.
         let binned = serve_binned_for_model(
             &model,
             std::slice::from_ref(&numeric),
@@ -2152,6 +2145,40 @@ mod cat_channels_fit_path_tests {
 
         let keep: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
         let w = vec![1.0_f32; n2];
+        let (rebalanced, _, _, report) = t_boost_core::prune::prune_model_to_keepset_budgeted(
+            &model,
+            &serve,
+            &y,
+            &w,
+            None,
+            &SquaredError,
+            RefMeasure::Uniform,
+            false, // reanchor
+            &keep,
+            true, // rebalance
+            0,
+            0,
+            DEFAULT_TABLE_MIN_ARITY,
+            &BTreeMap::new(),
+        )
+        .expect("the rebalanced deploy must succeed on the overflowing feature");
+        rebalanced.validate().unwrap();
+        let report = report.unwrap();
+        let touches_cat = |u: &FeatureSet| u.0.iter().any(|f| f.0 == 1);
+        assert_eq!(
+            report.excluded,
+            keep.iter()
+                .filter(|u| u.order() <= 2 && touches_cat(u))
+                .cloned()
+                .collect::<Vec<_>>(),
+            "every main or pair on the multi-channel categorical is left as fitted"
+        );
+        assert_eq!(
+            report.supports,
+            keep.iter()
+                .filter(|u| u.order() <= 2 && !touches_cat(u))
+                .count() as u64
+        );
         let tm = t_boost_core::prune::prune_model_to_keepset(
             &model,
             &serve,
@@ -2162,7 +2189,7 @@ mod cat_channels_fit_path_tests {
             RefMeasure::Uniform,
             false, // reanchor
             &keep,
-            true, // rebalance -- exercises the multi-channel skip end to end (bug #5 follow-up)
+            false, // rebalance
         )
         .expect("apply_keepset (prune_model_to_keepset) must succeed on the overflowing feature");
         tm.validate().unwrap();
@@ -2245,16 +2272,15 @@ mod cat_channels_fit_path_tests {
         }
     }
 
-    /// Proves the multi-channel skip is correctly SCOPED: a single-channel (no `cat_channels`
-    /// at all) model with `rebalance: true` must still actually rebalance -- no regression to
-    /// the normal, pre-bug-#5 path. Fits a genuine `x0 * x1` interaction, then prunes down to
+    /// A single-channel (no `cat_channels` at all) model with `rebalance: true` actually
+    /// rebalances. Fits a genuine `x0 * x1` interaction, then prunes down to
     /// ONLY the two main-effect (order-1) tables, dropping the pair entirely -- this leaves a
     /// clear, consistent residual (the discarded interaction's own marginal projection) that a
     /// per-cell ridge correction can partially recover, so `rebalance: true`'s no-harm guard
     /// should adopt the correction and the deployed table VALUES must differ from the
     /// `rebalance: false` bank.
     #[test]
-    fn single_channel_rebalance_is_unaffected_by_the_multichannel_skip() {
+    fn rebalance_recovers_part_of_a_dropped_interaction() {
         let n = 200;
         let x0: Vec<f32> = (0..n).map(|i| (i % 10) as f32).collect();
         let x1: Vec<f32> = (0..n).map(|i| ((i / 10) % 10) as f32).collect();
@@ -2366,38 +2392,61 @@ mod cat_channels_fit_path_tests {
             .collect();
         assert_ne!(
             values_off, values_on,
-            "rebalance:true must actually change the deployed table values for a \
-             single-channel model (dropping a genuine interaction leaves recoverable residual \
-             structure) -- if these are equal, rebalance silently didn't run, which would be a \
-             regression from the multi-channel skip, not a correct no-harm rejection"
+            "rebalance:true must actually change the deployed table values (dropping a \
+             genuine interaction leaves recoverable residual structure) -- if these are equal, \
+             rebalance silently didn't run"
         );
     }
 
-    /// THE regression test for the green-spine bug the skip closes: a multi-channel raw
-    /// feature (raw 0, axes 0-1, mean+count admitted) FOLLOWED by another raw feature (raw 1,
-    /// axis 2 -- a single-channel categorical, deliberately kept low-cardinality so it is NOT
-    /// admitted for a count channel of its own). `fit_model_ambient` numbers numeric columns
-    /// before categorical ones, so with NO numeric columns here, `cat_x`'s ORDER alone
-    /// controls which categorical is raw 0 vs raw 1 -- `cat_high` (admitted) is passed first,
-    /// giving it axes 0-1, so `cat_low` (raw 1, not admitted) ends up at axis 2, strictly
-    /// AFTER the multi-channel feature -- exactly the green-spine failure mode. If
-    /// `correction_scaffold`'s raw-id-as-axis-id bug ever ran, it would resolve raw 1's
-    /// supposed "axis 1" as raw 0's OWN second (count) channel instead of raw 1's real axis
-    /// (2) -- silently building the correction against the wrong column entirely, which
-    /// cannot possibly reconstruct the ensemble's actual prediction. `rebalance: true` here
-    /// must be silently skipped (this model has a multi-channel raw feature, so the
-    /// WHOLE-MODEL skip applies) -- if it were not skipped, or skipped only by checking raw 0
-    /// itself rather than the whole model, this test would fail on the buggy path.
+    /// Deploy `keep` with and without the rebalance, returning both banks and the report.
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: a test helper over the keep-set call.
+    fn deploy_both_ways(
+        model: &Model,
+        serve: &ServeBinnedMatrix,
+        y: &[f32],
+        keep: &[FeatureSet],
+    ) -> (TableModel, TableModel, t_boost_core::prune::RebalanceReport) {
+        let w = vec![1.0_f32; y.len()];
+        let deploy = |rebalance: bool| {
+            t_boost_core::prune::prune_model_to_keepset_budgeted(
+                model,
+                serve,
+                y,
+                &w,
+                None,
+                &SquaredError,
+                RefMeasure::Uniform,
+                false,
+                keep,
+                rebalance,
+                0,
+                0,
+                DEFAULT_TABLE_MIN_ARITY,
+                &BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let (on, _, _, report) = deploy(true);
+        let (off, _, _, none) = deploy(false);
+        assert!(none.is_none(), "no rebalance, no report");
+        on.validate().unwrap();
+        (on, off, report.unwrap())
+    }
+
+    /// Bug #5, end to end: a multi-channel raw feature (raw 0, axes 0-1, mean+count admitted)
+    /// FOLLOWED by a single-channel one (raw 1, axis 2 -- kept low-cardinality so it is NOT
+    /// admitted for a count channel of its own). With no numeric columns, `cat_x`'s order alone
+    /// fixes which categorical is raw 0. Reading raw 1's id as an axis id would re-solve raw 0's
+    /// count channel; the rebalance must instead re-solve raw 1 on its own axis and leave
+    /// raw 0's table exactly as fitted.
     #[test]
-    fn rebalance_skip_prevents_the_green_spine_misscore_for_a_feature_after_multichannel() {
+    fn rebalance_resolves_a_feature_after_a_multichannel_one_to_its_own_axis() {
         let n = 80;
         let cat_high: Vec<String> = (0..n).map(|i| format!("h{}", i % 8)).collect();
         // 3 distinct levels -- below the admission threshold (5) below, so this stays
         // single-channel, at whatever axis it ends up positioned at.
         let cat_low: Vec<String> = (0..n).map(|i| format!("l{}", i % 3)).collect();
-        // y depends on BOTH raw features (so both survive pruning as their own order-1 kept
-        // support) but additively, so this is purely about the axis-id bug, not about an
-        // interaction rebalance might legitimately need to recover.
+        // y depends on BOTH raw features (so both survive as their own order-1 table), additively.
         const HIGH_TARGET: [f32; 8] = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0];
         const LOW_TARGET: [f32; 3] = [0.0, 10.0, 20.0];
         let y: Vec<f32> = (0..n)
@@ -2419,19 +2468,11 @@ mod cat_channels_fit_path_tests {
             None,
         )
         .unwrap();
-        // raw 0 = cat_high, mean+count (axes 0-1); raw 1 = cat_low, single-channel (axis 2) --
-        // confirm the actual layout matches what this test needs (a multi-channel raw feature
-        // strictly followed by another one) via the exact same check the fix's own skip uses.
-        assert!(
-            model.provenance.len() > t_boost_core::data::n_raw_features(&model.provenance),
-            "fixture must have a genuine multi-channel raw feature"
-        );
         assert_eq!(
             model.provenance.len(),
             3,
             "cat_high: 2 axes, cat_low: 1 axis"
         );
-
         let binned = serve_binned_for_model(&model, &[], Some(&[cat_high, cat_low])).unwrap();
         let serve = ServeBinnedMatrix(binned);
         let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
@@ -2441,78 +2482,38 @@ mod cat_channels_fit_path_tests {
             2,
             "both raw features must survive as their own order-1 effect"
         );
-        let w = vec![1.0_f32; n];
-        let tm = t_boost_core::prune::prune_model_to_keepset(
-            &model,
-            &serve,
-            &y,
-            &w,
-            None,
-            &SquaredError,
-            RefMeasure::Uniform,
-            false,
-            &keep,
-            true, // rebalance requested -- must be silently skipped, not silently wrong
-        )
-        .expect("must not crash");
 
-        let tol = t_boost_core::explain::ExactTol::for_model(&model).recon_tol;
-        let ensemble_preds = model.predict(&serve.0, None).unwrap();
-        let tm_preds = tm.predict_binned(&serve.0, None).unwrap();
-        for (e, t) in ensemble_preds.iter().zip(&tm_preds) {
-            assert!(
-                (f64::from(*e) - f64::from(*t)).abs() < tol,
-                "deployed predict must equal the ensemble ({e} vs {t}) -- it CANNOT if the \
-                 raw-id-as-axis-id bug ran and built a correction against the wrong axis"
-            );
-        }
+        let (on, off, report) = deploy_both_ways(&model, &serve, &y, &keep);
+        assert_eq!(report.supports, 1, "raw 1 is re-solved");
+        assert_eq!(report.excluded, vec![FeatureSet::new(&[0])]);
+        let table = |tm: &TableModel, raw: u32| {
+            tm.bank
+                .tables
+                .iter()
+                .find(|t| t.u == FeatureSet::new(&[raw]))
+                .map(|t| t.values.try_values().unwrap().into_owned())
+                .unwrap()
+        };
+        assert_eq!(
+            table(&on, 0),
+            table(&off, 0),
+            "raw 0 is left as fitted: a correction read off its count channel would move it"
+        );
     }
 
-    /// The PURELY SILENT variant of the test above, and the reason the fix checks the WHOLE
-    /// model rather than just `keep`'s own contents. With only 2 raw features (the test
-    /// above), the misinterpreted axis id always lands back on some part of the SAME
-    /// multi-channel feature (still joint, so the guard still fires loudly) -- confirmed by
-    /// temporarily disabling the fix and re-running that test with `keep` restricted to raw 1
-    /// alone: it STILL crashed via the guard, not a silent wrong number, because raw 1's id
-    /// (1) resolves to axis 1, which belongs to raw 0 (the multi-channel feature) either way.
-    /// A TRULY silent misscore (no crash, just a wrong number) needs the misinterpreted axis
-    /// to land on a DIFFERENT single-channel raw feature -- which needs a multi-channel
-    /// feature followed by at least TWO more single-channel features, only the LATER of which
-    /// is kept: raw 0 (numeric), raw 1 (multi-channel, axes 1-2), raw 2 (single-channel, axis
-    /// 3), raw 3 (single-channel, axis 4) -- with ONLY raw 3 kept (raw 1 never appears in
-    /// `supports` at all), raw 3's id (3) misinterpreted as axis 3 resolves to raw 2 --
-    /// single-channel, so the guard never fires.
-    ///
-    /// ORACLE, take 2: an earlier draft compared this `rebalance:true` bank directly against a
-    /// `rebalance:false` run on the same keep-set, expecting `assert_eq!`. That does NOT
-    /// reliably discriminate on this fixture: re-running it with the fix disabled and
-    /// `TBOOST_PROFILE=1` shows the misrouted correction (built against raw 2's REAL cells --
-    /// axis 3 really is raw 2's column in `serve`, so the ridge fit itself is internally
-    /// consistent, just aimed at the wrong raw feature) gets REJECTED by the no-harm guard on
-    /// its own merits: `base_dev=20407.55078 corr_dev=20415.32617 -> fall back`. So the two
-    /// banks come back identical EITHER WAY here -- the guard's independent data-dependent
-    /// adopt/reject decision can mask whether the whole-model skip fired at all, which makes a
-    /// plain value comparison meaningless (a prior version of this comment claimed the values
-    /// came back different under the same conditions; that was not reproducible and has been
-    /// corrected after re-verifying directly).
-    ///
-    /// So instead: `y`/`w` are passed ONE ROW LONGER than `serve`'s row count. With
-    /// `reanchor=false`, `prune_model_to_keepset` never reads `y`/`w` at all except inside
-    /// `rebalance_kept_cells` (reached only when `rebalance=true`) -- so if the whole-model
-    /// skip fires (returning `base` before `y`/`w` are ever touched), the mismatched length is
-    /// irrelevant and this succeeds. If the skip is missing, execution reaches
-    /// `loss.grad_hess(y, ..)`, whose OWN shape check (`y.len() != raw.len()`) turns that
-    /// reintroduction into an immediate, unconditional `ShapeMismatch` error: a hard failure
-    /// the no-harm guard's adoption dynamics cannot mask, unlike a plain value comparison.
+    /// The silent variant: a multi-channel feature followed by TWO single-channel ones, only
+    /// the later of which is kept -- raw 0 (numeric, axis 0), raw 1 (mean+count, axes 1-2),
+    /// raw 2 (axis 3), raw 3 (axis 4). Read as an axis id, raw 3's id resolves to raw 2's
+    /// column, a different single-channel feature, so nothing would crash. The rebalance must
+    /// re-solve raw 3 alone, and every deployed table must stay inside the keep-set (a
+    /// correction aimed at raw 2 would add a raw-2 table).
     #[test]
-    fn rebalance_skip_prevents_the_purely_silent_variant_two_features_after_multichannel() {
+    fn rebalance_resolves_a_feature_two_after_a_multichannel_one_to_its_own_axis() {
         let n = 288;
         let numeric: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect();
         let cat1: Vec<String> = (0..n).map(|i| format!("h{}", i % 8)).collect();
-        // cat2 cycles on `i % 3`, cat3 on `(i / 3) % 3` -- independent periods (not both `i %
-        // 3`, which would make them perfectly collinear and let the booster capture the
-        // whole target via cat2 alone, never touching cat3 at all -- the first draft's bug,
-        // confirmed empirically: raw 3 never appeared as a realized table).
+        // cat2 cycles on `i % 3`, cat3 on `(i / 3) % 3`: independent periods, so the booster
+        // needs both (both `i % 3` would let cat2 carry the whole target).
         let cat2: Vec<String> = (0..n).map(|i| format!("l{}", i % 3)).collect();
         let cat3: Vec<String> = (0..n).map(|i| format!("m{}", (i / 3) % 3)).collect();
         const CAT2_TARGET: [f32; 3] = [0.0, 1.0, 2.0];
@@ -2536,11 +2537,7 @@ mod cat_channels_fit_path_tests {
             None,
         )
         .unwrap();
-        // raw 0 = numeric (axis 0); raw 1 = cat1, mean+count (axes 1-2); raw 2 = cat2, single
-        // (axis 3); raw 3 = cat3, single (axis 4).
         assert_eq!(model.provenance.len(), 5);
-        assert!(model.provenance.len() > t_boost_core::data::n_raw_features(&model.provenance));
-
         let binned = serve_binned_for_model(
             &model,
             std::slice::from_ref(&numeric),
@@ -2549,10 +2546,7 @@ mod cat_channels_fit_path_tests {
         .unwrap();
         let serve = ServeBinnedMatrix(binned);
         let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
-        // Keep ONLY raw 3's own order-1 table -- raw 0, raw 1, and raw 2 are all pruned away,
-        // so raw 1 (the actual multi-channel feature) never appears in `supports` at all; if
-        // the fix checked only `keep`'s own contents for multi-channel-ness, this case would
-        // slip through the skip entirely.
+        // Keep ONLY raw 3's own order-1 table: the multi-channel raw 1 is not kept at all.
         let keep: Vec<FeatureSet> = bank
             .tables
             .iter()
@@ -2565,26 +2559,10 @@ mod cat_channels_fit_path_tests {
             "raw 3 must have survived as its own order-1 effect"
         );
 
-        // Tripwire: y/w one row longer than serve's row count -- see the doc comment above.
-        let bad_y = vec![0.0_f32; n + 1];
-        let bad_w = vec![1.0_f32; n + 1];
-        t_boost_core::prune::prune_model_to_keepset(
-            &model,
-            &serve,
-            &bad_y,
-            &bad_w,
-            None,
-            &SquaredError,
-            RefMeasure::Uniform,
-            false,
-            &keep,
-            true, // rebalance requested -- must be skipped (whole-model, not per-feature)
-                  // before bad_y/bad_w are ever read, since raw 1 alone isn't even in `keep`
-        )
-        .expect(
-            "multi-channel model: the whole-model skip must return before rebalance_kept_cells \
-             ever reads the mismatched-length y/w via grad_hess",
-        );
+        let (on, _, report) = deploy_both_ways(&model, &serve, &y, &keep);
+        assert_eq!(report.supports, 1);
+        assert!(report.excluded.is_empty());
+        assert!(on.bank.tables.iter().all(|t| keep.contains(&t.u)));
     }
 
     /// Shared body for the bug #6 test-coverage-gap fix: a poisson/gamma multi-channel
@@ -5391,7 +5369,8 @@ impl PyModel {
     }
 
     /// [`apply_keepset`](Self::apply_keepset) with a DEPLOYED-BOX BUDGET, returning
-    /// `(table_model, box_budget_report_json)`.
+    /// `(table_model, box_budget_report_json, table_budget_report_json, rebalance_report_json)`
+    /// (the last `None` without `rebalance`).
     ///
     /// `box_budget` is the total rank-1 boxes the deployed bank may carry (`0` disables it and
     /// makes this method bit-identical to `apply_keepset`). `box_rank` supplies the held-out
@@ -5422,7 +5401,7 @@ impl PyModel {
         cat_x: Option<Vec<Vec<String>>>,
         table_budget: usize,
         table_min_arity: u8,
-    ) -> PyResult<(PyTableModel, String, String)> {
+    ) -> PyResult<(PyTableModel, String, String, Option<String>)> {
         let columns = raw_columns_from_array(x)?;
         let y_vec = y
             .as_slice()
@@ -5455,7 +5434,7 @@ impl PyModel {
             .collect();
         let model = Arc::clone(&self.model);
         let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let (tm, report, table_report) = py
+        let (tm, report, table_report, rebalance_report) = py
             .detach(move || {
                 let binned = serve_binned_for_model(&model, &columns, cat_x.as_deref())?;
                 let serve = ServeBinnedMatrix(binned);
@@ -5498,6 +5477,10 @@ impl PyModel {
                 "table budget report: {err}"
             )))
         })?;
+        let rebalance_json = rebalance_report
+            .map(|r| serde_json::to_string(&r))
+            .transpose()
+            .map_err(|err| py_err(PbError::Serialization(format!("rebalance report: {err}"))))?;
         Ok((
             PyTableModel {
                 model: Arc::new(tm),
@@ -5505,6 +5488,7 @@ impl PyModel {
             },
             report_json,
             table_report_json,
+            rebalance_json,
         ))
     }
 
@@ -8901,133 +8885,18 @@ fn fit_multiclass_pruned_owned(
                 bag_groups.clone(),
             )
         };
-        let mut ranked_used = false;
-        let (mut report, deploy_model, selection_json): (
-            PruneReport,
-            MultiClassModel,
-            Option<serde_json::Value>,
-        ) = if ranked_path {
-            // RANKED PATH: one deploy fit, supports ranked by purified variance under heredity,
-            // prefixes scored on the per-class out-of-bag juries, the minimum deployed. No fold
-            // CV, no guard (see `multiclass_ranked_path`).
-            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
+        // The CV fold vote over the deploy fit's realized supports: one fold refit per fold,
+        // walked on its held-out rows, aggregated by `aggregate_prune_selection`.
+        let fold_vote = |deploy_model: &MultiClassModel,
+                         full_supports: &[(FeatureSet, f64)],
+                         fold_of: &[i64]|
+         -> Result<(PruneReport, serde_json::Value), PbError> {
             let deploy_first = deploy_model
                 .classes
                 .first()
                 .ok_or_else(|| PbError::Internal {
                     what: "multiclass deploy fit produced no classes".into(),
                 })?;
-            let serve = ServeBinnedMatrix(serve_binned_for_model(
-                deploy_first,
-                &columns,
-                cat_x.as_deref(),
-            )?);
-            let supports = mc_stage("deploy_supports", || {
-                multiclass_realized_supports(&deploy_model, &serve, w_measure.clone(), &full_weight)
-            })?;
-            let sel = mc_stage("ranked_path", || {
-                multiclass_ranked_path(
-                    &deploy_model,
-                    &serve,
-                    &labels,
-                    &full_weight,
-                    w_measure.clone(),
-                    &supports,
-                    path_steps,
-                    path_fraction,
-                    path_tolerance,
-                    prune_guard_min_rows,
-                    prune_main_effects,
-                )
-            })?;
-            drop(serve);
-            let (keep, path_json) = match sel {
-                Some((keep, path)) => {
-                    // The variance-share floor, after the path's cutoff
-                    // (`prune_min_variance_share`). A skipped path keeps the full bank, floor
-                    // included, as the single-output path does and `binding_report_` says.
-                    let (keep, dropped_low) = t_boost_core::prune::drop_low_share(
-                        &keep,
-                        &supports,
-                        path_min_share,
-                        prune_main_effects,
-                    );
-                    let mut path_json = serde_json::to_value(&path).map_err(|err| {
-                        PbError::Serialization(format!("could not serialize path report: {err}"))
-                    })?;
-                    if let Some(obj) = path_json.as_object_mut() {
-                        obj.insert(
-                            "min_variance_share".into(),
-                            serde_json::json!(path_min_share),
-                        );
-                        obj.insert(
-                            "dropped_low_share".into(),
-                            serde_json::to_value(&dropped_low).map_err(|err| {
-                                PbError::Serialization(format!(
-                                    "could not serialize dropped tables: {err}"
-                                ))
-                            })?,
-                        );
-                    }
-                    (keep, path_json)
-                }
-                None => (
-                    supports.iter().map(|(u, _)| u.clone()).collect(),
-                    serde_json::json!({ "skipped": "no out-of-bag evidence: full bank kept" }),
-                ),
-            };
-            ranked_used = true;
-            let kept_set: std::collections::BTreeSet<FeatureSet> = keep.iter().cloned().collect();
-            let table_scores: Vec<PruneTableScore> = supports
-                .iter()
-                .map(|(u, v)| PruneTableScore {
-                    u: u.clone(),
-                    order: u8::try_from(u.order()).unwrap_or(u8::MAX),
-                    mean_gain: *v,
-                    se_gain: 0.0,
-                    variance: *v,
-                    sticky: cfg.is_sticky(u),
-                    selected: kept_set.contains(u),
-                })
-                .collect();
-            let effective_order =
-                u8::try_from(keep.iter().map(FeatureSet::order).max().unwrap_or(0))
-                    .unwrap_or(u8::MAX);
-            (
-                PruneReport {
-                    kept: keep,
-                    dropped: Vec::new(),
-                    effective_order,
-                    path: Vec::new(),
-                    table_scores,
-                    delta_vs_full: 0.0,
-                },
-                deploy_model,
-                Some(path_json),
-            )
-        } else if let Some(fold_of) = fold_of.as_deref() {
-            // ---- CV selection: deploy first, its realized supports are the candidates.
-            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
-            let deploy_first = deploy_model
-                .classes
-                .first()
-                .ok_or_else(|| PbError::Internal {
-                    what: "multiclass deploy fit produced no classes".into(),
-                })?;
-            let deploy_serve = ServeBinnedMatrix(serve_binned_for_model(
-                deploy_first,
-                &columns,
-                cat_x.as_deref(),
-            )?);
-            let full_supports = mc_stage("deploy_supports", || {
-                multiclass_realized_supports(
-                    &deploy_model,
-                    &deploy_serve,
-                    w_measure.clone(),
-                    &full_weight,
-                )
-            })?;
-            drop(deploy_serve);
             let full_ids: Vec<Vec<u32>> = full_supports
                 .iter()
                 .map(|(u, _)| feature_set_ids(u))
@@ -9186,9 +9055,11 @@ fn fit_multiclass_pruned_owned(
             let sel_value: serde_json::Value = serde_json::from_str(&sel_json).map_err(|err| {
                 PbError::Serialization(format!("could not parse selection report: {err}"))
             })?;
-            (report, deploy_model, Some(sel_value))
-        } else {
-            // ---- Legacy split selection.
+            Ok((report, sel_value))
+        };
+        // The legacy single train/select split (`multiclass_prune_cv=False`): one selection fit
+        // on the complement of `sel_rows`, walked on that slice.
+        let split_walk = || -> Result<PruneReport, PbError> {
             let train_rows: Vec<usize> = is_selected
                 .iter()
                 .enumerate()
@@ -9260,6 +9131,122 @@ fn fit_multiclass_pruned_owned(
             )?;
             drop(sel_serve);
             drop(sel_model);
+            Ok(report)
+        };
+        let mut ranked_used = false;
+        let (mut report, deploy_model, selection_json): (
+            PruneReport,
+            MultiClassModel,
+            Option<serde_json::Value>,
+        ) = if ranked_path || cv {
+            // Deploy first: its realized supports are the candidates of either selector.
+            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
+            let deploy_first = deploy_model
+                .classes
+                .first()
+                .ok_or_else(|| PbError::Internal {
+                    what: "multiclass deploy fit produced no classes".into(),
+                })?;
+            let serve = ServeBinnedMatrix(serve_binned_for_model(
+                deploy_first,
+                &columns,
+                cat_x.as_deref(),
+            )?);
+            let supports = mc_stage("deploy_supports", || {
+                multiclass_realized_supports(&deploy_model, &serve, w_measure.clone(), &full_weight)
+            })?;
+            // RANKED PATH: supports ranked by purified variance under heredity, prefixes scored
+            // on the per-class out-of-bag juries, the minimum deployed (see
+            // `multiclass_ranked_path`). Without an out-of-bag jury it returns `None` and the fit
+            // falls back to the fold vote, as the single-output path does.
+            let sel = if !ranked_path {
+                None
+            } else {
+                mc_stage("ranked_path", || {
+                    multiclass_ranked_path(
+                        &deploy_model,
+                        &serve,
+                        &labels,
+                        &full_weight,
+                        w_measure.clone(),
+                        &supports,
+                        path_steps,
+                        path_fraction,
+                        path_tolerance,
+                        prune_guard_min_rows,
+                        prune_main_effects,
+                    )
+                })?
+            };
+            drop(serve);
+            match sel {
+                None => match fold_of.as_deref() {
+                    Some(fold_of) => {
+                        let (report, sel_value) = fold_vote(&deploy_model, &supports, fold_of)?;
+                        (report, deploy_model, Some(sel_value))
+                    }
+                    None => (split_walk()?, deploy_model, None),
+                },
+                Some((keep, path)) => {
+                    // The variance-share floor, after the path's cutoff (`prune_min_variance_share`).
+                    let (keep, dropped_low) = t_boost_core::prune::drop_low_share(
+                        &keep,
+                        &supports,
+                        path_min_share,
+                        prune_main_effects,
+                    );
+                    let mut path_json = serde_json::to_value(&path).map_err(|err| {
+                        PbError::Serialization(format!("could not serialize path report: {err}"))
+                    })?;
+                    if let Some(obj) = path_json.as_object_mut() {
+                        obj.insert(
+                            "min_variance_share".into(),
+                            serde_json::json!(path_min_share),
+                        );
+                        obj.insert(
+                            "dropped_low_share".into(),
+                            serde_json::to_value(&dropped_low).map_err(|err| {
+                                PbError::Serialization(format!(
+                                    "could not serialize dropped tables: {err}"
+                                ))
+                            })?,
+                        );
+                    }
+                    ranked_used = true;
+                    let kept_set: std::collections::BTreeSet<FeatureSet> =
+                        keep.iter().cloned().collect();
+                    let table_scores: Vec<PruneTableScore> = supports
+                        .iter()
+                        .map(|(u, v)| PruneTableScore {
+                            u: u.clone(),
+                            order: u8::try_from(u.order()).unwrap_or(u8::MAX),
+                            mean_gain: *v,
+                            se_gain: 0.0,
+                            variance: *v,
+                            sticky: cfg.is_sticky(u),
+                            selected: kept_set.contains(u),
+                        })
+                        .collect();
+                    let effective_order =
+                        u8::try_from(keep.iter().map(FeatureSet::order).max().unwrap_or(0))
+                            .unwrap_or(u8::MAX);
+                    (
+                        PruneReport {
+                            kept: keep,
+                            dropped: Vec::new(),
+                            effective_order,
+                            path: Vec::new(),
+                            table_scores,
+                            delta_vs_full: 0.0,
+                        },
+                        deploy_model,
+                        Some(path_json),
+                    )
+                }
+            }
+        } else {
+            // ---- Legacy split selection, then the deploy fit.
+            let report = split_walk()?;
             let deploy_model = fit_deploy(state.clone())?;
             (report, deploy_model, None)
         };
@@ -9294,7 +9281,7 @@ fn fit_multiclass_pruned_owned(
         })?;
         // BANDING (see `band_multiclass_table_model`): after the keep-set, before the report.
         let (table_model, banding_reports) = match band_tolerance {
-            Some(tol) if multiclass_bag_oob_evidence_available(&deploy_model) => {
+            Some(tol) => {
                 let (tm, reps) = mc_stage("banding", || {
                     band_multiclass_table_model(
                         &table_model,
@@ -9771,7 +9758,8 @@ fn class_labels_from_array(y: &PyReadonlyArray1<'_, f32>, n_classes: usize) -> P
 
 /// Band every class bank of a multiclass tables model (see `t_boost_core::banding`). Each class is
 /// banded on its own softmax curvature `w · p_k (1 - p_k)`, its own logits as the distil target and
-/// its own bag noise (the deploy soup's class-`k` bags restricted to the keep-set).
+/// its own bag noise (the deploy soup's class-`k` bags restricted to the keep-set; with one bag,
+/// the deviance cap alone bounds the banding).
 #[allow(clippy::too_many_arguments)] // JUSTIFIED: the multiclass deploy stage's own inputs (§12.2).
 fn band_multiclass_table_model(
     tm: &MultiClassTableModel,
@@ -9875,26 +9863,34 @@ fn band_multiclass_table_model(
             .collect();
         let mck = mc.classes.get(k).ok_or_else(|| no_class(k))?;
         let tmk = tm.classes.get(k).ok_or_else(|| no_class(k))?;
-        let var = mc_stage("banding.bag_variance", || {
-            t_boost_core::prune::bag_score_variance_for_rows(
-                mck,
-                serve,
-                w_measure.clone(),
-                bag_mass.as_deref(),
-                keep,
-                &all_rows,
-            )
-        })?;
-        let b = mck.bag_spans.as_ref().map_or(2, Vec::len).max(2) as f64;
         let hs: f64 = h.iter().sum();
-        let num: f64 = h.iter().zip(&var).map(|(&hi, &vi)| hi * vi / b).sum();
+        // One bag has no spread to measure its noise by: the deviance cap alone bounds the
+        // banding.
+        let sigma = match mck.bag_spans.as_ref().map(Vec::len) {
+            Some(n_bags) if n_bags >= 2 => {
+                let var = mc_stage("banding.bag_variance", || {
+                    t_boost_core::prune::bag_score_variance_for_rows(
+                        mck,
+                        serve,
+                        w_measure.clone(),
+                        bag_mass.as_deref(),
+                        keep,
+                        &all_rows,
+                    )
+                })?;
+                let b = n_bags as f64;
+                let num: f64 = h.iter().zip(&var).map(|(&hi, &vi)| hi * vi / b).sum();
+                (num / hs.max(f64::MIN_POSITIVE)).sqrt()
+            }
+            _ => f64::INFINITY,
+        };
         let cells = mc_stage("banding.class_cells", || class_cells(tmk))?;
         let rows = t_boost_core::banding::BandingRows {
             cells: &cells,
             h: &h,
             mass: &mass,
             target: lk,
-            sigma: (num / hs.max(f64::MIN_POSITIVE)).sqrt(),
+            sigma,
             // the class's share of the deviance cap (expected increase Σ h δ² / Σ w per class)
             mse_cap: deviance_cap * dev_mean * ws / (hs.max(f64::MIN_POSITIVE) * k_classes as f64),
         };

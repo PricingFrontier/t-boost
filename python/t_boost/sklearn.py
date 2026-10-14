@@ -525,7 +525,7 @@ def _resolve_min_data_in_leaf(value: int | None, max_depth: int) -> int:
 # neutral-or-better at k=5, so nothing above that changes.
 _MIN_PRUNE_FOLD_ROWS = 125
 # Minimum out-of-bag-covered rows the ranked path needs to score its prefixes: below this the
-# path's deviances are noise, and the fit falls back to the fold vote (K>=3: keeps the full bank).
+# path's deviances are noise, and the fit falls back to the fold vote.
 # The name dates from the set-level guard that used it first (removed 2026-10-14).
 _PRUNE_GUARD_MIN_ROWS = 500
 
@@ -2451,9 +2451,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                              if multiclass or not n.startswith("multiclass_")),
                        "the ranked path selected the tables, so the fold vote this knob tunes "
                        "did not run", "prune_selector")
-            if "skipped" in (rep.get("selection") or {}):
-                add_unread(_RANKED_PATH_KNOBS, "the fit had no out-of-bag rows to score the "
-                           "path on, so the full table bank was kept", None)
         elif pruning_on and fold_vote:
             if getattr(self, "prune_selector", None) == "fold_vote":
                 add_unread(_RANKED_PATH_KNOBS, "prune_selector='fold_vote', so the ranked path "
@@ -4222,7 +4219,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                   if expo_full is not None else 0.0)
         h = _band_curvature(obj, target + offset, w, self.tweedie_rho)
         mass = w * (np.asarray(expo_full, dtype=np.float64) if expo_full is not None else 1.0)
-        try:
+        # One bag has no spread to measure its noise by: the deviance cap alone bounds the
+        # banding (sigma = inf).
+        sigma = float("inf")
+        if bool(full_model.bag_oob_available()):
             # Each bag's bank is purified under the same row mass (weight x exposure) as every
             # other fit-time bank, so the noise is measured on the tables that actually ship.
             var, n_bags = full_model.bag_score_variance(
@@ -4231,15 +4231,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 weight=np.ascontiguousarray(w_full), exposure=expo_full,
                 **self._measure_kwargs(),
             )
-        except ValueError as exc:
-            # No per-bag replicates to measure noise against (e.g. a model without its bag
-            # partition; a §G1 cell-corrected soup is fine, see `bag_score_variance`): ship the
-            # unbanded tables and say so.
-            if isinstance(getattr(self, "pruning_report_", None), dict):
-                self.pruning_report_["banding"] = {"skipped": f"no bag noise estimate: {exc}"}
-            return table_model
-        s2 = np.asarray(var, dtype=np.float64) / max(int(n_bags), 1)
-        sigma = float(np.sqrt(np.sum(h * s2) / max(np.sum(h), 1e-300)))
+            s2 = np.asarray(var, dtype=np.float64) / max(int(n_bags), 1)
+            sigma = float(np.sqrt(np.sum(h * s2) / max(np.sum(h), 1e-300)))
         seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
         # expected deviance increase of a move δ is Σ h δ² / Σ w (deviance = 2·NLL, h = NLL
         # curvature), so capping it at `band_deviance_cap` of the mean deviance caps the MSE at:
@@ -4247,6 +4240,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         cap_frac = float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT))
         mse_cap = (cap_frac * dev_mean * float(np.sum(w)) / max(float(np.sum(h)), 1e-300)
                    if np.isfinite(dev_mean) and cap_frac > 0 else float("inf"))
+        if not (np.isfinite(sigma) or np.isfinite(mse_cap)):
+            if isinstance(getattr(self, "pruning_report_", None), dict):
+                self.pruning_report_["banding"] = {
+                    "skipped": "one bag and band_deviance_cap=0: nothing bounds the banding"}
+            return table_model
         banded, report_json = table_model.band(
             x32, np.ascontiguousarray(h), np.ascontiguousarray(mass), np.ascontiguousarray(target),
             sigma, tolerance=tolerance, cat_x=cat_x, seed=seed, n_jobs=n_jobs, mse_cap=mse_cap,
@@ -4512,13 +4510,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # the last one a tight budget gives up. Supports the folds never scored rank at 0.0,
         # below every positively-evidenced support and above every harmful one. It is applied
         # natively, inside the keep-set application, because that is the only place the
-        # deployed bank's per-support BOX cost is known exactly; a budget of 0 never calls the
-        # budgeted binding at all, so an unbudgeted fit cannot be perturbed by this code.
+        # deployed bank's per-support BOX cost is known exactly; a budget of 0 is a no-op, so
+        # an unbudgeted fit deploys exactly the keep-set it selected.
         box_budget = max(0, int(getattr(self, "prune_box_budget", 0) or 0))
         # --- DEPLOYED MULTI-WAY TABLE BUDGET (2026-08-27) --------------------------------
         # Ralph's revised bar: cells within a table are free, the COUNT of >=3-way tables is
         # not. Same evidence ranking and the same binary dropping as the box budget, applied in
-        # the same place and composed after it; a budget of 0 never calls the budgeted binding.
+        # the same place and composed after it; a budget of 0 is a no-op.
         table_budget = max(0, int(getattr(self, "prune_table_budget", 0) or 0))
         table_min_arity = int(
             getattr(self, "prune_table_min_arity", _PRUNE_TABLE_MIN_ARITY_DEFAULT)
@@ -4533,8 +4531,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 except (KeyError, TypeError, ValueError):
                     continue
 
-        if box_budget > 0 or table_budget > 0:
-            table_model, box_report, table_report = full_model.apply_keepset_budgeted(
+        table_model, box_report, table_report, rebalance_report = (
+            full_model.apply_keepset_budgeted(
                 x32,  # see fit() call above
                 np.ascontiguousarray(y32),
                 np.ascontiguousarray(w_full),
@@ -4550,25 +4548,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 table_min_arity=table_min_arity,
                 **self._measure_kwargs(),
             )
-            if box_budget > 0:
-                self.pruning_report_["box_budget"] = json.loads(box_report)
-            if table_budget > 0:
-                self.pruning_report_["table_budget"] = json.loads(table_report)
-        else:
-            table_model = full_model.apply_keepset(
-                x32,  # see fit() call above
-                np.ascontiguousarray(y32),
-                np.ascontiguousarray(w_full),
-                keep,
-                reanchor=reanchor,
-                rebalance=bool(self.prune_rebalance),
-                n_jobs=self._resolve_n_jobs(),
-                exposure=expo_full,
-                cat_x=cat_x,
-                **self._measure_kwargs(),
-            )
+        )
+        if box_budget > 0:
+            self.pruning_report_["box_budget"] = json.loads(box_report)
+        if table_budget > 0:
+            self.pruning_report_["table_budget"] = json.loads(table_report)
+        if rebalance_report is not None:
+            self.pruning_report_["rebalance"] = json.loads(rebalance_report)
         band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
-        if band_tol is not None and bool(full_model.bag_oob_available()):
+        if band_tol is not None:
             table_model = self._band_deployed(
                 table_model, full_model, keep, x32, y32, w_full, expo_full, cat_x, obj,
                 float(band_tol),
@@ -5865,7 +5853,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        banding is skipped and pruning falls back to the fold vote.
+        pruning falls back to the fold vote, and no spread between bags, so
+        ``band_deviance_cap`` alone bounds the banding.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
@@ -6114,8 +6103,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
         deploys the smallest one that is good enough (``prune_path_fraction``,
         ``prune_path_tolerance``). It needs out-of-bag rows: without at least
-        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
-        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) the fit falls back to the
+        fold vote.
         ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
         vote and evidence gate: the parameters documented as fold vote only.
         ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
@@ -6356,8 +6345,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
-        to deploy the drop-only pruned model. Only has an effect together with ``prune=True``.
+        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Tables on a
+        categorical encoded by several channels (``cat_channels``) are left as fitted; the
+        outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
+        pruned model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
         bands. Adjacent cells are merged where the model barely distinguishes
@@ -6365,8 +6356,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs on every bagged fit (``n_bags >= 2``), pruned or not; the outcome
-        is in ``pruning_report_["banding"]``.
+        off. Banding runs on every fit, pruned or not; with one bag (``n_bags=1``) there is
+        no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
+        ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
         The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
         0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
@@ -6418,6 +6410,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
         means the gate was off and every other field is inert.
+
+        ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
+        were adopted, how many kept tables they span, the tables left as fitted
+        (``excluded``) and the held-out deviance before and after.
 
         ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
         its tables, the certificate (``"exact"`` when every combination of the other features
@@ -7158,9 +7154,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        banding is skipped and pruning falls back to the fold vote (a multiclass fit keeps
-        its full bank instead). The multiclass (K>=3) path bags too, souping the bags per
-        class.
+        pruning falls back to the fold vote, and no spread between bags, so
+        ``band_deviance_cap`` alone bounds the banding. The multiclass (K>=3) path bags too,
+        souping the bags per class.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
@@ -7434,8 +7430,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
         deploys the smallest one that is good enough (``prune_path_fraction``,
         ``prune_path_tolerance``). It needs out-of-bag rows: without at least
-        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
-        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) the fit falls back to the
+        fold vote.
         ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
         vote and evidence gate: the parameters documented as fold vote only.
         ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
@@ -7682,9 +7678,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
-        to deploy the drop-only pruned model. Binary (K=2) path only. Only has an effect
-        together with ``prune=True``.
+        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Tables on a
+        categorical encoded by several channels are left as fitted; the outcome is in
+        ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned model.
+        Binary (K=2) path only. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
         bands. Adjacent cells are merged where the model barely distinguishes
@@ -7692,8 +7689,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs on every bagged fit (``n_bags >= 2``), pruned or not; the outcome
-        is in ``pruning_report_["banding"]``.
+        off. Banding runs on every fit, pruned or not; with one bag (``n_bags=1``) there is
+        no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
+        ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
         The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
         0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
@@ -7748,6 +7746,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
         means the gate was off and every other field is inert.
+
+        ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
+        were adopted, how many kept tables they span, the tables left as fitted
+        (``excluded``) and the held-out deviance before and after.
 
         ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
         its tables, the certificate (``"exact"`` when every combination of the other features
@@ -8554,15 +8556,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             self.pruning_report_ = report
             band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
             if band_tol is not None:
-                try:
-                    model, band_json = full_model.band_tables(
-                        model, x32, np.ascontiguousarray(y_labels), w_full, float(band_tol),
-                        float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)),
-                        cat_x=cat_x, **self._measure_kwargs(),
-                    )
-                    self.pruning_report_["banding"] = json.loads(band_json)
-                except ValueError as exc:
-                    self.pruning_report_["banding"] = {"skipped": f"no bag noise estimate: {exc}"}
+                model, band_json = full_model.band_tables(
+                    model, x32, np.ascontiguousarray(y_labels), w_full, float(band_tol),
+                    float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)),
+                    cat_x=cat_x, **self._measure_kwargs(),
+                )
+                self.pruning_report_["banding"] = json.loads(band_json)
         self._multi_model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features

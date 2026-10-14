@@ -270,15 +270,16 @@ def test_min_variance_share_multiclass_and_binding():
     assert row["status"] == "INERT"
 
 
-def test_min_variance_share_leaves_a_skipped_multiclass_path_alone():
-    # One bag leaves no out-of-bag rows, so the path is skipped and the full bank kept: the floor
-    # must not drop tables then (the single-output path does not), as `binding_report_` says.
+def test_min_variance_share_is_inert_when_a_multiclass_fit_falls_back_to_the_fold_vote():
+    # One bag leaves no out-of-bag rows, so the multiclass fit falls back to the fold vote, as a
+    # single-output fit does: the floor is a ranked-path rule and must not drop tables then, as
+    # `binding_report_` says.
     rng = np.random.default_rng(1)
     X = rng.normal(size=(120, 3))
     y = rng.integers(0, 3, 120)
     fits = [TBoostClassifier(n_trees=12, n_bags=1, n_jobs=1, seed=0, validation_fraction=None,
                              prune_min_variance_share=share).fit(X, y) for share in (0.0, 0.99)]
-    assert "skipped" in fits[1].pruning_report_["selection"]
+    assert fits[1].pruning_report_["selector"] == "cv_fold_vote"
     assert "dropped_low_share" not in fits[1].pruning_report_["selection"]
     banks = [{c: [(t["feature_names"], t["values"]) for t in b["tables"]]
               for c, b in json.loads(m.tables(X)).items()} for m in fits]

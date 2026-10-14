@@ -433,6 +433,26 @@ pub struct BoxBudgetReport {
     pub cascade_dropped: Vec<FeatureSet>,
 }
 
+/// What the post-prune rebalance did (see [`rebalance_kept_cells`]). Serialized verbatim into
+/// the sklearn estimator's `pruning_report_["rebalance"]`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct RebalanceReport {
+    /// Whether the re-solved cell values were deployed: they lowered the deviance of the
+    /// held-out slice (or there was none).
+    pub adopted: bool,
+    /// The kept main and pair tables the re-solve spans.
+    pub supports: u64,
+    /// Kept main and pair tables left as fitted: each touches a categorical encoded by more
+    /// than one channel, which the cell correction cannot address as a single axis.
+    pub excluded: Vec<FeatureSet>,
+    /// Rows held out of the re-solve to judge it.
+    pub holdout_rows: u64,
+    /// The held-out slice's deviance (as the loss totals it) before the re-solve.
+    pub holdout_deviance_before: Option<f64>,
+    /// The held-out slice's deviance after it.
+    pub holdout_deviance_after: Option<f64>,
+}
+
 /// Per-support deployed BOX cost across one or more banks (one bank per class for a
 /// multiclass fit — a filing reader faces every class's copy, so they add).
 ///
@@ -1725,7 +1745,7 @@ pub fn prune_model_to_keepset(
     keep: &[FeatureSet],
     rebalance: bool,
 ) -> Result<TableModel, PbError> {
-    let (tm, _, _) = prune_model_to_keepset_budgeted(
+    let (tm, _, _, _) = prune_model_to_keepset_budgeted(
         model,
         serve,
         y,
@@ -1769,7 +1789,15 @@ pub fn prune_model_to_keepset_budgeted(
     max_tables: usize,
     table_min_arity: u8,
     evidence: &BTreeMap<FeatureSet, f64>,
-) -> Result<(TableModel, BoxBudgetReport, TableBudgetReport), PbError> {
+) -> Result<
+    (
+        TableModel,
+        BoxBudgetReport,
+        TableBudgetReport,
+        Option<RebalanceReport>,
+    ),
+    PbError,
+> {
     let prof = std::env::var_os("TBOOST_PROFILE").is_some();
     let mass = measure_mass(&w_measure, w, offset);
     let bank = model.explain_bank_with_mass(
@@ -1837,12 +1865,13 @@ pub fn prune_model_to_keepset_budgeted(
             bank.tables.len(),
         );
     }
+    let mut rebalance_report = None;
     if rebalance {
         // Post-prune re-solve: recalibrate the surviving tables' cell values to the
         // deviance-optimum of the reduced structure (the keep-set is fixed — this only
         // touches the numbers, never re-selects). No-harm guarded on a held-out slice.
         let t = std::time::Instant::now();
-        pruned = rebalance_kept_cells(
+        let (rebalanced, report) = rebalance_kept_cells(
             model,
             pruned,
             &base_raw,
@@ -1855,13 +1884,15 @@ pub fn prune_model_to_keepset_budgeted(
             w_measure,
             do_reanchor,
         )?;
+        pruned = rebalanced;
+        rebalance_report = Some(report);
         if prof {
             eprintln!("[prune] rebalance TOTAL {:.2}s", t.elapsed().as_secs_f64());
         }
     }
     let tm = TableModel::from_model_and_bank(model, pruned);
     tm.validate()?;
-    Ok((tm, box_report, table_report))
+    Ok((tm, box_report, table_report, rebalance_report))
 }
 
 /// Per-bag purified banks restricted to `keep`, on the SAME serve matrix the deployed bank
@@ -2326,6 +2357,11 @@ pub struct BagOobGroupSums {
 /// `base_raw + score(purify(δ))`, so no full-bank score is repeated. A deterministic ~15%
 /// held-out slice never enters the fit and gates the result: the rebalance is adopted only if
 /// it lowers held-out deviance, so it can only help or be neutralised — never regress.
+///
+/// A fit-time cell correction (`model.correction`) is already folded into `base`, purified
+/// under the same row mass as `δ`, so the re-solve composes with it. A kept table that touches
+/// a categorical encoded by more than one channel is left as fitted (see
+/// [`rebalance_supports`]); every other main and pair is re-solved.
 #[allow(clippy::too_many_arguments)]
 fn rebalance_kept_cells(
     model: &Model,
@@ -2339,37 +2375,17 @@ fn rebalance_kept_cells(
     loss: &dyn Loss,
     w_measure: RefMeasure,
     do_reanchor: bool,
-) -> Result<TableBank, PbError> {
-    // Composing a post-prune re-solve on top of a fit-time cell correction is out of
-    // scope; leave the pruned model as-is rather than silently drop that correction.
-    if model.correction.is_some() {
-        return Ok(base);
-    }
-    // P1 multi-channel (bug #5): `correction_scaffold` (reached via `fit_cell_correction`
-    // below) treats each of its `supports` entries as a MODEL AXIS id, but this function
-    // builds those supports from `keep`'s raw FEATURE ids (`FeatureSet::0`) a little further
-    // down — correct only under the pre-P1 green-spine invariant (raw id == axis id always).
-    // Once ANY raw feature in the model owns more than one axis, every raw feature POSITIONED
-    // AFTER it has axis index > raw id, so passing its raw id as an axis id there silently
-    // resolves the WRONG axis — the earlier multi-channel feature's own extra channel, not
-    // the intended raw feature — which is wrong even when that wrong axis is single-channel,
-    // and is the exact crash bug #5 reported when that wrong axis happens to BE a joint one.
-    //
-    // The check must cover the WHOLE model, not just `keep`: a multi-channel raw feature that
-    // ISN'T itself kept can still shift a LATER kept feature's axis index and trigger the same
-    // misresolution — e.g. raw 0 (single-axis, axis 0), raw 1 (multi-channel, axes 1-2), raw 2
-    // (single-axis, axis 3), `keep = [{raw 0}, {raw 2}]`: raw 1 is never kept, but
-    // `supports` still contains raw 2's id (`2`), which `correction_scaffold` would resolve as
-    // axis 2 — raw 1's own second channel, not raw 2 at all. Skipping only when a kept support
-    // itself named a multi-channel feature would miss this case entirely.
-    //
-    // So: skip rebalance for the ENTIRE model (never per-feature — a partial rebalance would
-    // need the very fix this skip avoids) whenever the model has ANY multi-channel raw feature
-    // anywhere, falling back to the already-proven-lossless unrebalanced deploy. A
-    // single-channel model (`provenance.len() == n_raw_features`, unaffected either way) always
-    // takes the `false` branch here and rebalances exactly as before this fix existed.
-    if model.provenance.len() > crate::data::n_raw_features(&model.provenance) {
-        return Ok(base);
+) -> Result<(TableBank, RebalanceReport), PbError> {
+    // (0) The correctable survivors: kept main + pair supports (order ≤ 2), as model axes.
+    //     The §G1 cell-basis correction spans mains + pairs; kept triples ride along unchanged.
+    let (supports, excluded) = rebalance_supports(&model.provenance, keep);
+    let mut report = RebalanceReport {
+        supports: supports.len() as u64,
+        excluded,
+        ..RebalanceReport::default()
+    };
+    if supports.is_empty() {
+        return Ok((base, report));
     }
     let prof = std::env::var_os("TBOOST_PROFILE").is_some();
     let n = serve.0.n_rows as usize;
@@ -2399,16 +2415,6 @@ fn rebalance_kept_cells(
         }
     }
 
-    // (2) The correctable survivors: kept main + pair supports (order ≤ 2). The §G1
-    //     cell-basis correction spans mains + pairs; kept triples ride along unchanged.
-    let supports: Vec<Vec<u32>> = keep
-        .iter()
-        .filter(|u| u.order() <= 2)
-        .map(|u| u.0.iter().map(|f| f.0).collect())
-        .collect();
-    if supports.is_empty() {
-        return Ok(base);
-    }
     if prof {
         eprintln!(
             "[rebalance]  (1) residual grad_hess {:.2}s (base_raw reused, {n} rows)",
@@ -2488,11 +2494,14 @@ fn rebalance_kept_cells(
             hw.push(w[r]);
         }
     }
+    report.holdout_rows = hy.len() as u64;
     let adopt = if hy.is_empty() {
         true // no held-out coverage → keep the rebalance
     } else {
         let base_dev = loss.deviance(&hy, &hb, &hw)?;
         let corr_dev = loss.deviance(&hy, &hc, &hw)?;
+        report.holdout_deviance_before = Some(f64::from(base_dev));
+        report.holdout_deviance_after = Some(f64::from(corr_dev));
         if prof {
             eprintln!(
                 "[rebalance]  (5) guard {:.2}s (base_dev={base_dev:.5} corr_dev={corr_dev:.5} -> {})",
@@ -2503,13 +2512,49 @@ fn rebalance_kept_cells(
         corr_dev <= base_dev
     };
     if !adopt {
-        return Ok(base);
+        return Ok((base, report));
     }
     // Materialise base ⊕ purify(δ) in place + apply the re-anchor shift.
     let mut corrected = base;
     crate::explain::add_bank_assign(&mut corrected, &delta_bank)?;
     corrected.f0 += shift;
-    Ok(corrected)
+    report.adopted = true;
+    Ok((corrected, report))
+}
+
+/// The kept main and pair tables the rebalance re-solves, as sorted MODEL AXIS ids (what
+/// `correction_scaffold` reads), and the ones it leaves as fitted. A raw feature owns one axis
+/// unless it is a categorical encoded by several channels; a table touching such a feature is
+/// excluded, since no single axis carries it. Axis ids differ from raw ids once any earlier
+/// feature owns several axes (bug #5: reading raw ids as axis ids re-solved the wrong column).
+fn rebalance_supports(
+    provenance: &[crate::data::AxisProvenance],
+    keep: &[FeatureSet],
+) -> (Vec<Vec<u32>>, Vec<FeatureSet>) {
+    // raw id -> its axis, or None once a second axis claims the same raw feature
+    let mut axis_of: BTreeMap<u32, Option<u32>> = BTreeMap::new();
+    for (axis, p) in (0_u32..).zip(provenance) {
+        axis_of
+            .entry(p.raw.0)
+            .and_modify(|a| *a = None)
+            .or_insert(Some(axis));
+    }
+    let mut supports = Vec::new();
+    let mut excluded = Vec::new();
+    for u in keep.iter().filter(|u| u.order() <= 2) {
+        let axes: Option<Vec<u32>> =
+            u.0.iter()
+                .map(|f| axis_of.get(&f.0).copied().flatten())
+                .collect();
+        match axes {
+            Some(mut axes) => {
+                axes.sort_unstable();
+                supports.push(axes);
+            }
+            None => excluded.push(u.clone()),
+        }
+    }
+    (supports, excluded)
 }
 
 /// Intercept-only multinomial re-anchor: the per-class shifts `delta` that make the softmax's
@@ -4743,30 +4788,97 @@ mod tests {
         }
     }
 
-    /// Bug #5's fix, at its narrowest possible grain: `rebalance_kept_cells` must return `base`
-    /// completely UNTOUCHED for any model with a multi-channel raw feature, never reaching
-    /// `fit_cell_correction`/`correction_scaffold` at all. Comparing only the RESULT against a
-    /// `rebalance:false` run is not a reliable oracle for this on every fixture: the no-harm
-    /// guard already refuses any correction that doesn't measurably improve held-out deviance,
-    /// so a genuinely misrouted (wrong-axis) correction can independently get rejected on its
-    /// own merits and produce the exact same output as a correctly-skipped one -- confirmed
-    /// empirically on a harder fixture (see the t-boost-py `rebalance_skip_prevents_the_purely_
-    /// silent_variant...` test, whose doc comment documents the profiling numbers). So this test
-    /// makes reaching the buggy path unmistakable instead: `y`/`w` are passed one row LONGER
-    /// than `serve`'s row count. If the skip fires (`Ok(base)` returned before `y`/`w` are ever
-    /// read), the mismatched length is irrelevant and this succeeds trivially. If the skip is
-    /// missing, execution reaches `loss.grad_hess(y, raw, w, ..)`, whose OWN shape check
-    /// (`SquaredError::grad_hess`, `raw.len() != y.len()`) turns any reintroduction of the bug
-    /// into a loud, unconditional `ShapeMismatch` error -- not a maybe-silent numeric wobble a
-    /// data-dependent guard could mask.
+    /// Bug #5, at its root: the rebalance hands `correction_scaffold` MODEL AXIS ids, which
+    /// differ from raw ids once an earlier raw feature owns several channel axes. Raw 0 owns
+    /// axes 0-1 here, so raws 1 and 2 sit at axes 2 and 3; a table touching raw 0 has no single
+    /// axis and is left as fitted, while triples are never re-solved at all.
     #[test]
-    fn rebalance_kept_cells_skips_the_whole_model_when_any_raw_feature_is_multichannel() {
+    fn rebalance_resolves_each_raw_feature_to_its_own_axis() {
+        use crate::data::{AxisKind, AxisProvenance, FeatureId};
+        let mut provenance = fixture_multichannel_model().provenance;
+        for raw in [1, 2] {
+            provenance.push(AxisProvenance {
+                raw: FeatureId(raw),
+                kind: AxisKind::Numeric,
+            });
+        }
+        let fs = |ids: &[u32]| FeatureSet::new(ids);
+        let keep = [
+            fs(&[0]),
+            fs(&[1]),
+            fs(&[2]),
+            fs(&[0, 1]),
+            fs(&[1, 2]),
+            fs(&[0, 1, 2]),
+        ];
+        let (supports, excluded) = rebalance_supports(&provenance, &keep);
+        assert_eq!(supports, vec![vec![2], vec![3], vec![2, 3]]);
+        assert_eq!(excluded, vec![fs(&[0]), fs(&[0, 1])]);
+    }
+
+    /// A fit-time cell correction is folded into the deployed bank, so the rebalance composes
+    /// with it: it runs over every kept main and pair, and the unrebalanced deploy is the
+    /// corrected ensemble, exactly.
+    #[test]
+    fn rebalance_composes_with_a_fit_time_cell_correction() {
+        let mut model = fixture_model();
+        let serve = fixture_serve();
+        let mut corr = crate::explain::correction_scaffold(&model, &[vec![0], vec![0, 1]]).unwrap();
+        for (c, v) in corr.tables[0].values.iter_mut().enumerate() {
+            *v = 0.25 + 0.1 * c as f64;
+        }
+        model.correction = Some(corr);
+        model.validate().unwrap();
+        let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
+        let keep: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
+        let n = serve.0.n_rows as usize;
+        let y: Vec<f32> = (0..n).map(|r| r as f32).collect();
+        let w = vec![1.0_f32; n];
+        let deploy = |rebalance: bool| {
+            prune_model_to_keepset_budgeted(
+                &model,
+                &serve,
+                &y,
+                &w,
+                None,
+                &SquaredError,
+                RefMeasure::Uniform,
+                false,
+                &keep,
+                rebalance,
+                0,
+                0,
+                DEFAULT_TABLE_MIN_ARITY,
+                &BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let (off, _, _, _) = deploy(false);
+        let (on, _, _, report) = deploy(true);
+        let report = report.unwrap();
+        assert_eq!(report.supports, keep.len() as u64);
+        assert!(report.excluded.is_empty());
+        on.validate().unwrap();
+        let ens = model.predict(&serve.0, None).unwrap();
+        let tab = off.predict_binned(&serve.0, None).unwrap();
+        for (e, t) in ens.iter().zip(&tab) {
+            assert!(
+                (e - t).abs() < 1e-6,
+                "corrected ensemble {e} vs deployed {t}"
+            );
+        }
+        if !report.adopted {
+            assert_eq!(on.bank, off.bank);
+        }
+    }
+
+    /// A model whose only kept table touches a multi-channel categorical has nothing to
+    /// re-solve: `base` comes back untouched, before `y`/`w` are read (they are one row too
+    /// long here, so reading them would fail), and the report says why.
+    #[test]
+    fn rebalance_leaves_a_multichannel_table_as_fitted() {
         let model = fixture_multichannel_model();
         let serve = fixture_multichannel_serve();
-        assert!(
-            model.provenance.len() > crate::data::n_raw_features(&model.provenance),
-            "fixture must actually be multi-channel for this test to mean anything"
-        );
         let bank = model
             .explain_bank(
                 &serve,
@@ -4779,35 +4891,25 @@ mod tests {
         assert!(!keep.is_empty(), "fixture must realize at least one table");
         let n = serve.0.n_rows as usize;
         let base = retain_tables(&bank, &keep);
-        let mut base_raw = vec![0.0_f64; n];
-        crate::scoring::score_bank_binned(
-            &base,
-            &model.schema.cat_encoders,
-            &serve.0,
-            &mut base_raw,
-        )
-        .unwrap();
-
-        let bad_y = vec![0.0_f32; n + 1];
-        let bad_w = vec![1.0_f32; n + 1];
-        let out = rebalance_kept_cells(
+        let base_raw = vec![0.0_f64; n];
+        let (out, report) = rebalance_kept_cells(
             &model,
             base.clone(),
             &base_raw,
             &keep,
             &serve,
-            &bad_y,
-            &bad_w,
+            &[0.0_f32; 5],
+            &[1.0_f32; 5],
             None,
             &SquaredError,
             RefMeasure::Uniform,
             false,
         )
-        .expect("multi-channel model: the skip must return before the mismatched y/w length is ever read");
-        assert_eq!(
-            out, base,
-            "the skip must return `base` completely unchanged"
-        );
+        .unwrap();
+        assert_eq!(out, base);
+        assert_eq!(report.supports, 0);
+        assert_eq!(report.excluded, keep);
+        assert!(!report.adopted);
     }
 
     // Held-out y is constant at the intercept ⇒ interactions only add overfit variance. Main

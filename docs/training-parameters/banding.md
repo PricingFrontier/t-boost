@@ -6,8 +6,9 @@ table that contains a feature cuts it at the same nested places, so the bands li
 tables. Missing values always keep their own band.
 
 How coarse the bands get is set by the model's own noise: the change to the predictions is held
-within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between the bags. Banding
-therefore needs bagging (`n_bags` of at least 2); pruned and unpruned (`prune=False`) models
+within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between the bags, and
+within the [deviance cap](#band_deviance_cap). With one bag (`n_bags=1`) there is no spread to
+measure, so the deviance cap alone bounds the change. Pruned and unpruned (`prune=False`) models
 are banded alike. The outcome is recorded in `pruning_report_["banding"]`. See
 [Pruning, banding and graduation](../algorithm/readable-tables.md) for details.
 
