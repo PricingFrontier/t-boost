@@ -773,3 +773,16 @@ def test_prediction_histogram_bins_every_dataset_alike(poisson):
     html = report_html(report)
     assert html.count('class="hbar"') >= 40 and "share of exposure per bin" in html
 
+
+def test_legends_and_titles_name_the_datasets(poisson):
+    # The page has no script: what names "the selected dataset" is drawn once per dataset and
+    # shown with it by the dataset switch.
+    _, _, _, report = poisson
+    html = report_html(report)
+    for shown, other in (("train", "test"), ("test", "train")):
+        assert f"actual ({shown})" in html and f"A/E ({other})" in html
+        assert f"{shown} in colour, {other} in grey" in html
+        assert f"out of balance on {shown}" in html
+        assert f"({shown})</span>" in html
+    assert "selected dataset" not in html and "other datasets" not in html
+

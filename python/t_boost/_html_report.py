@@ -567,6 +567,26 @@ def _legend(svg: _Svg, x: float, y: float, items: Sequence[tuple[str, str, str]]
     return x
 
 
+def _others(scored: list[dict[str, Any]], i: int) -> str:
+    """The labels of every dataset but the ``i``-th."""
+    return ", ".join(str(d["label"]) for j, d in enumerate(scored) if j != i)
+
+
+def _ds_legend(svg: _Svg, x: float, y: float, n: int,
+               items_for: Callable[[int], list[tuple[str, str, str]]], *,
+               fit: float | None = None) -> None:
+    """A legend for each of ``n`` datasets that names it and the others, shown with it by the
+    page's dataset switch. With ``fit``, trailing items that would overflow that width go."""
+    for i in range(n):
+        items = items_for(i)
+        while fit is not None and len(items) > 1 and (
+                sum(40 + _text_w(label) for _, _, label in items) - 18 > fit):
+            items.pop()
+        g = _Svg(svg.w, svg.h, "")
+        _legend(g, x, y, items)
+        svg.group(f"ds ds-{i}", g.parts)
+
+
 def _bar(cls: str, x: float, y_top: float, w: float, y_base: float, r: float = 2.0,
          title: str = "") -> str:
     """A column from the baseline up to ``y_top``, rounded at the data end only."""
@@ -799,10 +819,14 @@ def calibration_chart(r: dict[str, Any], k: int | None, w: float, h: float) -> s
     bw = (right - left) / n
     xs = [left + (j + 0.5) * bw for j in range(n)]
     svg = _Svg(w, h, "calibration by decile of predicted rate")
-    items = [("line", "data", "actual"), ("line", "model", "predicted")]
-    if len(scored) > 1:
-        items.append(("line", "dsl", "A/E of the other datasets"))
-    _legend(svg, left, 12, items)
+    def items(i: int) -> list[tuple[str, str, str]]:
+        label = str(scored[i]["label"])
+        out = [("line", "data", f"actual ({label})"), ("line", "model", f"predicted ({label})")]
+        if len(scored) > 1:
+            out.append(("line", "dsl", f"A/E ({_others(scored, i)})"))
+        return out
+
+    _ds_legend(svg, left, 12, len(scored), items)
     _yaxis(svg, ts, left, right, rate_fmt)
     _yaxis(svg, bs, left, right, _fixed2)
     svg.hline(left, right, bs(1.0), "ref")
@@ -1186,8 +1210,8 @@ def spread_chart(r: dict[str, Any], w: float) -> str:
         ticks = [t for t in lin.ticks if edges[0] <= t <= edges[-1]]
     svg = _Svg(w, h, "spread of the predictions")
     basis = "exposure" if r["model"]["link"] == "log" else "weight"
-    _legend(svg, left, 12, [("box", "hbar", "selected dataset"), ("line", "dsl", "other datasets")]
-            if len(found) > 1 else [("box", "hbar", str(scored[found[0][0]]["label"]))])
+    _ds_legend(svg, left, 12, len(scored), lambda i: [("box", "hbar", str(scored[i]["label"]))] + (
+        [("line", "dsl", _others(scored, i))] if len(found) > 1 else []))
     _yaxis(svg, ys, left, right, y_label)
     svg.text(right, 12, f"share of {basis} per bin", anchor="end", cls="lbl")
     for t in ticks:
@@ -1260,15 +1284,16 @@ def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
     rows = -(-len(feats) // cols)
     h = legend_h + rows * step - gap_y + 4
     svg = _Svg(w, h, "A/E by band for every feature")
-    items = [("line", "data", "A/E by band"), ("box", "bandbox", "±2σ")]
-    if tol:
-        items.append(("line", "guide", f"±{_pct(tol, 0)}"))
-    items += [("dot", "flagdot", "flagged"), ("dot", "neardot", "near miss")]
-    if len(scored) > 1:
-        items.append(("line", "dsl", "other datasets"))
-    while sum(40 + _text_w(label) for _, _, label in items) - 18 > w:
-        items.pop()  # a narrow card keeps the leading items
-    _legend(svg, 0, 12, items)
+    def items(i: int) -> list[tuple[str, str, str]]:
+        out = [("line", "data", str(scored[i]["label"])), ("box", "bandbox", "±2σ")]
+        if tol:
+            out.append(("line", "guide", f"±{_pct(tol, 0)}"))
+        out += [("dot", "flagdot", "flagged"), ("dot", "neardot", "near miss")]
+        if len(scored) > 1:
+            out.append(("line", "dsl", _others(scored, i)))
+        return out
+
+    _ds_legend(svg, 0, 12, len(scored), items, fit=w)  # a narrow card keeps the leading items
     chars = int(pw / (_FONT * 0.6))
     for n, f in enumerate(feats):
         px = (n % cols) * (pw + gap_x)
@@ -1479,7 +1504,12 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
             if ae_s.lo <= g <= ae_s.hi:
                 svg.hline(left, right, ae_s(g), "guide")
     svg.hline(left, right, ae_s(1.0), "ref")
-    svg.text(left, a0 - 8, "A/E by band (the review check), every dataset", cls="lbl")
+    for i in range(len(scored)):
+        g = _Svg(w, h, "")
+        others = f", {_others(scored, i)} in grey" if len(scored) > 1 else ""
+        g.text(left, a0 - 8, f"A/E by band (the review check): {scored[i]['label']} in colour"
+               + others, cls="lbl")
+        svg.group(f"ds ds-{i}", g.parts)
     if tol:
         svg.text(right, a0 - 8, f"dashed: ±{_pct(tol, 0)}; shaded: ±2σ", anchor="end")
 
@@ -1877,8 +1907,13 @@ def _badge(status: str, text: str | None = None) -> str:
             f"{_e(word)}</span>")
 
 
-def _card(title: str, body: str, *, what: str = "", extra: str = "", cls: str = "") -> str:
-    head = f'<h3 title="{_e(title)}">{_e(title)}</h3>'
+def _card(title: str, body: str, *, what: str = "", extra: str = "", cls: str = "",
+          titles: list[str] | None = None) -> str:
+    """A card; ``titles`` gives one title per dataset, shown with it by the dataset switch
+    (``title`` is then the hover text)."""
+    shown = ("".join(f'<span class="ds ds-{i}">{_e(t)}</span>' for i, t in enumerate(titles))
+             if titles else _e(title))
+    head = f'<h3 title="{_e(title)}">{shown}</h3>'
     if extra:
         head = f'<div class="head">{head}{extra}</div>'
     cap = f'<p class="what" title="{_e(what)}">{_e(what)}</p>' if what else ""
@@ -2062,6 +2097,7 @@ def _overview(r: dict[str, Any], tabs: _Radio, classes: _Radio | None) -> str:
 
     k0 = 0 if classes is not None else None
     cal_card = _card(_lift_takeaway(r, last, k0), _per_class(r, classes, cal),
+                     titles=[_lift_takeaway(r, i, k0) for i in range(len(scored))],
                      what="Equal-exposure deciles of predicted rate; A/E for every dataset, ±2σ shaded")
     imp_card = _card(_importance_takeaway(r), importance_chart(r, _W_HALF, _H_ROW),
                      what="Share of model variance: own one-way table, then through interactions")
@@ -2122,16 +2158,18 @@ def _performance(r: dict[str, Any], classes: _Radio | None) -> str:
                 dec_cls.append(f"ds ds-{i}")
         table = _table(["dataset", "decile", "rows", "share of exposure", "actual", "predicted",
                         "A/E", "z"], dec_rows, numeric=range(1, 8), row_class=dec_cls)
-        title = _lift_takeaway(r, last, k) + (f" · class {c}" if c else "")
-        return _card(title, calibration_chart(r, k, _W_FULL, 360)
+        suffix = f" · class {c}" if c else ""
+        return _card(_lift_takeaway(r, last, k) + suffix, calibration_chart(r, k, _W_FULL, 360)
                      + f"<details><summary>Decile table</summary>{table}</details>",
-                     what=("Equal-exposure deciles of predicted rate: actual and predicted for the "
-                           "selected dataset; A/E for every dataset, the selected one with ±2σ"))
+                     titles=[_lift_takeaway(r, i, k) + suffix for i in range(len(scored))],
+                     what=("Equal-exposure deciles of predicted rate: actual and predicted above, "
+                           "the A/E of each dataset below with ±2σ shaded"))
 
     def pair(c: str, k: int | None) -> str:
         lor = _card("Lorenz curve", lorenz_chart(r, k, _W_HALF, 300),
                     what="Share of actual against share of exposure, highest predicted rate first")
         bal = _card(_balance_takeaway(r, last, k), balance_chart(r, _W_HALF, k=k),
+                    titles=[_balance_takeaway(r, i, k) for i in range(len(scored))],
                     what=_balance_rule(r))
         return _row(lor, bal)
 
@@ -2252,8 +2290,10 @@ def _factors(r: dict[str, Any], fx: _Radio, classes: _Radio | None) -> str:
                           + "<h4>By band</h4>" + _table(cols, band_rows, numeric=range(1, 7))
                           + "<h4>By level</h4>"
                           + _table(cols, lvl_rows, numeric=range(1, 7), scroll="scroll") + "</div>")
+            named = "".join(f'<span class="ds ds-{i}">({_e(str(d["label"]))})</span>'
+                            for i, d in enumerate(scored))
             return (chart + "<details><summary>Actual and expected by level, and the numbers "
-                    "(selected dataset)</summary>" + "".join(lv) + "</details>")
+                    f"{named}</summary>" + "".join(lv) + "</details>")
 
         body.append(_per_class(r, classes, one))
         panes.append(f'<div class="fxp {fx.tag(j)}">'

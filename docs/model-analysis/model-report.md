@@ -60,7 +60,8 @@ viewer.
 
 The page has seven tabs and one dataset switch (train and test, or train, validation and test;
 it opens on the last dataset given, the most independent one). The selected dataset is drawn in
-colour in every chart and the others in grey, so the datasets compare without scrolling. Blue is
+colour in every chart and the others in grey, so the datasets compare without scrolling; the
+legends and the titles name the dataset each line or figure belongs to. Blue is
 observed data and orange is the model throughout. Each chart has a one-line caption and its
 numbers collapsed beneath it; hovering a point shows its values. The tabs, the switches and the
 collapsed sections are plain HTML and CSS, so they work where scripts are blocked.
