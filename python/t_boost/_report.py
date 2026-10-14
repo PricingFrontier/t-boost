@@ -387,6 +387,82 @@ def table_measure(est: "_BaseTBoost", X: Any, sample_weight: Any | None, exposur
             "weight": weight32, "exposure": exposure32}
 
 
+def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
+                   rho: float) -> None:
+    """For each interaction table the page draws, the A/E by band of its first feature (the
+    factor check's bands) within each band of its partner (the chart's bands of equal exposure),
+    per dataset (``interactions[k]["ae"]``), with each cell's mass, z and the standard deviation
+    ``sd`` of its A/E. One native pass per
+    dataset sums every table. A multiclass model's first class, one-vs-rest, as the page draws."""
+    from ._html_report import _INTERACTION_ROWS, _classes, _table_cells, interaction_layout
+
+    cls = _classes(report)[0]
+    plans = []
+    for inter in (report.get("interactions") or [])[:_INTERACTION_ROWS]:
+        lay = interaction_layout(report, inter, cls)
+        if lay is None or not lay["bands"]:
+            continue
+        xe, be = lay["entries"][lay["xf"]], lay["entries"][lay["by"]]
+        x_bands = [[int(c) for c in b["cells"]] for b in xe.get("bands") or []]
+        if not x_bands:
+            continue
+        x_band = np.full(len(xe["mass"]), -1, dtype=np.int64)
+        for i, cells in enumerate(x_bands):
+            x_band[cells] = i
+        band_of = {tc: i for i, band in enumerate(lay["bands"]) for tc in band}
+        by_band = np.array([-1 if tc is None else band_of.get(tc, -1)
+                            for tc in _table_cells(be["axis"], lay["t"]["axes"][lay["iby"]])],
+                           dtype=np.int64)
+        plans.append((inter, int(xe["raw"]), int(be["raw"]), x_band, by_band,
+                      [str(b["label"]) for b in xe["bands"]], lay))
+    if not plans:
+        return
+    per_ds: list[list[dict[str, Any]]] = [[] for _ in plans]
+    for p, d in zip(prepared, report["datasets"]):
+        if p.error is not None or not d.get("actual_vs_expected"):
+            continue
+        row_cells = p.cells[0]
+        codes = np.empty((row_cells.shape[0], len(plans)), dtype=np.uint32)
+        n_cells = []
+        for j, (_, rx, rb, x_band, by_band, x_labels, lay) in enumerate(plans):
+            nb, size = len(lay["bands"]), len(x_labels) * len(lay["bands"])
+            xb = x_band[np.minimum(row_cells[:, rx], len(x_band) - 1)]
+            pb = by_band[np.minimum(row_cells[:, rb], len(by_band) - 1)]
+            codes[:, j] = np.where((xb >= 0) & (pb >= 0), xb * nb + pb, size)  # last: neither
+            n_cells.append(size + 1)
+        if p.proba is not None and p.codes is not None:
+            pk = p.proba[:, 0]
+            actual, expected, var = (p.codes == 0).astype(np.float64), pk, pk * (1.0 - pk)
+        else:
+            assert p.pred is not None
+            actual, expected = p.y, p.pred
+            var = dispersion(obj, p.y, p.pred, p.w, rho) * _variance(obj, p.pred, rho)
+        sums = _report_cell_sums(np.ascontiguousarray(codes), n_cells, _f64(actual),
+                                 _f64(expected), _f64(p.w), _f64(p.e), _f64(var))
+        for j, ((_, _, _, _, _, x_labels, lay), (a, e, m, _, v)) in enumerate(zip(plans, sums)):
+            nb = len(lay["bands"])
+
+            def grid(values: list[float | None]) -> list[list[float | None]]:
+                return [values[i * nb:(i + 1) * nb] for i in range(len(x_labels))]
+
+            size = len(x_labels) * nb
+            per_ds[j].append({
+                "label": d["label"],
+                "ae": grid([_ratio(a[c], e[c]) if e[c] > 0 else None for c in range(size)]),
+                "mass": grid([float(m[c]) for c in range(size)]),
+                "z": grid([float((a[c] - e[c]) / math.sqrt(v[c])) if v[c] > 0 else None
+                           for c in range(size)]),
+                "sd": grid([float(math.sqrt(v[c]) / e[c]) if v[c] > 0 and e[c] > 0 else None
+                            for c in range(size)]),
+            })
+    for (inter, _, _, _, _, x_labels, lay), datasets in zip(plans, per_ds):
+        inter["ae"] = {"x": lay["xf"], "by": lay["by"], "x_labels": x_labels,
+                       "x_bands": [[int(c) for c in b["cells"]]
+                                   for b in lay["entries"][lay["xf"]]["bands"]],
+                       "by_bands": lay["bands"], "by_labels": lay["band_labels"],
+                       "datasets": datasets}
+
+
 def shap_by_cell(est: "_BaseTBoost", p: Prepared,
                  measure: dict[str, Any]) -> list[list[dict[str, Any]]]:
     """Per class bank and raw feature: each merged-grid cell's exposure-weighted mean and 10th
@@ -1461,6 +1537,7 @@ def build_report(
     report["structure"] = structure_section(est, banks)
     report["features"] = features_section(report, th)
     report["interactions"] = interactions_section(report)
+    interaction_ae(report, prepared, obj, rho)
     report["review"] = review(est, report, th)
     report["summary_metrics"] = summary_metrics(report)
     return json_safe(report)  # type: ignore[no-any-return]

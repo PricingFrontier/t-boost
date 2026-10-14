@@ -786,3 +786,22 @@ def test_legends_and_titles_name_the_datasets(poisson):
         assert f"({shown})</span>" in html
     assert "selected dataset" not in html and "other datasets" not in html
 
+
+def test_interaction_ae_by_band_pair(poisson):
+    # Each drawn interaction carries the A/E of its first feature's bands within each band of its
+    # partner, per dataset, and the page draws one strip per partner band.
+    _, _, _, report = poisson
+    inter = report["interactions"][0]
+    ae = inter["ae"]
+    assert {ae["x"], ae["by"]} <= set(inter["features"]) and ae["x"] != ae["by"]
+    nx, nb = len(ae["x_labels"]), len(ae["by_labels"])
+    assert nx == len(ae["x_bands"]) and nb == len(ae["by_bands"]) and 1 <= nb <= 4
+    for d, ds in zip(ae["datasets"], report["datasets"]):
+        assert d["label"] == ds["label"]
+        assert [len(row) for row in d["ae"]] == [nb] * nx == [len(row) for row in d["sd"]]
+        # with nothing missing, every row lands in exactly one band pair
+        assert sum(map(sum, d["mass"])) == pytest.approx(ds["metrics"]["mass"])
+    html = report_html(report)
+    assert f"A/E by {ae['x']} band within each {ae['by']} band" in html
+    assert html.count('class="ibw0"') >= len(ae["datasets"])
+

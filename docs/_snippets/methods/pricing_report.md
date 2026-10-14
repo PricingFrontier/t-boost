@@ -226,7 +226,10 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
 - `structure` — The deployed effects of each table bank with their variance shares.
 - `interactions` — Per interaction table, by share of model variance: its features, share,
   cells, the range of its effect over the cells with exposure and the range holding 90% of the
-  exposure (`spread`), and its smoothing strength.
+  exposure (`spread`), and its smoothing strength. The 40 largest also carry `ae`: the A/E by
+  band of the first feature (`x`, the factor check's bands) within each band of its partner
+  (`by`, up to four bands of equal exposure), per dataset, with each pair's `mass`, `z` and
+  standard deviation `sd`.
 - `features` — Per raw feature, by importance: its importance split into its own one-way table
   and its share through interactions, the interactions it is in, and its one-way table's effect
   range, thin cells, missing-value level and smoothing strength.

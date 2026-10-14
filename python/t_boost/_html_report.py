@@ -130,6 +130,7 @@ svg .shapband{fill:var(--model);opacity:.14}
 svg .ref1{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
 svg .ib0,svg .ib1,svg .ib2,svg .ib3{stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}
 svg .ib0{stroke:var(--i0)}svg .ib1{stroke:var(--i1)}svg .ib2{stroke:var(--i2)}svg .ib3{stroke:var(--i3)}
+svg .ibw0{fill:var(--i0);opacity:.14}svg .ibw1{fill:var(--i1);opacity:.14}svg .ibw2{fill:var(--i2);opacity:.14}svg .ibw3{fill:var(--i3);opacity:.14}
 svg .fade{opacity:.3}
 svg .shapmean{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
 svg .hbar{fill:var(--model-soft)}
@@ -1643,22 +1644,21 @@ def _flat_index(idx: Sequence[int], shape: Sequence[int]) -> int:
     return k
 
 
-def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: float) -> str:
-    """One interaction table on the levels of its first feature (the one with most levels): that
-    feature's one-way table alone (dashed) and, for each band of equal exposure of its partner,
-    the feature's effect with this table added (the table averaged over the band's cells, and
-    over any third feature, by their exposure); the train exposure below. Thin bands faded."""
-    link = r["model"]["link"]
+def interaction_layout(r: dict[str, Any], inter: dict[str, Any],
+                       cls: str) -> dict[str, Any] | None:
+    """How the Interactions tab draws one table, or None when it cannot: its first feature (the
+    one with most levels) on the x-axis, and its partner's bands of equal exposure (at most four,
+    as table-axis cells) with their labels. The report's A/E for the table uses the same bands."""
     scored = _scored(r)
     names = list(inter["features"])
     bank = _banks(r).get(cls) or {}
     t = next((t for t in bank.get("tables", []) if list(t["feature_names"]) == names), None)
     if t is None or not scored:
-        return _none()
+        return None
     key = None if not r["model"]["multiclass"] else cls
     entries = {f: _ae_entry(scored[0], f, key) for f in names}
     if any(e is None for e in entries.values()):
-        return _none()
+        return None
 
     def levels(f: str) -> int:
         e = entries[f]
@@ -1666,15 +1666,9 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
 
     order = sorted(range(len(names)), key=lambda i: -levels(names[i]))
     ix, iby = order[0], order[1]
-    xf, by = names[ix], names[iby]
-    base = entries[xf] or {}
-    axis = base["axis"]
-    mass = [float(m) for m in base["mass"]]
-    labels = cell_labels(axis)
     shape = [int(d) for d in t["shape"]]
     values = [float(v) for v in t["values"]]
     support = [float(v) for v in t.get("support") or [0.0] * len(values)]
-    mult = link in ("log", "logit")
     # Σ support and Σ support × value per (x cell, partner cell), over any third feature.
     s_xb: dict[tuple[int, int], float] = {}
     f_xb: dict[tuple[int, int], float] = {}
@@ -1689,8 +1683,6 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
         f_xb[cell] = f_xb.get(cell, 0.0) + support[k] * values[k]
     by_mass = [sum(s_xb.get((a, b), 0.0) for a in range(shape[ix])) for b in range(shape[iby])]
     bands = _bands_of_support(by_mass)
-    if not bands:
-        return _none("No exposure in this table.")
     by_axis = t["axes"][iby]
     by_labels = cell_labels(by_axis)
 
@@ -1699,6 +1691,35 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
             shown = ", ".join(by_labels[c] for c in cells[:2])
             return shown + (f" +{len(cells) - 2}" if len(cells) > 2 else "")
         return run_label(by_axis, cells[0], cells[-1])
+
+    return {"t": t, "names": names, "key": key, "entries": entries, "ix": ix, "iby": iby,
+            "xf": names[ix], "by": names[iby], "support": support, "s_xb": s_xb, "f_xb": f_xb,
+            "by_mass": by_mass, "bands": bands, "band_labels": [band_label(b) for b in bands]}
+
+
+def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: float) -> str:
+    """One interaction table on the levels of its first feature (the one with most levels): that
+    feature's one-way table alone (dashed) and, for each band of equal exposure of its partner,
+    the feature's effect with this table added (the table averaged over the band's cells, and
+    over any third feature, by their exposure); under it, when the report has it, the A/E by
+    band of the first feature within each partner band; the train exposure below. Thin bands
+    and thin cells faded."""
+    link = r["model"]["link"]
+    scored = _scored(r)
+    lay = interaction_layout(r, inter, cls)
+    if lay is None:
+        return _none()
+    t, names, ix, iby = lay["t"], lay["names"], lay["ix"], lay["iby"]
+    xf, by, bands = lay["xf"], lay["by"], lay["bands"]
+    s_xb, f_xb, by_mass, support = lay["s_xb"], lay["f_xb"], lay["by_mass"], lay["support"]
+    base = lay["entries"][xf] or {}
+    axis = base["axis"]
+    mass = [float(m) for m in base["mass"]]
+    labels = cell_labels(axis)
+    mult = link in ("log", "logit")
+    if not bands:
+        return _none("No exposure in this table.")
+    band_label = dict(zip(map(tuple, bands), lay["band_labels"]))
 
     total = sum(support) or 1.0
     thin_share = r["thresholds"].get("thin_cell_mass") or 0.0
@@ -1735,7 +1756,7 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
     vals = [shown(v) for line in lines for _, v, _ in line] + [shown(main[c]) for c in cells]
     top_h, mass_h, foot = 210.0, 40.0, 26.0
     legend_items = [("line", "ref1", f"{xf}, one-way table")] + [
-        ("line", f"ib{i}", f"{by} {band_label(b)}") for i, b in enumerate(bands)]
+        ("line", f"ib{i}", f"{by} {band_label[tuple(b)]}") for i, b in enumerate(bands)]
     if by_mass and by_mass[0] > 0:
         legend_items.append(("box", "tol", f"{by} missing: not shown"))
     rows_of_legend: list[list[tuple[str, str, str]]] = [[]]
@@ -1747,16 +1768,46 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
             width = 0.0
         rows_of_legend[-1].append(item)
         width += need
+    # The report's A/E by band of the first feature within each partner band, per dataset; a
+    # band pair under `factor_min_mass` of the dataset's exposure is faded and off the scale.
+    ae = inter.get("ae") if isinstance(inter.get("ae"), dict) else None
+    ae_ds: list[tuple[int, dict[str, Any]]] = []
+    if ae is not None and [list(b) for b in ae.get("by_bands") or []] == [list(b) for b in bands]:
+        by_label = {str(d["label"]): d for d in ae.get("datasets") or []}
+        ae_ds = [(i, by_label[str(d["label"])]) for i, d in enumerate(scored)
+                 if str(d["label"]) in by_label]
+    x_band_of = {int(c): i for i, run in enumerate((ae or {}).get("x_bands") or []) for c in run}
+    fmin = r["thresholds"].get("factor_min_mass") or 0.0
+    tol = r["thresholds"].get("factor_ae")
+
+    def thin_pair(d: dict[str, Any], a: int, b: int) -> bool:
+        total = sum(sum(row) for row in d["mass"]) or 1.0
+        return float(d["mass"][a][b]) < fmin * total
+
+    ae_vals = _fv(d["ae"][a][b] for _, d in ae_ds for a in range(len(d["ae"]))
+                  for b in range(len(bands)) if not thin_pair(d, a, b))
+    span = (tol or 0.1) * 1.3
+    # One strip per partner band, on the x-axis of the chart above and one shared scale.
+    strip_h, strip_gap = 58.0, 22.0
+    ae_h = len(bands) * (strip_h + strip_gap) - strip_gap if ae_ds else 0.0
     t0 = 12 + 18 * len(rows_of_legend) + 4
-    m0 = t0 + top_h + 26
+    a0 = t0 + top_h + 44
+    m0 = (a0 + ae_h + 30) if ae_ds else (t0 + top_h + 26)
     h = m0 + mass_h + foot
     ys: _Scale = (_Log(min(vals), max(vals), t0 + top_h, t0, max_ticks=5) if mult
                   else _Lin(min(vals), max(vals), t0 + top_h, t0, n=4))
+    ae_lo = max(min(ae_vals + [1 - span]), 0.5)
+    ae_hi = min(max(ae_vals + [1 + span]), 1.6)
+
+    def strip(b: int) -> _Lin:
+        y0 = a0 + b * (strip_h + strip_gap)
+        return _Lin(ae_lo, ae_hi, y0 + strip_h, y0, pad=0.04, n=2)
 
     def fmt(v: float) -> str:
         return _mult_tick(v) if mult else _num(v, 2)
 
-    left, right = 6 + _label_w(ys, fmt) + 6, w - 10
+    left = 6 + max(_label_w(ys, fmt), _text_w("0.90") if ae_ds else 0.0) + 6
+    right = w - 10
     n = len(cells)
     slot = (right - left) / n
     xs = {c: left + (j + 0.5) * slot for j, c in enumerate(cells)}
@@ -1769,6 +1820,47 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
     for i, line in enumerate(lines):
         pts = [(xs[c], ys(shown(v))) for c, v, _ in line]
         _segments(svg, pts, [thin for _, _, thin in line], cls=f"ib{i}", faded_cls=f"ib{i} fade")
+    if ae_ds:
+        if tol:
+            svg.text(right, a0 - 24, f"dashed: ±{_pct(tol, 0)}; shaded: ±2σ", anchor="end")
+        for b in range(len(bands)):
+            sc = strip(b)
+            _legend(svg, left, sc.b - 6, [("line", f"ib{b}", f"{by} {band_label[tuple(bands[b])]}")])
+            marks = [1.0] + ([1 - tol, 1 + tol] if tol else [])
+            for v in marks:
+                if sc.lo <= v <= sc.hi:
+                    svg.hline(left, right, sc(v), "ref" if v == 1.0 else "guide")
+                    svg.text(left - 6, sc(v) + 4, _fixed2(v), anchor="end")
+        for i, d in ae_ds:
+            g = _Svg(w, h, "")
+            g.text(left, a0 - 24, f"A/E by {xf} band within each {by} band ({d['label']})",
+                   cls="lbl")
+            for b in range(len(bands)):
+                sc = strip(b)
+
+                def y_of(v: float) -> float:
+                    return sc(min(max(v, sc.lo), sc.hi))
+
+                runs: list[list[tuple[int, float, float, bool]]] = [[]]
+                for c in cells:
+                    a = x_band_of.get(c)
+                    v = d["ae"][a][b] if a is not None and a < len(d["ae"]) else None
+                    if v is None or a is None:
+                        runs.append([])
+                        continue
+                    sd = d.get("sd", [[None]])[a][b] if "sd" in d else None
+                    runs[-1].append((c, float(v), float(sd or 0.0), thin_pair(d, a, b)))
+                for run in (r_ for r_ in runs if r_):
+                    up = [(xs[c] + e * slot / 2, y_of(1 + 2 * sd)) for c, _, sd, _ in run
+                          for e in (-1, 1)]
+                    dn = [(xs[c] + e * slot / 2, y_of(1 - 2 * sd)) for c, _, sd, _ in run
+                          for e in (-1, 1)]
+                    g.add(f'<path class="ibw{b}" d="{_d(up + dn[::-1])}Z"/>')
+                    _segments(g, [(xs[c] + e * slot / 2, y_of(v)) for c, v, _, _ in run
+                                  for e in (-1, 1)],
+                              [thin for _, _, _, thin in run for _ in (0, 1)],
+                              cls=f"ib{b}", faded_cls=f"ib{b} fade")
+            svg.group(f"ds ds-{i}", g.parts)
     svg.text(left, m0 - 8, f"exposure, {scored[0]['label']}", cls="lbl")
     cap = max((mass[c] for c in cells), default=0.0) or 1.0
     bar_w = max(min(slot - 2, 26.0), 1.0)
@@ -1783,8 +1875,14 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
         for i, line in enumerate(lines):
             hit = next((v for cc, v, _ in line if cc == c), None)
             if hit is not None:
-                tips.append(f"{band_label(bands[i])} {show(shown(hit))}")
-        svg.hit(xs[c] - slot / 2, t0, slot, m0 + mass_h - t0, "; ".join(tips))
+                tips.append(f"{band_label[tuple(bands[i])]} {show(shown(hit))}")
+        a = x_band_of.get(c)
+        for _, d in ae_ds:
+            if a is not None and a < len(d["ae"]):
+                tips.append(f"{d['label']} A/E: " + ", ".join(
+                    f"{band_label[tuple(bands[b])]} {_fixed(d['ae'][a][b], 2)}"
+                    for b in range(len(bands))))
+        svg.hit(xs[c] - slot / 2, t0, slot, m0 + mass_h - t0, "\n".join(tips))
     return svg.render()
 
 
