@@ -69,6 +69,6 @@ kept only if it raises the training deviance by at most 1%.
 
 `graduation_alpha` fixes one strength for every table. `graduation_high_order_alpha` (off by
 default) adds a light neighbour smoothing for factored 3-way and higher interactions. Details are
-in `graduation_report_`. `graduate=False` ships the unsmoothed tables. Graduation is skipped for
-monotone-constrained fits and is not supported for models with three or more classes. See
+in `graduation_report_`. `graduate=False` ships the unsmoothed tables. Graduation is not supported
+for models with three or more classes. See
 [Graduation settings](../training-parameters/graduation.md).

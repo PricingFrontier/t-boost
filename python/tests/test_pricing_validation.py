@@ -154,12 +154,13 @@ def test_a_declined_graduation_alpha_warns_and_does_not_bind():
                    for r in ok.binding_report_)
 
 
-def test_monotone_final_tables_retain_full_function():
+def test_monotone_final_tables_are_monotone():
     x, y, _ = fixture()
     m = estimator(objective='squared_error', monotone_constraints=[1, 0]).fit(x, y)
     grid = np.column_stack([np.linspace(-4, 4, 100), np.full(100, 0.4)]).astype(np.float32)
     assert np.all(np.diff(m.predict(grid)) >= -1e-6)
-    assert 'full table bank' in m.pruning_report_['constraints']
+    assert 'constraints' not in m.pruning_report_
+    assert m.pruning_report_['monotone']['features'][0]['feature'] == 0
     assert m.graduation_validation_['holdout_rows'] == 0
 
 

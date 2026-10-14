@@ -3300,7 +3300,7 @@ pub fn prune_multiclass_to_tables(
 /// The f0 re-anchor shift `ln(Σwy / Σw·μ(raw))` for a set of already-computed raw predictions
 /// — the aggregate-balance correction, split out so a caller that already holds `raw` (the
 /// rebalance path) re-anchors without a second `score_bank_binned` pass.
-fn reanchor_shift(
+pub(crate) fn reanchor_shift(
     raw: &[f64],
     y: &[f32],
     w: &[f32],

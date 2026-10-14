@@ -17,8 +17,7 @@ def test_invalid_strength_fails_before_fit(alpha):
             np.zeros((20, 3), dtype=np.float32), np.zeros(20, dtype=np.float32))
 
 
-@pytest.mark.parametrize('kwargs', [dict(prune=False), dict(graduate=False),
-                                   dict(monotone_constraints=[1, 0, 0])])
+@pytest.mark.parametrize('kwargs', [dict(prune=False), dict(graduate=False)])
 def test_unsupported_configuration_is_not_silently_ignored(kwargs):
     with pytest.raises(ValueError, match='smoothing|graduation_high_order_alpha'):
         TBoostRegressor(graduation_high_order_alpha=0.5, **kwargs).fit(

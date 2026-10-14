@@ -6352,6 +6352,109 @@ impl PyTableModel {
         ))
     }
 
+    /// Project this deployed model back onto its monotone constraints (see
+    /// `t_boost_core::monotone`), and re-anchor the intercept when anything changed and
+    /// `reanchor` is set. `x`/`cat_x`/`y`/`weight`/`exposure` are the TRAINING data, `h` the
+    /// loss curvature per row at this model's score, and `monotone` one sign (-1/0/+1) per raw
+    /// feature in native order. Returns `(model, report_json)`; a model whose every constrained
+    /// family already passes comes back unchanged.
+    #[pyo3(signature = (x, h, monotone, y, weight, exposure=None, cat_x=None, reanchor=true, n_jobs=None))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: one argument per training input (§12.2).
+    fn enforce_monotone(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        h: PyReadonlyArray1<'_, f64>,
+        monotone: Vec<i8>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        exposure: Option<PyReadonlyArray1<'_, f32>>,
+        cat_x: Option<Vec<Vec<String>>>,
+        reanchor: bool,
+        n_jobs: Option<usize>,
+    ) -> PyResult<(PyTableModel, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let h = h
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("h must be contiguous float64: {e}")))?
+            .to_vec();
+        let y_vec = y
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
+            .to_vec();
+        let w_vec = weight
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
+            .to_vec();
+        let offset: Option<Vec<f32>> = match exposure {
+            Some(e) => Some(
+                e.as_slice()
+                    .map_err(|err| {
+                        PyValueError::new_err(format!("exposure must be contiguous: {err}"))
+                    })?
+                    .iter()
+                    .map(|&v| v.ln())
+                    .collect(),
+            ),
+            None => None,
+        };
+        let mut signs = Vec::new();
+        for (raw, &s) in monotone.iter().enumerate() {
+            if s != 0 {
+                let feature = u32::try_from(raw)
+                    .map_err(|_| PyValueError::new_err("too many features for monotone"))?;
+                signs.push(t_boost_core::monotone::MonotoneSign {
+                    feature,
+                    increasing: s > 0,
+                });
+            }
+        }
+        let model = Arc::clone(&self.model);
+        let (tm, report) = py
+            .detach(move || {
+                let run = || -> Result<(TableModel, String), PbError> {
+                    let binned = serve_binned_for_tables(&model, columns, cat_x, None)?;
+                    let loss = loss_choice_from_tag(&model.schema.objective)?;
+                    let (tm, report) = t_boost_core::monotone::enforce_monotone(
+                        &model,
+                        &binned,
+                        &y_vec,
+                        &w_vec,
+                        offset.as_deref(),
+                        loss.as_loss(),
+                        &signs,
+                        &h,
+                        reanchor,
+                    )?;
+                    let json = serde_json::to_string(&report).map_err(|err| {
+                        PbError::Serialization(format!(
+                            "could not serialize monotone report: {err}"
+                        ))
+                    })?;
+                    Ok((tm, json))
+                };
+                require_nonzero_n_jobs(n_jobs)?;
+                match n_jobs {
+                    Some(nj) => rayon::ThreadPoolBuilder::new()
+                        .num_threads(nj)
+                        .build()
+                        .map_err(|err| PbError::InvalidConfig {
+                            what: format!("could not build rayon pool: {err}"),
+                        })?
+                        .install(run),
+                    None => run(),
+                }
+            })
+            .map_err(py_err)?;
+        Ok((
+            PyTableModel {
+                model: Arc::new(tm),
+                serve: Default::default(),
+            },
+            report,
+        ))
+    }
+
     /// Every training label of each categorical raw feature, as `(raw id, labels)` in raw
     /// order (see `CatEncoderStore::known_labels`).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {

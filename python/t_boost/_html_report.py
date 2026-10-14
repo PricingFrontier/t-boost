@@ -2680,9 +2680,38 @@ def _build(r: dict[str, Any]) -> str:
         out.append(_card("Pruning", body))
     else:
         out.append(_card("Pruning", f'<p class="note">{_e(fit.get("reason") or "Not recorded")}.</p>'))
+    mono = _monotone(r)
+    if mono:
+        out.append(mono)
     out.append(_row(_graduation(r), _training(r)))
     out.append("</section>")
     return "".join(out)
+
+
+def _monotone(r: dict[str, Any]) -> str:
+    """One row per constrained feature: how far the deployed tables were moved back onto its
+    sign after pruning (empty when the fit has no monotone constraints)."""
+    fit = r["fit"]["pruning"]
+    rep = (fit["value"] or {}).get("monotone") if fit["available"] else None
+    if not rep:
+        return ""
+    names = list(r["model"]["native_feature_order"])
+    rows = []
+    for f in rep["features"]:
+        j = int(f["feature"])
+        name = names[j] if j < len(names) else str(j)
+        if not f["tables"]:
+            result = "not used by the model"
+        elif f["worst_step_before"] >= -1e-9:
+            result = "already monotone"
+        else:
+            clipped = len(f["clipped"])
+            result = (f"repaired: main effect moved by up to {_pct(math.expm1(f['main_change']))}"
+                      + (f", {clipped} interaction table(s) clipped" if clipped else ""))
+        rows.append([_e(name), "increasing" if f["sign"] > 0 else "decreasing", _e(result)])
+    return _card("Monotone constraints", _table(["feature", "direction", "result"], rows),
+                 what="The trees enforce each sign; after pruning, the deployed tables are "
+                      "projected back onto it")
 
 
 def _graduation(r: dict[str, Any]) -> str:

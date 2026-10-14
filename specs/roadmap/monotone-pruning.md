@@ -1,8 +1,8 @@
 # Monotone constraints without switching the pipeline off — plan
 
-Status: plan, revision 2 (2026-10-14), branch `report-0.9.1`. Not implemented. Revision 2 folds
-in a read-only review (Codex gpt-6-astra, ultra effort); its findings and what was done with each
-are at the end.
+Status: implemented 2026-10-14 on branch `report-0.9.1` (revision 2 of the plan, which folds in a
+read-only review: Codex gpt-6-astra, ultra effort; its findings and what was done with each are at
+the end). See "As built".
 
 ## Goal
 
@@ -373,17 +373,35 @@ Each bug fix gets its own regression test.
 
 1. Bugs 2–4 (small and independent), each with its test. Done: 52f4232.
 2. Remove the guards (item 1). Done: 7e1f070.
-3. `monotone.rs` primitives:
-   - the certificate;
-   - shifted PAVA with positive weights;
-   - invariant maintenance (sub-bank re-purify, re-centre, variances, re-anchor);
-   - verification.
+3. A Python prototype of candidates (i)–(iii) and rebalance on/off, compared on repaired outputs
+   (see "Benchmark"). Clipping (iii) won; rebalance stays on.
+4. `monotone.rs` with clipping (iii), its binding, the Python wiring, reports, docs, tests and
+   every gate in CONTRIBUTING.md.
 
-   Then, end to end: the main-only repair (candidate i), the bypass removed, the refusals
-   lifted.
-4. The benchmark: candidates (i)–(iii) and rebalance on/off, compared on repaired outputs.
-   Implement the winning interaction step if it isn't (i).
-5. Reports, docs, the remaining tests, and every gate in CONTRIBUTING.md.
+## As built (2026-10-14)
+
+- `crates/t-boost-core/src/monotone.rs`: `repair_bank` (the phases above) and
+  `enforce_monotone` (repair plus the intercept re-anchor). Ten unit tests check the repair
+  against brute force over every cell combination:
+  - one, two and three constrained features, both signs, tables shared between features;
+  - factored effects through both the exact and the bound path;
+  - purity and stored variances of every repaired table;
+  - PAVA against the min-max formula;
+  - a certified bank returned unchanged, and determinism.
+- Binding `_TableModel.enforce_monotone`. `_fit_and_prune` calls it last, after graduation,
+  weighted by `_band_curvature`.
+- `python/tests/test_monotone_pruning.py` covers:
+  - the default pipeline;
+  - a single-bag fit that keeps factored effects and needs a repair;
+  - `prune_main_effects`, both budgets, higher-order smoothing, and rebalance and graduation off;
+  - `prune=False`;
+  - the categorical refusal;
+  - a binary classifier;
+  - serialization and exports;
+  - the HTML report's Build-tab card.
+- On freMTPL2 the real estimator reproduces the prototype: test deviance 0.306977 with all
+  defaults and 0.306993 with graduation off, no reversals, 51 tables instead of 113 (today's
+  bypass: 0.307258).
 
 ## Not in this plan: other stages that are switched off (audit, 2026-10-14)
 

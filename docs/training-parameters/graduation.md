@@ -6,8 +6,7 @@ smoother for rating factors. Each table picks its own strength by generalized cr
 it. The outcome is recorded in the `graduation_report_` attribute. See
 [Pruning, banding and graduation](../algorithm/readable-tables.md) for details.
 
-Graduation is skipped for models with `monotone_constraints` and is not supported for
-multiclassification.
+Graduation is not supported for multiclassification.
 
 ## graduate {#graduate}
 
@@ -64,8 +63,8 @@ non-missing values are not smoothed. Effects with more than 1 024 stored boxes, 
 add more than 4 096 boxes in total or 2 000 000 cells, are skipped; the details are in
 `graduation_report_`.
 
-0 turns it off. Requires `prune=True` and graduation turned on; not supported with
-`monotone_constraints` or for multiclassification.
+0 turns it off. Requires `prune=True` and graduation turned on; not supported for
+multiclassification.
 
 **Type**
 

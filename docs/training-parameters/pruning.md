@@ -56,7 +56,7 @@ that contains it, and the path starts from the intercept-only model instead of t
 model. [`prune_path_fraction`](#prune_path_fraction) is then measured from the intercept-only
 model, which can change the interactions that are kept as well.
 
-Requires `prune=True` and cannot be combined with `monotone_constraints`.
+Requires `prune=True`.
 
 **Type**
 

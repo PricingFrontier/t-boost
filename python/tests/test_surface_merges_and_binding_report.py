@@ -338,13 +338,15 @@ def test_the_fold_vote_fallback_is_reported_on_the_ranked_path_knobs():
     assert _row(m, "prune_min_stability")["status"] != "INERT"   # the fold vote did run
 
 
-def test_a_monotone_fit_reports_its_selection_knobs_INERT():
-    # A monotone fit keeps the full table bank: no selector runs at all.
+def test_a_monotone_fit_runs_its_selector():
+    # A monotone fit used to keep the full table bank with no selector; now the selector runs
+    # and the deployed tables are projected back onto the signs afterwards.
     X, y = _fixture()
     m = TBoostRegressor(objective="poisson", n_trees=60, seed=0, n_jobs=2, prune=True,
                         monotone_constraints={"a": 1}, prune_min_stability=1.0).fit(X[["a", "b"]], y)
-    row = _row(m, "prune_min_stability")
-    assert (row["status"], row["overridden_by"]) == ("INERT", "monotone_constraints")
+    assert _row(m, "prune_min_stability")["overridden_by"] != "monotone_constraints"
+    assert _row(m, "monotone_constraints")["status"] == "HONOURED"
+    assert "monotone" in m.pruning_report_
 
 
 def test_multiclass_selection_knobs_follow_the_task():

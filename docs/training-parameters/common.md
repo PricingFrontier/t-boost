@@ -470,9 +470,11 @@ Supported formats for setting the value of this parameter:
 
 !!! note
 
-    A model with monotonic constraints keeps its full set of tables: pruning, banding and
-    graduation are skipped, and `prune_main_effects`, `prune_table_budget` and
-    `prune_box_budget` cannot be used with it.
+    Monotonic constraints apply to numeric features only; a constraint on a categorical feature
+    raises an error. The trees enforce the constraints. With `prune=True`, pruning, banding and
+    graduation run as for any other model, and the deployed tables are then projected back onto
+    the constraints, changing as little as possible. The `pruning_report_["monotone"]` attribute
+    records what changed.
 
 **Type**
 

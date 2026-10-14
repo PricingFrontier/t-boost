@@ -202,11 +202,14 @@ def test_prune_main_effects_needs_pruning() -> None:
         TBoostClassifier(n_trees=20, prune=False, prune_main_effects=True).fit(x, (y > 0).astype(int))
 
 
-def test_prune_main_effects_refuses_monotone_constraints() -> None:
+def test_prune_main_effects_works_with_monotone_constraints() -> None:
+    # Monotone fits used to keep the full bank and refuse this; the deployed tables are now
+    # projected back onto the signs after pruning, main effects pruned or not.
     x, y = _book(500)
     est = TBoostRegressor(n_trees=20, monotone_constraints=[1, 0, 0, 0, 0, 0], prune_main_effects=True)
-    with pytest.raises(ValueError, match="monotone_constraints"):
-        est.fit(x, y)
+    est.fit(x, y)
+    assert est.pruning_report_["main_effect_policy"] == "prunable"
+    assert est.pruning_report_["monotone"]["features"][0]["worst_step_after"] >= -1e-9
 
 
 def test_a_document_saved_before_the_parameter_loads_with_sticky_mains(

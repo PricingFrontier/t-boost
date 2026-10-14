@@ -508,6 +508,18 @@ class _TableModel:
         n_jobs: int | None = None,
         mse_cap: float = ...,
     ) -> tuple[_TableModel, str]: ...
+    def enforce_monotone(
+        self,
+        x: np.ndarray,
+        h: np.ndarray,
+        monotone: Sequence[int],
+        y: np.ndarray,
+        weight: np.ndarray,
+        exposure: np.ndarray | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        reanchor: bool = True,
+        n_jobs: int | None = None,
+    ) -> tuple[_TableModel, str]: ...
     def graduation_tables(
         self, max_cells: int = 2500
     ) -> list[tuple[int, list[int], list[int], list[float], list[float], list[bool]]]: ...

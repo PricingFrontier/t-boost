@@ -2403,8 +2403,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             and rep.get("evidence_budget_bound") is False
         )
         # The selector that chose the keep-set. Both gates are fold-vote knobs: when the ranked
-        # path ran instead, or a monotone fit kept the full bank, they are reported below with
-        # the other knobs of the selector that did not run.
+        # path ran instead, they are reported below with the other knobs of the selector that
+        # did not run.
         selector = rep.get("selector")
         fold_vote = selector in _FOLD_VOTE_SELECTORS
         for gate in ("prune_min_stability", "prune_min_mean_gain"):
@@ -2461,10 +2461,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 add_unread(_RANKED_PATH_KNOBS, "the ranked path needs out-of-bag rows and this "
                            "fit had none it could use (for example n_bags=1), so the fold vote "
                            "selected the tables", None)
-        elif pruning_on and "constraints" in rep:
-            add_unread(tuple(n for n in defaults if n.startswith("prune_")),
-                       "monotone_constraints keeps the full table bank, so no table selection "
-                       "ran", "monotone_constraints")
 
         # size caps: a cap above the bank never binds (the count is only read when a cap is set)
         for cap, what in (("prune_table_budget", "tables"), ("prune_box_budget", "boxes")):
@@ -2477,15 +2473,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 else:
                     add(cap, "HONOURED", f"cap applied to deployed {what}")
 
-        # monotone: disclose WHICH axes each sign was expanded onto (the fix of 2026-09-04 binds
-        # every axis a categorical emits, which is a policy choice the caller should see)
+        # monotone: say how the deployed tables were kept monotone
         mono = getattr(self, "monotone_constraints", None)
         if mono:
-            _fn = getattr(self, "feature_names_in_", None)      # a numpy array; `or []` is ambiguous
-            names = [] if _fn is None else list(_fn)
-            add("monotone_constraints", "HONOURED",
-                f"signs expanded onto every axis of each named feature"
-                + (f"; input features: {names}" if names else ""))
+            if "monotone" in rep:
+                how = ("the trees enforce the signs, and the deployed tables were projected back "
+                       "onto them after pruning; see pruning_report_['monotone']")
+            else:
+                how = "the trees enforce the signs; the full table bank is monotone as fitted"
+            add("monotone_constraints", "HONOURED", how)
 
         # Only when set away from its default, like every other row (the default 0.1 is simply
         # unused when eval_set supplies the rows; reporting it made every eval_set fit fail
@@ -2970,6 +2966,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if s not in (-1, 0, 1):
                 raise ValueError(f"monotone sign {s} must be -1, 0, or 1")
         return signs if any(signs) else None
+
+    @staticmethod
+    def _refuse_categorical_monotone(
+        monotone: list[int] | None, cat_idx: list[int], feature_names: list[str] | None
+    ) -> None:
+        """Monotone constraints apply to numeric features only. A categorical has no order of
+        its own (its axis is ordered by a target statistic learned from the data), so a sign on
+        one is refused rather than silently enforced along that learned order."""
+        if monotone is None:
+            return
+        bad = [i for i in cat_idx if monotone[i]]
+        if bad:
+            names = [feature_names[i] if feature_names is not None else f"f{i}" for i in bad]
+            raise ValueError(
+                f"monotone_constraints apply to numeric features only; {names} "
+                f"{'is' if len(names) == 1 else 'are'} categorical. To constrain an ordered "
+                "category, encode it as numbers."
+            )
 
     def _resolve_categorical(
         self, n_features: int, feature_names: list[str] | None
@@ -3866,20 +3880,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # reorder the design (numeric axes first, then categoricals, per `_split_columns`),
         # so remap the sign vector to that axis order before handing it to the core.
         monotone = self._resolve_monotone(n_features, feature_names)
-        if self.graduation_high_order_alpha > 0 and monotone and any(monotone):
-            raise ValueError("higher-order smoothing does not support monotone constraints")
+        self._refuse_categorical_monotone(monotone, cat_idx, feature_names)
         if monotone is not None and cat_idx:
             cat_set = set(cat_idx)
             numeric_idx = [i for i in range(n_features) if i not in cat_set]
             monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         if monotone is not None and any(monotone) and self.cell_refit_base is not None:
             raise ValueError("cell_refit_base cannot preserve monotone_constraints; leave it unset")
-        if (monotone is not None and any(monotone) and self.prune
-                and bool(getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT))):
-            raise ValueError(
-                "prune_main_effects cannot be honored with monotone_constraints: a monotone fit "
-                "deploys its full table bank without selection. Leave it at its default (False)."
-            )
         booster = self._new_booster(
             fit_pool_width=self._default_fit_pool(n_features), external_eval="eval_x" in deploy
         )
@@ -3982,12 +3989,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         `graduate=None` resolves to ON: the smoothing is free on the measured catalog and a
         graduated bank is the better artifact to print. `graduate=False` skips it entirely
-        (and `graduation_report_` is then never set). Monotone fits keep the full bank
-        verbatim (see `_fit_and_prune_core`) and never graduate. Multiclass (K>=3) has no
-        graduation path at all and never reaches this method.
+        (and `graduation_report_` is then never set). A monotone fit runs every stage like any
+        other fit and is then projected back onto its signs (`_enforce_monotone`), last.
+        Multiclass (K>=3) has no graduation path at all and never reaches this method.
         """
         n = len(y32)
-        do_graduate = self.graduate is not False and not (monotone and any(monotone))
+        do_graduate = self.graduate is not False
         if do_graduate:
             self.graduation_report_: list[dict[str, Any]] = []
         # `group_disjoint`/`selection_independent` are gone with the holdout they described:
@@ -4007,11 +4014,60 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 model, x32, y32, np.ascontiguousarray(w), exposure32, cat_x,
             )
         else:
-            self.graduation_validation_["skipped"] = (
-                "disabled" if self.graduate is False else "monotone_constraints"
-            )
+            self.graduation_validation_["skipped"] = "disabled"
         self.pruning_report_["graduation_validation"] = self.graduation_validation_
+        if monotone is not None and any(monotone):
+            model = self._enforce_monotone(
+                model, x32, y32, weight32, exposure32, cat_x, monotone
+            )
         return model
+
+    def _enforce_monotone(
+        self, model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int],
+    ) -> "_TableModel":
+        """Project the deployed tables back onto `monotone_constraints`, after every other stage
+        (see `t_boost_core::monotone`). The trees keep only the FULL bank monotone; selection,
+        rebalance, banding and graduation each change it without knowing the constraint. The
+        projection is weighted by the loss curvature, as banding is, and records what it did in
+        `pruning_report_["monotone"]`."""
+        obj = _canonical_objective(self.objective)
+        n = len(y32)
+        w = np.ascontiguousarray(
+            weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
+        )
+        offset = (np.log(np.asarray(exposure32, dtype=np.float64))
+                  if exposure32 is not None else 0.0)
+        raw = np.asarray(model.predict_raw(x32, cat_x=cat_x), dtype=np.float64)
+        h = _band_curvature(obj, raw + offset, np.asarray(w, dtype=np.float64), self.tweedie_rho)
+        repaired, report_json = model.enforce_monotone(
+            x32, np.ascontiguousarray(h, dtype=np.float64), [int(s) for s in monotone],
+            np.ascontiguousarray(y32), w,
+            exposure=(np.ascontiguousarray(exposure32) if exposure32 is not None else None),
+            cat_x=cat_x, reanchor=self._resolved_reanchor(), n_jobs=self._resolve_n_jobs(),
+        )
+        self.pruning_report_["monotone"] = json.loads(report_json)
+        self._reconcile_deployed(repaired)
+        return repaired
+
+    def _resolved_reanchor(self) -> bool:
+        """`reanchor`, with `None` resolved by objective (keep in lockstep with `_new_booster`'s
+        resolution; logistic added 2026-07-23, single-output path only)."""
+        if self.reanchor is None:
+            return _canonical_objective(self.objective) in {"poisson", "gamma", "tweedie", "logistic"}
+        return bool(self.reanchor)
+
+    def _reconcile_deployed(self, table_model: "_TableModel") -> None:
+        """Reconcile the selection report with the shipped artifact: keep-set members whose
+        tables purify to nothing (typically order-3 candidates on narrow data) never reach the
+        deployed bank, and the report used to silently overstate the model."""
+        deployed = sorted(tuple(u) for u in table_model.deployed_supports())
+        kept_keys = {tuple(sorted(int(i) for i in u)) for u in self.pruning_report_.get("kept", [])}
+        self.pruning_report_["deployed"] = [list(u) for u in deployed]
+        self.pruning_report_["kept_not_deployed"] = [
+            list(u) for u in sorted(kept_keys - set(deployed))
+        ]
 
     def _checked_min_variance_share(self) -> float:
         value = float(getattr(self, "prune_min_variance_share", _PRUNE_MIN_VARIANCE_SHARE_DEFAULT))
@@ -4206,12 +4262,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # (`recommended_recipe`, `params["reanchor"] = True`). That crashed every grouped tuned
         # deploy fit with UnboundLocalError (insur-arena fremotor_prem, 9/9 splits NaN).
         obj = _canonical_objective(self.objective)
-        reanchor = self.reanchor
-        if reanchor is None:
-            # keep in lockstep with `_new_booster`'s resolution (logistic added 2026-07-23,
-            # single-output path only — see the comment there).
-            reanchor = obj in {"poisson", "gamma", "tweedie", "logistic"}
-        reanchor = bool(reanchor)
+        reanchor = self._resolved_reanchor()
         w_full = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
         expo_full = np.ascontiguousarray(exposure32) if exposure32 is not None else None
 
@@ -4294,19 +4345,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         }
         full_supports = sorted(table_share)
-        if monotone is not None and any(monotone):
-            if self.prune_box_budget or self.prune_table_budget:
-                raise ValueError("monotone_constraints cannot be combined with table/box budgets")
-            self.pruning_report_: dict[str, Any] = {
-                "kept": [list(u) for u in full_supports],
-                "constraints": "full table bank retained; pruning/refits/graduation disabled",
-            }
-            return full_model.apply_keepset(
-                x32, np.ascontiguousarray(y32), np.ascontiguousarray(w_full),
-                [list(u) for u in full_supports], reanchor=reanchor, rebalance=False,
-                n_jobs=self._resolve_n_jobs(), exposure=expo_full, cat_x=cat_x,
-                **self._measure_kwargs(),
-            )
         full_tree_count = int(getattr(full_model, "n_trees", 0))
         trees_per_bag = max(1, math.ceil(full_tree_count / max(1, int(self.n_bags))))
         fold_tree_cap = min(int(self.n_trees), max(64, int(math.ceil(2.0 * trees_per_bag))))
@@ -4502,15 +4540,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             _lap(f"(3b) banding (tolerance {band_tol})")
         _lap(f"(3) deploy contribution keep-set ({len(keep)}/{len(full_supports)} tables)")
 
-        # Reconcile the selection report with the shipped artifact: keep-set members whose tables
-        # purify to nothing (typically order-3 candidates on narrow data) never reach the deployed
-        # bank, and the report used to silently overstate the model.
-        deployed = sorted(tuple(u) for u in table_model.deployed_supports())
-        kept_keys = {tuple(sorted(int(i) for i in u)) for u in self.pruning_report_.get("kept", [])}
-        self.pruning_report_["deployed"] = [list(u) for u in deployed]
-        self.pruning_report_["kept_not_deployed"] = [
-            list(u) for u in sorted(kept_keys - set(deployed))
-        ]
+        self._reconcile_deployed(table_model)
         return table_model
 
     # --- Whittaker-Henderson graduation of the deployed fANOVA tables (post-fit) -------------
@@ -5760,7 +5790,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
         step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for monotone or multiclass fits. Numeric
+        and graduation enabled; unsupported for multiclass fits. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -5941,7 +5971,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
-        ``f{i}``) or integer index, valued the same way.
+        ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
+        categorical feature raises. The trees enforce the signs; with ``prune=True`` every
+        pruning stage then runs as usual and the deployed tables are projected back onto the
+        signs last, changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -6036,7 +6069,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         interaction that needs it, and the path starts from the intercept-only model. So
         ``prune_path_fraction`` is then measured against the intercept-only model rather than
         the main-effects-only one, which can change the interactions kept as well. Requires
-        ``prune=True`` and refuses ``monotone_constraints`` (raises otherwise).
+        ``prune=True`` (raises otherwise).
     prune_selector : {"ranked_path", "fold_vote"}, default="ranked_path"
         How pruning chooses the tables to keep. ``"ranked_path"`` ranks the candidate tables by
         purified variance, admits them in that order under heredity (a k-way table only after
@@ -6347,6 +6380,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
         means the gate was off and every other field is inert.
+
+        ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
+        its tables, the certificate (``"exact"`` when every combination of the other features
+        was checked, ``"bound"`` when a sound bound was used), the worst step before and after
+        (link scale, ``>= 0`` is monotone), the largest change to its main effect, and the
+        interaction tables clipped. ``certified`` is true when the tables were already monotone
+        and were left untouched.
 
         ``["box_budget"]`` appears only when ``prune_box_budget > 0``: ``max_boxes`` (the
         budget), ``boxes_before``/``boxes_after`` and ``effects_before``/``effects_after`` (the
@@ -7037,7 +7077,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
         step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for monotone or multiclass fits. Numeric
+        and graduation enabled; unsupported for multiclass fits. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -7244,7 +7284,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
-        ``f{i}``) or integer index, valued the same way.
+        ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
+        categorical feature raises. The trees enforce the signs; with ``prune=True`` every
+        pruning stage then runs as usual and the deployed tables are projected back onto the
+        signs last, changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -7666,6 +7709,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
         means the gate was off and every other field is inert.
+
+        ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
+        its tables, the certificate (``"exact"`` when every combination of the other features
+        was checked, ``"bound"`` when a sound bound was used), the worst step before and after
+        (link scale, ``>= 0`` is monotone), the largest change to its main effect, and the
+        interaction tables clipped. ``certified`` is true when the tables were already monotone
+        and were left untouched.
 
         ``["box_budget"]`` appears only when ``prune_box_budget > 0``: ``max_boxes`` (the
         budget), ``boxes_before``/``boxes_after`` and ``effects_before``/``effects_after`` (the

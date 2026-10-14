@@ -48,6 +48,7 @@ pub mod error;
 pub mod explain;
 pub mod joint;
 pub mod loss;
+pub mod monotone;
 pub mod prune;
 pub mod report;
 pub(crate) mod sched;
