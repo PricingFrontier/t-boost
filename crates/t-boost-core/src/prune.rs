@@ -440,6 +440,9 @@ pub struct RebalanceReport {
     /// Whether the re-solved cell values were deployed: they lowered the deviance of the
     /// held-out slice (or there was none).
     pub adopted: bool,
+    /// The fraction of the re-solve deployed: 1 when adopted on a single-output fit; on a
+    /// multiclass fit, the joint step the held-out multinomial deviance chose. 0 when declined.
+    pub step: f64,
     /// The kept main and pair tables the re-solve spans.
     pub supports: u64,
     /// Kept main and pair tables left as fitted: each touches a categorical encoded by more
@@ -447,7 +450,8 @@ pub struct RebalanceReport {
     pub excluded: Vec<FeatureSet>,
     /// Rows held out of the re-solve to judge it.
     pub holdout_rows: u64,
-    /// The held-out slice's deviance (as the loss totals it) before the re-solve.
+    /// The held-out slice's deviance before the re-solve, on the loss's own scale (a total for a
+    /// single-output loss, the mean cross-entropy for a multiclass one).
     pub holdout_deviance_before: Option<f64>,
     /// The held-out slice's deviance after it.
     pub holdout_deviance_after: Option<f64>,
@@ -2519,6 +2523,7 @@ fn rebalance_kept_cells(
     crate::explain::add_bank_assign(&mut corrected, &delta_bank)?;
     corrected.f0 += shift;
     report.adopted = true;
+    report.step = 1.0;
     Ok((corrected, report))
 }
 
@@ -2555,6 +2560,182 @@ fn rebalance_supports(
         }
     }
     (supports, excluded)
+}
+
+/// Per-class corrections a multiclass rebalance deploys: each class's purified correction bank
+/// and its score on the training rows, both already scaled by the chosen step.
+type ClassCorrections = (Vec<TableBank>, Vec<Vec<f64>>);
+
+/// The post-prune rebalance of a multiclass keep-set: [`rebalance_kept_cells`] for each class's
+/// logit, from the softmax working residual at the re-anchored deploy logits `raw`
+/// (`[class][row]`). The K classes are solved apart (diagonal Hessian) and accepted or shrunk
+/// by ONE joint step on the held-out multinomial deviance, the design of the K-class §G1 cell
+/// refit (`attach_multiclass_cell_correction`), whose doc records why: the decoupled step keeps
+/// the joint Newton direction but overshoots it, most at small K. Step 0 declines it.
+///
+/// Each class is re-solved over the kept tables its own bank carries (`banks_kept`, the retained
+/// per-class banks): the keep-set is shared, but a class that never split on a feature has a
+/// one-cell grid there and nothing to correct. The classes share one provenance (enforced by
+/// `MultiClassModel::validate`). With per-class encoding channels (`cat_channels` including
+/// `class_freq`) every categorical is multi-channel, so its tables are left as fitted, as the
+/// cell refit leaves them (`n_blocked`).
+#[allow(clippy::too_many_arguments)]
+fn rebalance_multiclass_cells(
+    mc: &MultiClassModel,
+    banks_kept: &[TableBank],
+    raw: &[Vec<f64>],
+    serve: &ServeBinnedMatrix,
+    labels: &[u32],
+    w: &[f32],
+    w_measure: &RefMeasure,
+    mass: Option<&[f32]>,
+) -> Result<(Option<ClassCorrections>, RebalanceReport), PbError> {
+    let first = mc.classes.first().ok_or_else(|| PbError::Internal {
+        what: "multiclass rebalance: the model has no classes".into(),
+    })?;
+    // Per class: its kept tables as axes, and the union over classes for the report.
+    let mut class_supports = Vec::with_capacity(banks_kept.len());
+    let mut resolved: std::collections::BTreeSet<FeatureSet> = std::collections::BTreeSet::new();
+    let mut excluded: std::collections::BTreeSet<FeatureSet> = std::collections::BTreeSet::new();
+    for bank in banks_kept {
+        let carried: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
+        let (axes, left) = rebalance_supports(&first.provenance, &carried);
+        resolved.extend(
+            carried
+                .iter()
+                .filter(|u| u.order() <= 2 && !left.contains(u))
+                .cloned(),
+        );
+        excluded.extend(left);
+        class_supports.push(axes);
+    }
+    let mut report = RebalanceReport {
+        supports: resolved.len() as u64,
+        excluded: excluded.into_iter().collect(),
+        ..RebalanceReport::default()
+    };
+    if resolved.is_empty() {
+        return Ok((None, report));
+    }
+    let n = labels.len();
+    let n_classes = mc.classes.len();
+    let raw32: Vec<Vec<f32>> = raw
+        .iter()
+        .map(|col| col.iter().map(|&v| v as f32).collect())
+        .collect();
+    let mut probs = Vec::new();
+    crate::engine::boost::multiclass_softmax(&raw32, n_classes, n, &mut probs)?;
+    // The single-output rebalance's deterministic ~15% slice.
+    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
+
+    // (1) Per class: the Newton working residual z = -g/h, IRLS weight h (held-out rows carry
+    //     weight 0), the ridge cell correction, purified alone and scored (see the scalar twin).
+    //     The class solves are independent and mostly sequential inside, so they fan out over
+    //     the pool a wave at a time, as the cell refit's do; results keep class order.
+    let spec = crate::cell_refit::CellRefitSpec::default();
+    let solve = |k: usize| -> Result<(TableBank, Vec<f64>), PbError> {
+        let model = mc.classes.get(k).ok_or_else(|| PbError::Internal {
+            what: format!("multiclass rebalance: no class {k}"),
+        })?;
+        let supports = class_supports.get(k).ok_or_else(|| PbError::Internal {
+            what: format!("multiclass rebalance: no supports for class {k}"),
+        })?;
+        let mut gh = crate::loss::GradHess {
+            g: vec![0.0_f32; n],
+            h: vec![0.0_f32; n],
+        };
+        crate::engine::boost::fill_grad_hess_from_probs(&probs, labels, w, k, n_classes, &mut gh)?;
+        let mut residual = vec![0.0_f64; n];
+        let mut weight = vec![0.0_f64; n];
+        for r in 0..n {
+            if !is_holdout(r) {
+                let h = f64::from(gh.h[r]).max(1e-12);
+                residual[r] = -f64::from(gh.g[r]) / h;
+                weight[r] = h;
+            }
+        }
+        let corr = crate::cell_refit::fit_cell_correction(
+            model,
+            &serve.0.data,
+            &residual,
+            &weight,
+            supports,
+            &spec,
+        )?;
+        let bank = crate::explain::purify_correction(model, serve, w_measure.clone(), mass, &corr)?;
+        let mut score = vec![0.0_f64; n];
+        crate::scoring::score_bank_binned(&bank, &model.schema.cat_encoders, &serve.0, &mut score)?;
+        Ok((bank, score))
+    };
+    let class_ids: Vec<usize> = (0..n_classes).collect();
+    let mut banks = Vec::with_capacity(n_classes);
+    let mut scores = Vec::with_capacity(n_classes);
+    for wave in class_ids.chunks(crate::engine::boost::MC_REFIT_CLASS_WAVE) {
+        let solved: Vec<(TableBank, Vec<f64>)> = wave
+            .par_iter()
+            .map(|&k| solve(k))
+            .collect::<Result<_, _>>()?;
+        for (bank, score) in solved {
+            banks.push(bank);
+            scores.push(score);
+        }
+    }
+
+    // (2) One joint step: the held-out multinomial deviance of `raw + step·δ`, all K classes
+    //     together, over the cell refit's grid. Without held-out rows the Newton step stands.
+    let hrows: Vec<usize> = (0..n).filter(|&r| is_holdout(r)).collect();
+    report.holdout_rows = hrows.len() as u64;
+    let mut step = 1.0_f64;
+    if !hrows.is_empty() {
+        let mut candidate: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; n_classes];
+        let (mut best_dev, mut best_step) = (f64::INFINITY, 0.0_f64);
+        for &trial in &crate::engine::boost::MC_CORRECTION_STEPS {
+            let trial = f64::from(trial);
+            for ((cand, base), delta) in candidate.iter_mut().zip(raw).zip(&scores) {
+                for &r in &hrows {
+                    cand[r] = (base[r] + trial * delta[r]) as f32;
+                }
+            }
+            let dev =
+                crate::engine::boost::multiclass_deviance_for_rows(&candidate, labels, w, &hrows)?;
+            if trial == 0.0 {
+                report.holdout_deviance_before = Some(dev);
+            }
+            if dev < best_dev {
+                (best_dev, best_step) = (dev, trial);
+            }
+        }
+        report.holdout_deviance_after = Some(best_dev);
+        step = best_step;
+    }
+    report.step = step;
+    report.adopted = step > 0.0;
+    if !report.adopted {
+        return Ok((None, report));
+    }
+    if step < 1.0 {
+        for bank in &mut banks {
+            scale_bank(bank, step)?;
+        }
+        for score in &mut scores {
+            for v in score.iter_mut() {
+                *v *= step;
+            }
+        }
+    }
+    Ok((Some((banks, scores)), report))
+}
+
+/// `bank` times `s`: purification is linear, so this is the bank purified from the scaled
+/// correction.
+fn scale_bank(bank: &mut TableBank, s: f64) -> Result<(), PbError> {
+    bank.f0 *= s;
+    for table in &mut bank.tables {
+        let values: Vec<f64> = table.values.try_values()?.iter().map(|v| v * s).collect();
+        table.values = crate::explain::Tensor::from_vec(table.values.shape(), values)?;
+        table.variance *= s * s;
+    }
+    Ok(())
 }
 
 /// Intercept-only multinomial re-anchor: the per-class shifts `delta` that make the softmax's
@@ -2736,13 +2917,14 @@ pub fn prune_multiclass_to_keepset(
     w_measure: RefMeasure,
     keep: &[FeatureSet],
 ) -> Result<MultiClassTableModel, PbError> {
-    let (out, _, _) = prune_multiclass_to_keepset_budgeted(
+    let (out, _, _, _) = prune_multiclass_to_keepset_budgeted(
         mc,
         serve,
         labels,
         w,
         w_measure,
         keep,
+        false,
         0,
         0,
         DEFAULT_TABLE_MIN_ARITY,
@@ -2800,11 +2982,13 @@ pub fn multiclass_full_tables(
     Ok(out)
 }
 
-/// [`prune_multiclass_to_keepset`] with a DEPLOYED-BOX BUDGET (see [`apply_box_budget`]).
+/// [`prune_multiclass_to_keepset`] with a DEPLOYED-BOX BUDGET (see [`apply_box_budget`]) and,
+/// with `rebalance`, the post-prune rebalance of the kept tables (see
+/// [`rebalance_multiclass_cells`]), followed by a second intercept re-anchor.
 ///
 /// The keep-set is shared across classes, so the budget is too: a support's cost is the sum of
 /// its box counts over the K per-class banks, because a filing reader faces every class's copy
-/// of it. `max_boxes == 0` disables the budget and reproduces
+/// of it. `max_boxes == 0` disables the budget and, without `rebalance`, reproduces
 /// [`prune_multiclass_to_keepset`] bit-for-bit.
 ///
 /// # Errors
@@ -2816,11 +3000,20 @@ pub fn prune_multiclass_to_keepset_budgeted(
     w: &[f32],
     w_measure: RefMeasure,
     keep: &[FeatureSet],
+    rebalance: bool,
     max_boxes: usize,
     max_tables: usize,
     table_min_arity: u8,
     evidence: &BTreeMap<FeatureSet, f64>,
-) -> Result<(MultiClassTableModel, BoxBudgetReport, TableBudgetReport), PbError> {
+) -> Result<
+    (
+        MultiClassTableModel,
+        BoxBudgetReport,
+        TableBudgetReport,
+        Option<RebalanceReport>,
+    ),
+    PbError,
+> {
     let n = serve.0.n_rows as usize;
 
     if labels.len() != n || w.len() != n {
@@ -2887,6 +3080,40 @@ pub fn prune_multiclass_to_keepset_budgeted(
     for (bank, d) in pruned_banks.iter_mut().zip(&delta) {
         bank.f0 += d;
     }
+    let mut rebalance_report = None;
+    if rebalance {
+        let anchored: Vec<Vec<f64>> = raw
+            .iter()
+            .zip(&delta)
+            .map(|(col, d)| col.iter().map(|v| v + d).collect())
+            .collect();
+        let (corrections, report) = rebalance_multiclass_cells(
+            mc,
+            &pruned_banks,
+            &anchored,
+            serve,
+            labels,
+            w,
+            &w_measure,
+            mass.as_deref(),
+        )?;
+        if let Some((banks, scores)) = corrections {
+            for (bank, correction) in pruned_banks.iter_mut().zip(&banks) {
+                crate::explain::add_bank_assign(bank, correction)?;
+            }
+            // The corrections move each class's logit mass: re-anchor the intercepts again.
+            let corrected: Vec<Vec<f64>> = anchored
+                .iter()
+                .zip(&scores)
+                .map(|(col, d)| col.iter().zip(d).map(|(a, b)| a + b).collect())
+                .collect();
+            let shift = multiclass_intercept_shifts(&corrected, labels, w, "rebalance reanchor")?;
+            for (bank, d) in pruned_banks.iter_mut().zip(&shift) {
+                bank.f0 += d;
+            }
+        }
+        rebalance_report = Some(report);
+    }
     let classes: Vec<TableModel> = pruned_banks
         .into_iter()
         .zip(mc.classes.iter())
@@ -2906,7 +3133,7 @@ pub fn prune_multiclass_to_keepset_budgeted(
         schema_version: class_version,
     };
     out.validate()?;
-    Ok((out, box_report, table_report))
+    Ok((out, box_report, table_report, rebalance_report))
 }
 
 /// # Errors

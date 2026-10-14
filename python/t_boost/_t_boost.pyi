@@ -184,6 +184,7 @@ class _Booster:
         path_tolerance: float = 0.0,
         prune_main_effects: bool = False,
         path_min_share: float = 0.0,
+        rebalance: bool = False,
     ) -> tuple[_MultiClassTableModel, str]: ...
 
     def fit_prune_folds(

@@ -12,9 +12,9 @@ import numpy as np
 import polars as pl
 import pytest
 
-from t_boost import TBoostRegressor
+from t_boost import TBoostClassifier, TBoostRegressor
 
-KEYS = {"adopted", "supports", "excluded", "holdout_rows", "holdout_deviance_before",
+KEYS = {"adopted", "step", "supports", "excluded", "holdout_rows", "holdout_deviance_before",
         "holdout_deviance_after"}
 
 
@@ -51,3 +51,45 @@ def test_tables_on_a_multichannel_categorical_are_left_as_fitted(data) -> None:
     kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
     assert rep["excluded"] == [u for u in kept if 2 in u] != []
     assert rep["supports"] == len(kept) - len(rep["excluded"]) > 0
+
+
+@pytest.fixture(scope="module")
+def three_class() -> tuple[pl.DataFrame, np.ndarray]:
+    rng = np.random.default_rng(5)
+    n = 6000
+    x = rng.normal(size=(n, 3))
+    c = rng.choice([f"L{i}" for i in range(12)], n)
+    logits = np.stack([np.zeros(n), 1.5 * np.tanh(x[:, 0]) + x[:, 0] * x[:, 1],
+                       -x[:, 1] + 0.8 * x[:, 2] * (c < "L6")], axis=1)
+    p = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+    y = (rng.uniform(size=(n, 1)) > np.cumsum(p, axis=1)).sum(axis=1)
+    return pl.DataFrame({"a": x[:, 0], "b": x[:, 1], "d": x[:, 2], "c": c}), y
+
+
+def _fit_mc(data, **kw) -> TBoostClassifier:
+    X, y = data
+    # Few, large trees underfit: the dropped tables then leave a residual the re-solve recovers.
+    return TBoostClassifier(n_trees=8, learning_rate=0.3, validation_fraction=None, seed=0,
+                            n_jobs=2, **kw).fit(X, y)
+
+
+def test_a_multiclass_fit_rebalances_with_one_joint_step(three_class) -> None:
+    est = _fit_mc(three_class)
+    rep = est.pruning_report_["rebalance"]
+    assert set(rep) == KEYS
+    assert rep["adopted"] and 0 < rep["step"] <= 1
+    assert rep["holdout_deviance_after"] < rep["holdout_deviance_before"]
+    off = _fit_mc(three_class, prune_rebalance=False)
+    assert off.pruning_report_.get("rebalance") is None
+    X, _ = three_class
+    assert not np.array_equal(est.predict_proba(X), off.predict_proba(X))
+    np.testing.assert_allclose(est.predict_proba(X).sum(axis=1), 1.0, rtol=1e-5)
+
+
+def test_per_class_channels_leave_the_categorical_as_fitted(three_class) -> None:
+    # `class_freq` gives "c" (raw 3) one channel per class, so its tables have no single axis.
+    est = _fit_mc(three_class, cat_channels=["mean", "class_freq"])
+    rep = est.pruning_report_["rebalance"]
+    kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
+    assert sorted(rep["excluded"]) == sorted(u for u in kept if 3 in u) != []
+    assert rep["supports"] == len(kept) - len(rep["excluded"])

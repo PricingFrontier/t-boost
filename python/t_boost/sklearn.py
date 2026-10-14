@@ -7678,10 +7678,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Tables on a
-        categorical encoded by several channels are left as fitted; the outcome is in
-        ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned model.
-        Binary (K=2) path only. Only has an effect together with ``prune=True``.
+        Held-out no-harm guarded: adopted only if it lowers held-out deviance. On a multiclass
+        (K>=3) fit each class's tables are re-solved from the softmax residual, and one joint
+        step, chosen on the held-out multinomial deviance, decides how much of it is kept.
+        Tables on a categorical encoded by several channels are left as fitted; the outcome
+        is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
+        model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
         bands. Adjacent cells are merged where the model barely distinguishes
@@ -8411,6 +8413,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 path_fraction=float(getattr(self, "prune_path_fraction", _PRUNE_PATH_FRACTION_DEFAULT)),
                 path_tolerance=float(getattr(self, "prune_path_tolerance", _PRUNE_PATH_TOLERANCE_DEFAULT)),
                 path_min_share=self._checked_min_variance_share(),
+                # See `prune_rebalance`: the kept tables are re-solved per class.
+                rebalance=bool(self.prune_rebalance),
                 # See `_PRUNE_MAIN_EFFECTS_DEFAULT`: every multiclass selector honors it.
                 prune_main_effects=bool(
                     getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)

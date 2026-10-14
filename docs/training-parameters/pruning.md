@@ -192,7 +192,9 @@ After tables are dropped, re-solve the values of the remaining tables for the sm
 (one ridge IRLS step, followed by purification). The new values are kept only if they lower the
 held-out deviance. Tables on a categorical feature encoded by several channels (see
 [`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
-two-way interaction is re-solved. The outcome is recorded in `pruning_report_["rebalance"]`.
+two-way interaction is re-solved. For multiclassification each class's tables are re-solved,
+and a single step size, chosen on the held-out deviance of all classes together, decides how much
+of the change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
 
 `False` deploys the remaining tables with their values unchanged.
 

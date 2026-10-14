@@ -4339,7 +4339,7 @@ impl PyBooster {
     /// Fit native-softmax on the complement of `sel_rows`, then prune the per-class banks with a
     /// shared keep-set selected on those held-out rows. The full design crosses the Python boundary
     /// once; row gathering, fitting, full-data serving, and pruning run on one bounded Rayon pool.
-    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard_min_rows=500, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0))]
+    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard_min_rows=500, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0, rebalance=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit_multiclass_pruned(
         &self,
@@ -4407,6 +4407,8 @@ impl PyBooster {
         prune_main_effects: bool,
         // The ranked path's variance-share floor (`t_boost_core::prune::drop_low_share`).
         path_min_share: f64,
+        // Re-solve the kept tables after the keep-set (see `rebalance_multiclass_cells`).
+        rebalance: bool,
     ) -> PyResult<(PyMultiClassTableModel, String)> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4471,6 +4473,7 @@ impl PyBooster {
                     path_tolerance,
                     prune_main_effects,
                     path_min_share,
+                    rebalance,
                 )
             })
             .map_err(py_err)?;
@@ -8739,6 +8742,7 @@ fn fit_multiclass_pruned_owned(
     path_tolerance: f64,
     prune_main_effects: bool,
     path_min_share: f64,
+    rebalance: bool,
 ) -> Result<(MultiClassTableModel, String), PbError> {
     let n = y.len();
     if n == 0 {
@@ -9265,20 +9269,22 @@ fn fit_multiclass_pruned_owned(
             .map(|ts| (ts.u.clone(), ts.mean_gain))
             .collect();
         let w_measure_band = w_measure.clone();
-        let (table_model, box_report, table_report) = mc_stage("keepset_apply", || {
-            prune_multiclass_to_keepset_budgeted(
-                &deploy_model,
-                &deploy_serve,
-                &labels,
-                &full_weight,
-                w_measure,
-                &shipped_keep,
-                box_budget,
-                table_budget,
-                table_min_arity,
-                &evidence,
-            )
-        })?;
+        let (table_model, box_report, table_report, rebalance_report) =
+            mc_stage("keepset_apply", || {
+                prune_multiclass_to_keepset_budgeted(
+                    &deploy_model,
+                    &deploy_serve,
+                    &labels,
+                    &full_weight,
+                    w_measure,
+                    &shipped_keep,
+                    rebalance,
+                    box_budget,
+                    table_budget,
+                    table_min_arity,
+                    &evidence,
+                )
+            })?;
         // BANDING (see `band_multiclass_table_model`): after the keep-set, before the report.
         let (table_model, banding_reports) = match band_tolerance {
             Some(tol) => {
@@ -9326,6 +9332,16 @@ fn fit_multiclass_pruned_owned(
             );
             if let Some(sel) = selection_json {
                 obj.insert("selection".into(), sel);
+            }
+            if let Some(rep) = &rebalance_report {
+                obj.insert(
+                    "rebalance".into(),
+                    serde_json::to_value(rep).map_err(|err| {
+                        PbError::Serialization(format!(
+                            "could not serialize rebalance report: {err}"
+                        ))
+                    })?,
+                );
             }
             if let Some(reps) = &banding_reports {
                 obj.insert(

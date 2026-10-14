@@ -443,7 +443,7 @@ const INCREMENTAL_MU_REFRESH_ROUNDS: u32 = 64;
 
 /// Class solves the K>=3 cell refit runs at once (see `attach_multiclass_cell_correction`): each
 /// holds one `supports x fit_rows` design, so this caps the designs live together.
-const MC_REFIT_CLASS_WAVE: usize = 8;
+pub(crate) const MC_REFIT_CLASS_WAVE: usize = 8;
 
 /// Best-round restore state for early-stop truncation (see the `best_snapshot` comment in
 /// `fit_single`): the cheap `Alphas` form suffices when only alphas can be mutated after the
@@ -1839,6 +1839,11 @@ fn fit_multiclass_bagged(
     Ok(out)
 }
 
+/// The step sizes a K-class decoupled cell correction is scored at on held-out rows: halvings
+/// from the Newton step (1) down to declining it (0), finer below 0.25 because the decoupled
+/// direction's known failure is overshoot (see [`attach_multiclass_cell_correction`]).
+pub(crate) const MC_CORRECTION_STEPS: [f32; 8] = [0.0, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0];
+
 /// The K-class §G1 cell-basis correction: K decoupled diagonal-Hessian cell solves on the
 /// out-of-bag softmax working residual, accepted or shrunk by ONE JOINT BACKTRACK on the true
 /// multinomial loss. The multiclass analogue of [`attach_cell_correction`].
@@ -2081,8 +2086,7 @@ fn attach_multiclass_cell_correction(
         let mut cand: Vec<Vec<f32>> = vec![vec![0.0_f32; hrows.len()]; n_classes];
         let mut best_dev = f64::INFINITY;
         let mut best = 0.0_f32;
-        const LAMBDAS: [f32; 8] = [0.0, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0];
-        for &lam in &LAMBDAS {
+        for &lam in &MC_CORRECTION_STEPS {
             for k in 0..n_classes {
                 for i in 0..hrows.len() {
                     cand[k][i] = hraw[k][i] + lam * hd[k][i];
@@ -2095,7 +2099,7 @@ fn attach_multiclass_cell_correction(
             }
         }
         // "Rejected" = every trial step the joint loss refused, i.e. the halvings walked past.
-        n_rejected = LAMBDAS.iter().filter(|&&l| l > best).count();
+        n_rejected = MC_CORRECTION_STEPS.iter().filter(|&&l| l > best).count();
         lambda = best;
     }
     if lambda <= 0.0 {
@@ -2602,7 +2606,7 @@ fn multiclass_init(labels: &[u32], weight: &[f32], n_classes: usize) -> Result<V
 /// Fill `probs` with the row-major `n × K` softmax probabilities from the K raw columns (reuses
 /// the stable [`softmax_in_place`]). `probs` is resized in place (a no-op at steady `n,K`), so the
 /// caller reuses one buffer across rounds with no per-round allocation. Deterministic per-row.
-fn multiclass_softmax(
+pub(crate) fn multiclass_softmax(
     raw: &[Vec<f32>],
     n_classes: usize,
     n: usize,
@@ -2653,7 +2657,7 @@ fn multiclass_softmax(
 
 /// Fill `out` with class-`k` softmax `(g, h)` from the precomputed `n x K` probabilities:
 /// `g = w(p_k - 1[y=k])`, `h = (w * p_k(1-p_k)).max(1e-16)`. Deterministic row map.
-fn fill_grad_hess_from_probs(
+pub(crate) fn fill_grad_hess_from_probs(
     probs: &[f32],
     labels: &[u32],
     weight: &[f32],
