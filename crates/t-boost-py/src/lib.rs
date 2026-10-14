@@ -5768,9 +5768,12 @@ type BagOobGroupArrays<'py> = (
     Bound<'py, PyArray1<u32>>,
 );
 
+/// One dense table's graduation payload: `(table index, feature ids, shape, values, support,
+/// per-axis categorical flags)`.
+type GraduationTableInput = (usize, Vec<u32>, Vec<usize>, Vec<f64>, Vec<f64>, Vec<bool>);
+
 /// Low-level Python tables-only served model: a pruned/purified fANOVA bank that IS the model,
 /// scored by the lossless LUT-sum (no trees). Produced by [`PyModel::prune_to_tables`].
-type GraduationTableInput = (usize, Vec<u32>, Vec<usize>, Vec<f64>, Vec<f64>, Vec<bool>);
 
 #[pyclass(name = "_TableModel", skip_from_py_object)]
 #[derive(Clone)]
@@ -5847,48 +5850,7 @@ impl PyTableModel {
     /// serializing and parsing the complete model merely to inspect a handful of table tensors.
     #[pyo3(signature = (max_cells=2500))]
     fn graduation_tables(&self, max_cells: usize) -> PyResult<Vec<GraduationTableInput>> {
-        let mut out = Vec::new();
-        for (index, table) in self.model.bank.tables.iter().enumerate() {
-            let shape = table.values.shape();
-            if table.values.is_sparse()
-                || table.support.is_sparse()
-                || !(1..=2).contains(&shape.len())
-                || table.values.len() > max_cells
-            {
-                continue;
-            }
-            if table.support.shape() != shape {
-                return Err(py_err(PbError::ShapeMismatch {
-                    what: format!("graduation table {index} support shape differs from values"),
-                }));
-            }
-            let mut axis_categorical = Vec::with_capacity(table.axes.len());
-            for axis in &table.axes {
-                let provenance = self
-                    .model
-                    .provenance
-                    .iter()
-                    .find(|provenance| provenance.raw == axis.raw)
-                    .ok_or_else(|| {
-                        py_err(PbError::Internal {
-                            what: format!(
-                                "graduation table {index} axis raw {} has no provenance",
-                                axis.raw.0
-                            ),
-                        })
-                    })?;
-                axis_categorical.push(!matches!(provenance.kind, AxisKind::Numeric));
-            }
-            out.push((
-                index,
-                feature_set_ids(&table.u),
-                shape,
-                table.values.values().into_owned(),
-                table.support.values().into_owned(),
-                axis_categorical,
-            ));
-        }
-        Ok(out)
+        graduation_table_inputs(&self.model, max_cells).map_err(py_err)
     }
 
     /// Apply dense graduation and optional reference-preserving factored diffusion together.
@@ -7133,6 +7095,60 @@ impl PyMultiClassTableModel {
     fn deployed_census<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let banks: Vec<&TableBank> = self.model.classes.iter().map(|c| &c.bank).collect();
         deployed_census_dict(py, &banks)
+    }
+
+    /// The dense order-1/2 tables of every class bank the graduation solver can smooth, one list
+    /// per class (see `_TableModel.graduation_tables`).
+    #[pyo3(signature = (max_cells=2500))]
+    fn graduation_tables(&self, max_cells: usize) -> PyResult<Vec<Vec<GraduationTableInput>>> {
+        self.model
+            .classes
+            .iter()
+            .map(|c| graduation_table_inputs(c, max_cells).map_err(py_err))
+            .collect()
+    }
+
+    /// Graduate every class bank: the smoothed dense tables `(class, table, values)` and, with
+    /// `alpha > 0`, the high-order diffusion, re-anchored and kept only if the training
+    /// multinomial deviance rises by at most 1% (see `apply_multiclass_graduation`). Returns the
+    /// model, whether the smoothing was adopted, and the per-class high-order reports as JSON.
+    #[pyo3(signature = (x, y, weight, updates, alpha=0.0, cat_x=None, n_jobs=None, box_budget=0))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: the design plus the graduation knobs.
+    fn apply_graduation(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        updates: Vec<(usize, usize, Vec<f64>)>,
+        alpha: f64,
+        cat_x: Option<Vec<Vec<String>>>,
+        n_jobs: Option<usize>,
+        box_budget: usize,
+    ) -> PyResult<(PyMultiClassTableModel, bool, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
+        let weight = array1_to_vec(weight, "weight")?;
+        let model = Arc::clone(&self.model);
+        let (graduated, adopted, reports) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    apply_multiclass_graduation(
+                        &model, columns, labels, weight, cat_x, updates, alpha, box_budget,
+                    )
+                })
+            })
+            .map_err(py_err)?;
+        let reports =
+            serde_json::to_string(&reports).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((
+            PyMultiClassTableModel {
+                model: Arc::new(graduated),
+                serve: Default::default(),
+            },
+            adopted,
+            reports,
+        ))
     }
 
     #[getter]
@@ -10329,6 +10345,299 @@ fn deployed_census_dict<'py>(
     Ok(d)
 }
 
+/// The dense order-1/2 tables of `model` the graduation solver can smooth (see
+/// `_TableModel.graduation_tables`).
+fn graduation_table_inputs(
+    model: &TableModel,
+    max_cells: usize,
+) -> Result<Vec<GraduationTableInput>, PbError> {
+    let mut out = Vec::new();
+    for (index, table) in model.bank.tables.iter().enumerate() {
+        let shape = table.values.shape();
+        if table.values.is_sparse()
+            || table.support.is_sparse()
+            || !(1..=2).contains(&shape.len())
+            || table.values.len() > max_cells
+        {
+            continue;
+        }
+        if table.support.shape() != shape {
+            return Err(PbError::ShapeMismatch {
+                what: format!("graduation table {index} support shape differs from values"),
+            });
+        }
+        let mut axis_categorical = Vec::with_capacity(table.axes.len());
+        for axis in &table.axes {
+            let provenance = model
+                .provenance
+                .iter()
+                .find(|provenance| provenance.raw == axis.raw)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!(
+                        "graduation table {index} axis raw {} has no provenance",
+                        axis.raw.0
+                    ),
+                })?;
+            axis_categorical.push(!matches!(provenance.kind, AxisKind::Numeric));
+        }
+        out.push((
+            index,
+            feature_set_ids(&table.u),
+            shape,
+            table.values.values().into_owned(),
+            table.support.values().into_owned(),
+            axis_categorical,
+        ));
+    }
+    Ok(out)
+}
+
+/// One bank's graduation candidate: `bank` (the high-order diffusion's output) with the smoothed
+/// dense `updates` applied and, when there are any, re-purified. No re-anchor and no check: the
+/// callers own both.
+fn graduated_model(
+    model: &TableModel,
+    bank: TableBank,
+    updates: Vec<(usize, Vec<f64>)>,
+) -> Result<TableModel, PbError> {
+    let mut graduated = model.clone();
+    graduated.bank = bank;
+    let dense_changed = !updates.is_empty();
+    let mut seen = BTreeSet::new();
+    for (index, values) in updates {
+        if !seen.insert(index) {
+            return Err(PbError::InvalidInput {
+                what: format!("graduation table {index} was updated more than once"),
+            });
+        }
+        let table = graduated
+            .bank
+            .tables
+            .get_mut(index)
+            .ok_or_else(|| PbError::InvalidInput {
+                what: format!("graduation table index {index} out of range"),
+            })?;
+        if table.values.is_sparse() {
+            return Err(PbError::InvalidInput {
+                what: format!("graduation table {index} is sparse"),
+            });
+        }
+        if values.len() != table.values.len() || values.iter().any(|value| !value.is_finite()) {
+            return Err(PbError::InvalidInput {
+                what: format!(
+                    "graduation table {index} received {} finite cells, expected {}",
+                    values.len(),
+                    table.values.len()
+                ),
+            });
+        }
+        table.values = Tensor::from_vec(table.values.shape(), values)?;
+    }
+
+    if dense_changed {
+        // Re-purify: GCV smoothing preserves each table's own support-weighted grand mean, not
+        // the per-axis-slice w-weighted zero means Purity requires, so a smoothed table can
+        // silently absorb lower-order mass (e.g. a smoothed 2-D interaction table absorbing part
+        // of a main effect). Feed every CURRENT (post-smoothing) table back through the canonical
+        // purify cascade as if it were raw — purify is linear, so this is exactly equivalent to
+        // purifying the original raw effects (Lengerich Cor 2.2), and it is the only
+        // reconstruction available at all once a TableModel has already dropped its trees.
+        // `purify` also recomputes every table's `variance` internally (`table_variance`),
+        // closing the stale-Sobol half of the same finding for free. Factored effects have
+        // already undergone optional reference-preserving diffusion and remain pure.
+        let banded = graduated
+            .bank
+            .tables
+            .iter()
+            .any(|t| t.axes.iter().any(|a| a.band_of.is_some()));
+        if banded {
+            // Banded tables live on band grids: re-purify band-aware (exactly equivalent).
+            graduated.bank = t_boost_core::banding::repurify_bank(&graduated.bank)?;
+        } else {
+            let effects: Vec<RawEffect> = graduated
+                .bank
+                .tables
+                .iter()
+                .map(|table| RawEffect {
+                    u: table.u.clone(),
+                    values: table.values.clone(),
+                    support: table.support.clone(),
+                })
+                .collect();
+            let factored = std::mem::take(&mut graduated.bank.factored);
+            let mut repurified = purify_raw_effects(
+                graduated.bank.f0,
+                graduated.bank.merged_grids.clone(),
+                graduated.bank.w.clone(),
+                effects,
+            )?;
+            repurified.factored = factored;
+            graduated.bank = repurified;
+        }
+    }
+    Ok(graduated)
+}
+
+/// Graduation of every class bank of a multiclass tables model: each class's high-order
+/// diffusion and smoothed dense tables (`updates` are `(class, table, values)`; see
+/// [`graduated_model`]), then one multinomial re-anchor of the class intercepts on every row, and
+/// the single-output path's training-deviance check: the smoothing is kept only if the training
+/// multinomial deviance rises by at most 1%. The diffusion's added boxes come out of one
+/// `box_budget` shared by the classes and spent in class order, as the deployed box budget
+/// counts every class's copy of a table. Returns the model, whether the smoothing was adopted,
+/// and the per-class high-order reports.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_multiclass_graduation(
+    model: &MultiClassTableModel,
+    columns: Vec<Vec<f32>>,
+    labels: Vec<u32>,
+    weight: Vec<f32>,
+    cat_x: Option<Vec<Vec<String>>>,
+    updates: Vec<(usize, usize, Vec<f64>)>,
+    high_order_alpha: f64,
+    box_budget: usize,
+) -> Result<
+    (
+        MultiClassTableModel,
+        bool,
+        Vec<Vec<t_boost_core::explain::HighOrderSmoothingReport>>,
+    ),
+    PbError,
+> {
+    let n_classes = model.classes.len();
+    let mut per_class: Vec<Vec<(usize, Vec<f64>)>> = vec![Vec::new(); n_classes];
+    for (class, index, values) in updates {
+        per_class
+            .get_mut(class)
+            .ok_or_else(|| PbError::InvalidInput {
+                what: format!("graduation class {class} out of range for {n_classes} classes"),
+            })?
+            .push((index, values));
+    }
+    let boxes = |bank: &TableBank| -> usize { bank.factored.iter().map(|f| f.n_boxes()).sum() };
+    let existing: usize = model.classes.iter().map(|c| boxes(&c.bank)).sum();
+    let mut remaining = box_budget.saturating_sub(existing);
+    let mut banks = Vec::with_capacity(n_classes);
+    let mut reports = Vec::with_capacity(n_classes);
+    for class in &model.classes {
+        let numeric_raws: Vec<u32> = class
+            .provenance
+            .iter()
+            .filter(|p| matches!(p.kind, AxisKind::Numeric))
+            .map(|p| p.raw.0)
+            .collect();
+        let added_budget = if box_budget == 0 {
+            4096
+        } else {
+            4096.min(remaining)
+        };
+        let (bank, report) = class.bank.smooth_high_order(
+            &numeric_raws,
+            high_order_alpha,
+            1024,
+            added_budget,
+            2_000_000,
+        )?;
+        remaining = remaining.saturating_sub(boxes(&bank).saturating_sub(boxes(&class.bank)));
+        banks.push(bank);
+        reports.push(report);
+    }
+    let changed =
+        per_class.iter().any(|u| !u.is_empty()) || reports.iter().flatten().any(|r| r.applied);
+    if !changed {
+        return Ok((model.clone(), true, reports));
+    }
+    if labels.len() != weight.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "graduation input lengths y={}, weight={}",
+                labels.len(),
+                weight.len()
+            ),
+        });
+    }
+    let mut graduated = model.clone();
+    for ((slot, (class, bank)), updates) in graduated
+        .classes
+        .iter_mut()
+        .zip(model.classes.iter().zip(banks))
+        .zip(per_class)
+    {
+        *slot = graduated_model(class, bank, updates)?;
+    }
+    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+        what: "multiclass tables model has no classes".into(),
+    })?;
+    let binned = serve_binned_for_tables(first, columns, cat_x, None)?;
+    if binned.n_rows as usize != labels.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "graduation design has {} rows but y has {}",
+                binned.n_rows,
+                labels.len()
+            ),
+        });
+    }
+    let logits = |m: &MultiClassTableModel| -> Result<Vec<Vec<f64>>, PbError> {
+        m.classes
+            .iter()
+            .map(|c| {
+                c.score_raw(&binned, None)
+                    .map(|v| v.into_iter().map(f64::from).collect())
+            })
+            .collect()
+    };
+    let mut after = logits(&graduated)?;
+    let shifts = t_boost_core::prune::multiclass_intercept_shifts(
+        &after,
+        &labels,
+        &weight,
+        "graduation reanchor",
+    )?;
+    for ((class, column), shift) in graduated.classes.iter_mut().zip(&mut after).zip(&shifts) {
+        class.bank.f0 += shift;
+        for v in column.iter_mut() {
+            *v += shift;
+        }
+    }
+    let raw_deviance = multinomial_deviance(&logits(model)?, &labels, &weight)?;
+    let graduated_deviance = multinomial_deviance(&after, &labels, &weight)?;
+    if !graduated_deviance.is_finite() || graduated_deviance > raw_deviance * 1.01 {
+        return Ok((model.clone(), false, reports));
+    }
+    graduated.validate()?;
+    Ok((graduated, true, reports))
+}
+
+/// Total weighted multinomial deviance `Σ w·2·(ln Σ_k e^{f_k} − f_y)` of `[class][row]` logits.
+fn multinomial_deviance(logits: &[Vec<f64>], labels: &[u32], w: &[f32]) -> Result<f64, PbError> {
+    let mut total = 0.0_f64;
+    let mut row = Vec::with_capacity(logits.len());
+    for (i, (&label, &wi)) in labels.iter().zip(w).enumerate() {
+        row.clear();
+        for column in logits {
+            row.push(
+                column
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("multinomial deviance: a class has no logit for row {i}"),
+                    })?,
+            );
+        }
+        let mx = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let log_z = row.iter().map(|v| (v - mx).exp()).sum::<f64>().ln() + mx;
+        let fy = row
+            .get(label as usize)
+            .copied()
+            .ok_or_else(|| PbError::InvalidInput {
+                what: format!("multinomial deviance: label {label} has no class"),
+            })?;
+        total += 2.0 * f64::from(wi) * (log_z - fy);
+    }
+    Ok(total)
+}
+
 /// `eval_rows`, when given, restricts the no-harm comparison to those rows of the design —
 /// the caller passes the rows the bags left OUT of bag, so the acceptance is honest rather
 /// than a training-loss brake — and tightens the slack from the legacy 1% (a training loss
@@ -10424,81 +10733,7 @@ fn apply_graduation_updates_impl(
         });
     }
 
-    let mut graduated = model.clone();
-    graduated.bank = bank;
-    let dense_changed = !updates.is_empty();
-    let mut seen = BTreeSet::new();
-    for (index, values) in updates {
-        if !seen.insert(index) {
-            return Err(PbError::InvalidInput {
-                what: format!("graduation table {index} was updated more than once"),
-            });
-        }
-        let table = graduated
-            .bank
-            .tables
-            .get_mut(index)
-            .ok_or_else(|| PbError::InvalidInput {
-                what: format!("graduation table index {index} out of range"),
-            })?;
-        if table.values.is_sparse() {
-            return Err(PbError::InvalidInput {
-                what: format!("graduation table {index} is sparse"),
-            });
-        }
-        if values.len() != table.values.len() || values.iter().any(|value| !value.is_finite()) {
-            return Err(PbError::InvalidInput {
-                what: format!(
-                    "graduation table {index} received {} finite cells, expected {}",
-                    values.len(),
-                    table.values.len()
-                ),
-            });
-        }
-        table.values = Tensor::from_vec(table.values.shape(), values)?;
-    }
-
-    if dense_changed {
-        // Re-purify: GCV smoothing preserves each table's own support-weighted grand mean, not
-        // the per-axis-slice w-weighted zero means Purity requires, so a smoothed table can
-        // silently absorb lower-order mass (e.g. a smoothed 2-D interaction table absorbing part
-        // of a main effect). Feed every CURRENT (post-smoothing) table back through the canonical
-        // purify cascade as if it were raw — purify is linear, so this is exactly equivalent to
-        // purifying the original raw effects (Lengerich Cor 2.2), and it is the only
-        // reconstruction available at all once a TableModel has already dropped its trees.
-        // `purify` also recomputes every table's `variance` internally (`table_variance`),
-        // closing the stale-Sobol half of the same finding for free. Factored effects have
-        // already undergone optional reference-preserving diffusion and remain pure.
-        let banded = graduated
-            .bank
-            .tables
-            .iter()
-            .any(|t| t.axes.iter().any(|a| a.band_of.is_some()));
-        if banded {
-            // Banded tables live on band grids: re-purify band-aware (exactly equivalent).
-            graduated.bank = t_boost_core::banding::repurify_bank(&graduated.bank)?;
-        } else {
-            let effects: Vec<RawEffect> = graduated
-                .bank
-                .tables
-                .iter()
-                .map(|table| RawEffect {
-                    u: table.u.clone(),
-                    values: table.values.clone(),
-                    support: table.support.clone(),
-                })
-                .collect();
-            let factored = std::mem::take(&mut graduated.bank.factored);
-            let mut repurified = purify_raw_effects(
-                graduated.bank.f0,
-                graduated.bank.merged_grids.clone(),
-                graduated.bank.w.clone(),
-                effects,
-            )?;
-            repurified.factored = factored;
-            graduated.bank = repurified;
-        }
-    }
+    let mut graduated = graduated_model(model, bank, updates)?;
 
     let binned = serve_binned_for_tables(model, columns, cat_x, None)?;
     if binned.n_rows as usize != y.len() {

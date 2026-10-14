@@ -2733,7 +2733,11 @@ def _graduation(r: dict[str, Any]) -> str:
         rows = [[_e(" × ".join(x["features"])), _num(x.get("alpha")),
                  "rejected" if x.get("rejected") else ("smoothed" if (x.get("alpha") or 0) > 0
                                                        else "as fitted")] for x in ordered]
-        body.append(_table(["table", "strength", "result"], rows, numeric=(1,), scroll="short"))
+        head = ["table", "strength", "result"]
+        if any(x.get("class") is not None for x in ordered):
+            head = ["class", *head]
+            rows = [[_e(x.get("class") or ""), *row] for x, row in zip(ordered, rows)]
+        body.append(_table(head, rows, numeric=(len(head) - 2,), scroll="short"))
     if not body:
         body.append(f'<p class="note">{_e(grad.get("reason") or "Graduation off")}.</p>')
     return _card("Graduation", "".join(body), what="Whittaker–Henderson smoothing of the deployed tables")

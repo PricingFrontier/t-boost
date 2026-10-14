@@ -745,6 +745,20 @@ class _MultiClassTableModel:
 
     def deployed_table_count(self) -> int: ...
     def deployed_census(self) -> dict[str, Any]: ...
+    def graduation_tables(
+        self, max_cells: int = 2500
+    ) -> list[list[tuple[int, list[int], list[int], list[float], list[float], list[bool]]]]: ...
+    def apply_graduation(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        weight: np.ndarray,
+        updates: Sequence[tuple[int, int, Sequence[float]]],
+        alpha: float = 0.0,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        n_jobs: int | None = None,
+        box_budget: int = 0,
+    ) -> tuple[_MultiClassTableModel, bool, str]: ...
 
     @property
     def class_labels(self) -> list[str]: ...

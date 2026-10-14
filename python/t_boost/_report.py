@@ -1205,20 +1205,26 @@ def _available(value: Any, reason: str) -> dict[str, Any]:
 
 
 def _graduation_tables(est: "_BaseTBoost", names: list[str]) -> list[dict[str, Any]] | None:
-    """Per smoothed-candidate table: its features, the strength chosen (0 = left as fitted) and
-    whether the holdout rejected it, from ``graduation_report_``."""
+    """Per smoothed-candidate table: its features, the strength chosen (0 = left as fitted),
+    whether the training-deviance check rejected it and, on a multiclass fit, its class, from
+    ``graduation_report_``."""
     rows = getattr(est, "graduation_report_", None)
     if not rows:
         return None
+    labels = getattr(est, "classes_", None)
+    classes = [] if labels is None else [str(c) for c in labels]
     out = []
     for g in rows:
         ids = g.get("features") or g.get("u") or []
+        k = g.get("class")
         out.append({
             "features": [names[i] if isinstance(i, int) and 0 <= i < len(names) else str(i)
                          for i in ids],
             "alpha": _display(g.get("alpha")),
             "rejected": bool(g.get("rejected", False)),
             "method": _display(g.get("method")),
+            "class": (classes[k] if isinstance(k, int) and 0 <= k < len(classes)
+                      else None if k is None else str(k)),
         })
     return out
 

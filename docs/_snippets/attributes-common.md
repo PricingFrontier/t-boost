@@ -196,8 +196,9 @@ dict
 #### Purpose
 
 The graduation diagnostics, one entry per table: the features, the smoothing strength (`alpha`)
-and whether the smoothing was rejected. Only set when graduation is turned on. Saved with the
-model.
+and whether the smoothing was rejected. For multiclassification, each entry also names its
+class (`class`, the index into `classes_`). Only set when graduation is turned on. Saved with
+the model.
 
 #### Type
 

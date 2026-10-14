@@ -476,13 +476,12 @@ def test_graduation_runs_on_unpruned_fits_too() -> None:
     est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xc, yc)
     assert hasattr(est, "graduation_report_")
 
-    # Multiclass (K>=3): graduate=True always raises, prune or not -- there is no graduation
-    # path for the multiclass per-class banks at all.
+    # Multiclass (K>=3) graduates every class bank, pruned or not.
     xm, ym = multiclass_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect for multiclass"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xm, ym)
-    with pytest.raises(ValueError, match="graduate=True has no effect for multiclass"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=True).fit(xm, ym)
+    for prune in (False, True):
+        est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=prune).fit(xm, ym)
+        assert "skipped" not in est.graduation_validation_
+        assert all("class" in entry for entry in est.graduation_report_)
 
 
 def test_graduated_table_variance_reflects_post_smoothing_values() -> None:

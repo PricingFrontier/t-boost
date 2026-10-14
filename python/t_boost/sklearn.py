@@ -2839,6 +2839,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 "path. Use ['mean'] or ['mean','count'] here."
             )
 
+    def _validate_high_order_alpha(self) -> None:
+        high_alpha = self.graduation_high_order_alpha
+        if (isinstance(high_alpha, (bool, np.bool_))
+                or not isinstance(high_alpha, (int, float, np.integer, np.floating))
+                or not np.isfinite(high_alpha) or not 0.0 <= high_alpha <= 1.0):
+            raise ValueError("graduation_high_order_alpha must be finite and in [0, 1]")
+        if high_alpha > 0 and self.graduate is False:
+            raise ValueError("graduation_high_order_alpha requires graduation enabled")
+
     def _validate_multiclass_inert_params(self) -> None:
         """No silent parameter no-ops: the native multiclass (K>=3) path never applies the
         fully-corrective ridge leaf refit, DART, intercept/slope re-anchoring, or the
@@ -2864,9 +2873,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         Called once, near the top of `_fit_multiclass`, before either the pruned or unpruned
         branch (both are equally affected).
         """
-
-        if self.graduation_high_order_alpha != 0:
-            raise ValueError("higher-order smoothing does not support multiclass (K>=3)")
 
         def _raise(name: str, mechanism: str) -> None:
             raise ValueError(
@@ -3747,13 +3753,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         offset: Any | None = None,
     ) -> _Model | _TableModel:
         self._clear_stale_fit_state()
-        high_alpha = self.graduation_high_order_alpha
-        if (isinstance(high_alpha, (bool, np.bool_))
-                or not isinstance(high_alpha, (int, float, np.integer, np.floating))
-                or not np.isfinite(high_alpha) or not 0.0 <= high_alpha <= 1.0):
-            raise ValueError("graduation_high_order_alpha must be finite and in [0, 1]")
-        if high_alpha > 0 and self.graduate is False:
-            raise ValueError("graduation_high_order_alpha requires graduation enabled")
+        self._validate_high_order_alpha()
         if BUILD_PROFILE == "debug":
             warnings.warn(
                 "the t_boost extension is a DEBUG build — fit timings are unrepresentative"
@@ -3984,7 +3984,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         graduated bank is the better artifact to print. `graduate=False` skips it entirely
         (and `graduation_report_` is then never set). A monotone fit runs every stage like any
         other fit and is then projected back onto its signs (`_enforce_monotone`), last.
-        Multiclass (K>=3) has no graduation path at all and never reaches this method.
+        Multiclass (K>=3) fits graduate in `_fit_multiclass`, through `_graduate`.
         """
         model = self._fit_and_prune_core(
             booster, x32, y32, weight32, exposure32, axis_names, class_labels,
@@ -3999,6 +3999,20 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     ) -> "_TableModel":
         """The last post-fit stages, for pruned and unpruned fits alike: graduation (unless
         `graduate=False`), then the monotone repair when a sign is set."""
+        model = self._graduate(model, x32, y32, weight32, exposure32, cat_x)
+        if monotone is not None and any(monotone):
+            model = self._enforce_monotone(
+                model, x32, y32, weight32, exposure32, cat_x, monotone
+            )
+        return model
+
+    def _graduate(
+        self, model: Any, x32: np.ndarray, y32: np.ndarray, weight32: np.ndarray | None,
+        exposure32: np.ndarray | None, cat_x: list[list[str]] | None,
+    ) -> Any:
+        """Graduation unless `graduate=False`, of a single-output model or of every class bank
+        of a multiclass one (`y32` then holds the class indices); records
+        `graduation_validation_`."""
         n = len(y32)
         do_graduate = self.graduate is not False
         if do_graduate:
@@ -4018,10 +4032,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         else:
             self.graduation_validation_["skipped"] = "disabled"
         self.pruning_report_["graduation_validation"] = self.graduation_validation_
-        if monotone is not None and any(monotone):
-            model = self._enforce_monotone(
-                model, x32, y32, weight32, exposure32, cat_x, monotone
-            )
         return model
 
     def _finish_unpruned(
@@ -4928,15 +4938,20 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             return None
         return int(table_idx), features, out, alpha
 
-    def _graduate_table_model(self, table_model: "_TableModel", x32: "np.ndarray",
+    def _graduate_table_model(self, table_model: Any, x32: "np.ndarray",
                               y32: "np.ndarray", w_full: "np.ndarray",
                               exposure: "np.ndarray | None",
                               cat_x: "list[list[str]] | None",
-                              eval_rows: "np.ndarray | None" = None) -> "_TableModel":
+                              eval_rows: "np.ndarray | None" = None) -> Any:
+        """Graduate a `_TableModel`, or every class bank of a `_MultiClassTableModel` (whose
+        `y32` holds the class indices): the same per-table solves, then one native candidate,
+        re-anchored and checked on the training deviance."""
         if eval_rows is not None:
             raise ValueError("eval_rows from the fit design are not an independent holdout")
+        multiclass = isinstance(table_model, _MultiClassTableModel)
         report: list[dict[str, Any]] = []
-        updates: list[tuple[int, list[float]]] = []
+        # `(table, values)`, or `(class, table, values)` for a multiclass fit's class banks.
+        updates: list[tuple[Any, ...]] = []
         fixed = self.graduation_alpha
         # Fidelity weights: the bank's `support` is BINNED ROW COUNTS, but the GCV noise model
         # needs the cell's information mass. On aggregated portfolios one row can carry
@@ -4955,7 +4970,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # before axis kinds are resolved, so it cannot yet tell a cheap separable table from an
         # expensive joint one — the real per-table budget is enforced inside `_graduate_one`
         # (see the two-tier cap comment on `_GRADUATION_MAX_CELLS`).
-        items = list(table_model.graduation_tables(self._GRADUATION_MAX_CELLS_RAW))
+        tables = table_model.graduation_tables(self._GRADUATION_MAX_CELLS_RAW)
+        keyed: list[tuple[int | None, Any]] = (
+            [(k, it) for k, class_tables in enumerate(tables) for it in class_tables]
+            if multiclass else [(None, it) for it in tables]
+        )
+        items = [it for _, it in keyed]
         jobs = self._resolve_n_jobs()
         jobs = max(1, min(int(jobs), len(items))) if (jobs and items) else 1
         # Tables are independent and the loop can fan out on a thread pool sized to n_jobs —
@@ -4996,13 +5016,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                     ))
             else:
                 results = [self._graduate_one(it, fixed, w_scale) for it in items]
-        for res in results:
+        for (k, _), res in zip(keyed, results):
             if res is None:
                 continue
             table_idx, features, out, alpha = res
+            entry = {"features": features, "alpha": alpha, "table_idx": int(table_idx)}
+            if k is not None:
+                entry["class"] = k
             if alpha > 0.0:
-                updates.append((int(table_idx), out.tolist()))
-            report.append({"features": features, "alpha": alpha, "table_idx": int(table_idx)})
+                updates.append((int(table_idx), out.tolist()) if k is None
+                               else (k, int(table_idx), out.tolist()))
+            report.append(entry)
         if not updates and self.graduation_high_order_alpha == 0:
             self.graduation_report_ = report
             return table_model
@@ -5014,7 +5038,19 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             exposure=(np.ascontiguousarray(exposure) if exposure is not None else None),
             cat_x=cat_x, n_jobs=self._resolve_n_jobs(),
         )
-        if self.graduation_high_order_alpha > 0:
+        if multiclass:
+            # One method for both steps: the high-order diffusion runs only at alpha > 0.
+            candidate, train_adopted, class_reports = table_model.apply_graduation(
+                *args, alpha=float(self.graduation_high_order_alpha), cat_x=cat_x,
+                n_jobs=self._resolve_n_jobs(), box_budget=max(0, int(self.prune_box_budget or 0)),
+            )
+            if self.graduation_high_order_alpha > 0:
+                for k, entries in enumerate(json.loads(class_reports)):
+                    for entry in entries:
+                        report.append({**entry, "class": k, "method": "reference_diffusion",
+                                       "requested_alpha": entry["alpha"],
+                                       "alpha": entry["alpha"] if entry["applied"] else 0.0})
+        elif self.graduation_high_order_alpha > 0:
             candidate, train_adopted, high_report = table_model.apply_high_order_graduation(
                 *args, alpha=float(self.graduation_high_order_alpha),
                 box_budget=max(0, int(self.prune_box_budget or 0)), **kwargs,
@@ -5802,7 +5838,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         not a deviance comparison's: set ``graduate=False`` for the raw pruned bank. The
         smoothing is kept only if it raises the training deviance by at most 1%; otherwise
         every table is kept as fitted and ``graduation_validation_`` says why.
-        Multiclass (K>=3) graduation is unsupported.
     graduation_alpha : float or None, default=None
         Fixed Whittaker-Henderson smoothing strength, overriding the per-table generalized
         cross-validation (GCV) alpha selection that ``graduate`` normally uses. ``None`` (the
@@ -5814,7 +5849,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
         step on factored interactions of orders 3 through 8. Requires graduation
-        enabled; unsupported for multiclass fits. Numeric
+        enabled. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -6933,7 +6968,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     (``n_bags=8``), per-tree column sampling is on (``colsample_bytree=0.8``), and post-fit
     table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
     (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
-    tables are graduated (``graduate``; not for multiclass). The fitted artifact is that tables-only model.
+    tables are graduated (``graduate``). The fitted artifact is that tables-only model.
     Pass ``n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
     graduate=False`` for the cheapest single-fit baseline: one fit's full table bank, as the
     trees fitted it.
@@ -6950,8 +6985,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     the out-of-bag rows the cell refit and the ranked path read are honest on panel data.
     The internal early-stopping holdout carve is stratified by class in
     the native core for every ``n_bags`` configuration — for binary (K=2) AND multiclass
-    (K>=3) fits alike (the per-class labels are the strata). Multiclass fits also have no ``graduate``/Whittaker-Henderson graduation path at
-    all (an explicit ``graduate=True`` raises rather than silently no-opping), and no
+    (K>=3) fits alike (the per-class labels are the strata). Multiclass fits have no
     ``exposure`` support (:meth:`fit` raises if both are given for K>=3).
 
     The multiclass (K>=3) native-softmax path HONORS: ``n_bags``/``bag_subsample`` (outer bags
@@ -6961,7 +6995,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     intercept-only multinomial IPF, applied unconditionally inside the prune — it is NOT the
     ``reanchor`` knob), and ``cell_refit_base``/``cell_refit_gamma`` (the §G1 out-of-bag fANOVA
     cell refit, since 2026-08-25 — K decoupled diagonal-Hessian cell solves on the softmax
-    working residual, accepted or shrunk by ONE joint backtrack on the true multinomial loss).
+    working residual, accepted or shrunk by ONE joint backtrack on the true multinomial loss),
+    and every post-fit stage: the rebalance (``prune_rebalance``, re-solved the same way),
+    banding and graduation of every class's tables.
     ``leaf_refine_steps``/``leaf_refine_backtracks`` have no effect for K>=3 (a Jacobi
     refinement measured harmful as a drop-in), so a default fit is byte-identical to
     ``leaf_refine_steps=0``.
@@ -7103,16 +7139,16 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         fade, and additionally requires 3-way admissions to clear a stricter multiplier than
         2-way admissions.
     graduate : bool or None, default=None
-        Binary (K=2) fits use the regressor's graduation policy -- smoothing on the
-        full fit, no holdout, kept only if the training deviance rises by at most 1% (see
-        :class:`TBoostRegressor`).
-        Multiclass (K>=3) graduation is unavailable; explicit ``True`` raises.
+        The regressor's graduation policy -- smoothing on the full fit, no holdout, kept
+        only if the training deviance rises by at most 1% (see :class:`TBoostRegressor`). A
+        multiclass (K>=3) fit graduates every class's tables, re-anchors the class
+        intercepts, and checks the multinomial deviance.
     graduation_alpha : float or None, default=None
-        Fixed smoothing strength on binary fits; unused for multiclass.
+        Fixed smoothing strength (see :class:`TBoostRegressor`).
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
         step on factored interactions of orders 3 through 8. Requires graduation
-        enabled; unsupported for multiclass fits. Numeric
+        enabled. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -7768,10 +7804,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         first, so the tail is the weakest) and ``cascade_dropped`` (those removed after, each
         properly containing a dropped support).
     graduation_report_ : list of dict
-        One entry per eligible table on a BINARY (K=2) fit -- the binary bank graduates
-        through the same path as the regressor's (see ``graduate``). Not set for
-        multiclass (K>=3): there is no Whittaker-Henderson path for the per-class banks,
-        and an explicit ``graduate=True`` raises there rather than no-opping.
+        One entry per eligible table, as on the regressor (see ``graduate``). On a
+        multiclass (K>=3) fit each entry also names its class bank (``class``, the index into
+        ``classes_``).
 
     Examples
     --------
@@ -8304,14 +8339,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     ) -> _MultiClassModel | _MultiClassTableModel:
         self._clear_stale_fit_state()
         self._clear_fit_counts()  # the boosting report covers regression and binary fits
-        # No silent no-op: there is no graduation path for multiclass (K>=3) at all, prune or
-        # not, so an explicit graduate=True can never be honored here.
-        if self.graduate:
-            raise ValueError(
-                "graduate=True has no effect for multiclass (K>=3) fits: there is no "
-                "Whittaker-Henderson graduation path for the multiclass per-class banks. "
-                "Leave graduate at its default (None)."
-            )
+        self._validate_high_order_alpha()
         self._validate_multiclass_inert_params()
         self._validate_cat_channels(multiclass=True)
         _reject_sparse(X)
@@ -8566,6 +8594,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                     cat_x=cat_x, **self._measure_kwargs(),
                 )
                 self.pruning_report_["banding"] = json.loads(band_json)
+        # Every class bank is graduated, pruned or not, as a single-output fit's bank is.
+        model = self._graduate(model, x32, y_labels, weight32, None, cat_x)
         self._multi_model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features

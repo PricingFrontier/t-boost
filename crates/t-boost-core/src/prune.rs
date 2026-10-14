@@ -2751,8 +2751,8 @@ fn scale_bank(bank: &mut TableBank, s: f64) -> Result<(), PbError> {
 /// in error text.
 ///
 /// # Errors
-/// [`PbError::InvalidInput`] if a label escapes `0..raw.len()`.
-fn multiclass_intercept_shifts(
+/// [`PbError::InvalidInput`] if a label escapes `0..raw.len()`, or the solve does not converge.
+pub fn multiclass_intercept_shifts(
     raw: &[Vec<f64>],
     labels: &[u32],
     w: &[f32],
