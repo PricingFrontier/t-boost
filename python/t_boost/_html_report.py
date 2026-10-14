@@ -892,7 +892,7 @@ def importance_chart(r: dict[str, Any], w: float, h: float | None = None, *, top
 def multiples_chart(r: dict[str, Any], w: float, h: float, *, cls: str = "",
                     count: int = 4) -> str:
     """The one-way tables of the most important features side by side on one shared scale (log
-    for a multiplicative link), thin cells faded: the shape of the tariff at a glance."""
+    for a multiplicative link), thin cells faded: the shape of the main effects at a glance."""
     link = r["model"]["link"]
     thin_share = r["thresholds"].get("thin_cell_mass") or 0.0
     panels = []
@@ -1962,7 +1962,7 @@ def _overview(r: dict[str, Any], tabs: _Radio, classes: _Radio | None) -> str:
     def cal(c: str, k: int | None) -> str:
         return calibration_chart(r, k, _W_HALF, _H_ROW)
 
-    def tariff(c: str, k: int | None) -> str:
+    def one_way(c: str, k: int | None) -> str:
         return multiples_chart(r, _W_HALF, _H_ROW, cls=c)
 
     k0 = 0 if classes is not None else None
@@ -1971,9 +1971,9 @@ def _overview(r: dict[str, Any], tabs: _Radio, classes: _Radio | None) -> str:
     imp_card = _card(_importance_takeaway(r), importance_chart(r, _W_HALF, _H_ROW),
                      what="Share of model variance: own one-way table, then through interactions")
     thin = r["thresholds"].get("thin_cell_mass")
-    tariff_card = _card("The tariff: the largest one-way tables", _per_class(r, classes, tariff),
-                        what=("Effects on one shared scale; faded cells hold under "
-                              f"{_pct(thin, 1)} of the table's exposure"))
+    one_way_card = _card("The largest one-way tables", _per_class(r, classes, one_way),
+                         what=("Effects on one shared scale; faded cells hold under "
+                               f"{_pct(thin, 1)} of the table's exposure"))
     if _path_data(r) is not None:
         gain_card = _card(_gain_takeaway(r), gain_chart(r, _W_HALF, _H_ROW),
                           what="Out-of-bag gain as ranked tables join the bank; the cutoff and floor")
@@ -1984,7 +1984,7 @@ def _overview(r: dict[str, Any], tabs: _Radio, classes: _Radio | None) -> str:
         gain_card = _card("Lorenz curve", _per_class(r, classes, lorenz),
                           what="Share of actual against share of exposure, riskiest first")
     return (_open("Overview") + _row(perf, review) + _row(cal_card, imp_card)
-            + _row(tariff_card, gain_card) + "</section>")
+            + _row(one_way_card, gain_card) + "</section>")
 
 
 def _performance(r: dict[str, Any], classes: _Radio | None) -> str:

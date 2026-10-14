@@ -6870,7 +6870,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         There is deliberately no held-out accuracy gate -- between 2026-09-09 and
         2026-09-20 one existed, paid for by a ``prune_validation_fraction`` holdout carved
         out of every fit, and it cost +1.29% mean test deviance on the arena catalog to
-        decide a bit worth -0.015%. Whether a smoothed tariff is what you want is your call,
+        decide a bit worth -0.015%. Whether smoothed tables are what you want is your call,
         not a deviance comparison's: set ``graduate=False`` for the raw pruned bank. The
         smoothing is kept only if it raises the training deviance by at most 1%; otherwise
         every table is kept as fitted and ``graduation_validation_`` says why.
