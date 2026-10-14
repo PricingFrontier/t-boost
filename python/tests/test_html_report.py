@@ -802,7 +802,10 @@ def test_interaction_ae_by_band_pair(poisson):
         # with nothing missing, every row lands in exactly one band pair
         assert sum(map(sum, d["mass"])) == pytest.approx(ds["metrics"]["mass"])
     html = report_html(report)
-    assert f"A/E by {ae['x']} band, a line per {ae['by']} band" in html
+    assert f"by {ae['x']}, a line per {ae['by']} band" in html  # actual and expected rates
+    lv = ae["datasets"][0]["levels"]
+    assert len(lv["actual"]) == len(lv["expected"]) == len(lv["mass"])
+    assert sum(map(sum, lv["mass"])) == pytest.approx(sum(map(sum, ae["datasets"][0]["mass"])))
     assert f"each {ae['by']} band on its own" in html
     assert html.count('class="ibw0"') >= len(ae["datasets"])
 

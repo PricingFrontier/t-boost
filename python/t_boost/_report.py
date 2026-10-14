@@ -391,8 +391,9 @@ def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
                    rho: float) -> None:
     """For each interaction table the page draws, the A/E by band of its first feature (the
     factor check's bands) within each band of its partner (the chart's bands of equal exposure),
-    per dataset (``interactions[k]["ae"]``), with each cell's mass, z and the standard deviation
-    ``sd`` of its A/E. One native pass per
+    per dataset (``interactions[k]["ae"]``), with each pair's mass, z and the standard deviation
+    ``sd`` of its A/E; and, by level of the first feature within each partner band, the actual,
+    expected and mass (``levels``) behind the actual and expected rates. One native pass per
     dataset sums every table. A multiclass model's first class, one-vs-rest, as the page draws."""
     from ._html_report import _INTERACTION_ROWS, _classes, _table_cells, interaction_layout
 
@@ -422,14 +423,18 @@ def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
         if p.error is not None or not d.get("actual_vs_expected"):
             continue
         row_cells = p.cells[0]
-        codes = np.empty((row_cells.shape[0], len(plans)), dtype=np.uint32)
+        # Two columns per table: (x band, partner band), then (x level, partner band).
+        codes = np.empty((row_cells.shape[0], 2 * len(plans)), dtype=np.uint32)
         n_cells = []
         for j, (_, rx, rb, x_band, by_band, x_labels, lay) in enumerate(plans):
             nb, size = len(lay["bands"]), len(x_labels) * len(lay["bands"])
-            xb = x_band[np.minimum(row_cells[:, rx], len(x_band) - 1)]
+            cx = np.minimum(row_cells[:, rx], len(x_band) - 1)
             pb = by_band[np.minimum(row_cells[:, rb], len(by_band) - 1)]
-            codes[:, j] = np.where((xb >= 0) & (pb >= 0), xb * nb + pb, size)  # last: neither
-            n_cells.append(size + 1)
+            xb = x_band[cx]
+            codes[:, 2 * j] = np.where((xb >= 0) & (pb >= 0), xb * nb + pb, size)  # last: neither
+            levels = len(x_band) * nb
+            codes[:, 2 * j + 1] = np.where(pb >= 0, cx * nb + pb, levels)
+            n_cells += [size + 1, levels + 1]
         if p.proba is not None and p.codes is not None:
             pk = p.proba[:, 0]
             actual, expected, var = (p.codes == 0).astype(np.float64), pk, pk * (1.0 - pk)
@@ -439,7 +444,8 @@ def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
             var = dispersion(obj, p.y, p.pred, p.w, rho) * _variance(obj, p.pred, rho)
         sums = _report_cell_sums(np.ascontiguousarray(codes), n_cells, _f64(actual),
                                  _f64(expected), _f64(p.w), _f64(p.e), _f64(var))
-        for j, ((_, _, _, _, _, x_labels, lay), (a, e, m, _, v)) in enumerate(zip(plans, sums)):
+        for j, (_, _, _, x_band, _, x_labels, lay) in enumerate(plans):
+            (a, e, m, _, v), (la, le, lm, _, _) = sums[2 * j], sums[2 * j + 1]
             nb = len(lay["bands"])
 
             def grid(values: list[float | None]) -> list[list[float | None]]:
@@ -454,6 +460,9 @@ def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
                            for c in range(size)]),
                 "sd": grid([float(math.sqrt(v[c]) / e[c]) if v[c] > 0 and e[c] > 0 else None
                             for c in range(size)]),
+                "levels": {key: [[float(arr[c * nb + b]) for b in range(nb)]
+                                 for c in range(len(x_band))]
+                           for key, arr in (("actual", la), ("expected", le), ("mass", lm))},
             })
     for (inter, _, _, _, _, x_labels, lay), datasets in zip(plans, per_ds):
         inter["ae"] = {"x": lay["xf"], "by": lay["by"], "x_labels": x_labels,

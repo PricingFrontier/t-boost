@@ -136,11 +136,12 @@ The interaction tables by share of model variance, each with the range of its ef
 exposure (the support-weighted 5th to 95th percentile of its cells). Selecting one draws, on the
 levels of its feature with the most levels, that feature's one-way table (dashed) and, for up to
 four bands of equal exposure of the partner, the effect with this table added: where the lines
-part, the interaction matters. Under it, the selected dataset's A/E by band of the first
-feature within each partner band: first every partner band's line on one panel, then one strip
-per partner band with ±2 standard deviations shaded, the `factor_ae` tolerance dashed in both
-(band pairs under `factor_min_mass` of the exposure faded). Lines that stay near 1 in every strip
-mean the model captures the interaction. A three-way table
+part, the interaction matters. Under it, the selected dataset's actual (dashed) and expected
+(solid) rate by level of the first feature within each partner band (pairs under
+`thin_cell_mass` of the exposure have their actual faded); then one strip per partner band with
+the A/E by band of the first feature, ±2 standard deviations shaded and the `factor_ae`
+tolerance dashed (band pairs under `factor_min_mass` faded). Lines that stay near 1 in every
+strip mean the model captures the interaction. A three-way table
 is averaged over its third feature. The 40 largest are drawn; every table's numbers are under
 Tables.
 

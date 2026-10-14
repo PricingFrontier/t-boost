@@ -130,6 +130,9 @@ svg .shapband{fill:var(--model);opacity:.14}
 svg .ref1{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
 svg .ib0,svg .ib1,svg .ib2,svg .ib3{stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}
 svg .ib0{stroke:var(--i0)}svg .ib1{stroke:var(--i1)}svg .ib2{stroke:var(--i2)}svg .ib3{stroke:var(--i3)}
+svg .dash{stroke-dasharray:4 3}
+svg .exl{stroke:var(--ink2);stroke-width:2;fill:none}
+svg .acl{stroke:var(--ink2);stroke-width:2;stroke-dasharray:4 3;fill:none}
 svg .ibw0{fill:var(--i0);opacity:.14}svg .ibw1{fill:var(--i1);opacity:.14}svg .ibw2{fill:var(--i2);opacity:.14}svg .ibw3{fill:var(--i3);opacity:.14}
 svg .fade{opacity:.3}
 svg .shapmean{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
@@ -1801,7 +1804,22 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
                   else _Lin(min(vals), max(vals), t0 + top_h, t0, n=4))
     ae_lo = max(min(ae_vals + [1 - span]), 0.5)
     ae_hi = min(max(ae_vals + [1 + span]), 1.6)
-    ov_s = _Lin(ae_lo, ae_hi, o0 + ov_h, o0, pad=0.04, n=4)
+    # The actual and expected rate per level of the first feature within each partner band; a
+    # pair under `thin_cell_mass` of the dataset's exposure has its actual faded, off the scale.
+    thin_level = r["thresholds"].get("thin_cell_mass") or 0.0
+    rates: dict[int, list[list[tuple[int, float, float, bool]]]] = {}
+    for i, d in ae_ds:
+        lv = d.get("levels") or {}
+        act, exp, ms = lv.get("actual") or [], lv.get("expected") or [], lv.get("mass") or []
+        total = sum(sum(row) for row in ms) or 1.0
+        rates[i] = [[(c, act[c][b] / ms[c][b], exp[c][b] / ms[c][b], ms[c][b] < thin_level * total)
+                     for c in cells if c < len(ms) and ms[c][b] > 0] for b in range(len(bands))]
+    rate_vals = _fv(v for per in rates.values() for pts in per for _, a, e, thin in pts
+                    for v in ((e,) if thin else (a, e)))
+    lv_s = _Lin(0.0, max(rate_vals or [1.0]), o0 + ov_h, o0, zero=True, n=4)
+
+    def rate_fmt(v: float) -> str:
+        return _num(v, 3)
 
     def strip(b: int) -> _Lin:
         y0 = a0 + b * (strip_h + strip_gap)
@@ -1810,7 +1828,8 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
     def fmt(v: float) -> str:
         return _mult_tick(v) if mult else _num(v, 2)
 
-    left = 6 + max(_label_w(ys, fmt), _label_w(ov_s, _fixed2) if ae_ds else 0.0) + 6
+    left = 6 + max(_label_w(ys, fmt), _label_w(lv_s, rate_fmt) if ae_ds else 0.0,
+                   _text_w("0.90") if ae_ds else 0.0) + 6
     right = w - 10
     n = len(cells)
     slot = (right - left) / n
@@ -1825,32 +1844,21 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
         pts = [(xs[c], ys(shown(v))) for c, v, _ in line]
         _segments(svg, pts, [thin for _, _, thin in line], cls=f"ib{i}", faded_cls=f"ib{i} fade")
     if ae_ds:
-        _yaxis(svg, ov_s, left, right, _fixed2)
-        svg.hline(left, right, ov_s(1.0), "ref")
+        _yaxis(svg, lv_s, left, right, rate_fmt)
+        svg.hline(left, right, o0 + ov_h, "ax")
+        keys = [("line", "exl", "expected"), ("line", "acl", "actual")]
+        _legend(svg, right - sum(40 + _text_w(k[2]) for k in keys) + 18, o0 - 8, keys)
         if tol:
-            for v in (1 - tol, 1 + tol):
-                if ov_s.lo <= v <= ov_s.hi:
-                    svg.hline(left, right, ov_s(v), "guide")
-            svg.text(right, o0 - 8, f"dashed: ±{_pct(tol, 0)}", anchor="end")
             svg.text(right, a0 - 24, f"dashed: ±{_pct(tol, 0)}; shaded: ±2σ", anchor="end")
         for i, d in ae_ds:
             g = _Svg(w, h, "")
-            g.text(left, o0 - 8, f"A/E by {xf} band, a line per {by} band ({d['label']})",
-                   cls="lbl")
-            for b in range(len(bands)):
-                seg: list[tuple[float, float]] = []
-                seg_thin: list[bool] = []
-                for c in cells + [-1]:  # -1 ends the last run
-                    a = x_band_of.get(c)
-                    v = d["ae"][a][b] if a is not None and a < len(d["ae"]) else None
-                    if v is None or a is None:
-                        if seg:
-                            _segments(g, seg, seg_thin, cls=f"ib{b}", faded_cls=f"ib{b} fade")
-                        seg, seg_thin = [], []
-                        continue
-                    y = ov_s(min(max(float(v), ov_s.lo), ov_s.hi))
-                    seg += [(xs[c] - slot / 2, y), (xs[c] + slot / 2, y)]
-                    seg_thin += [thin_pair(d, a, b)] * 2
+            g.text(left, o0 - 8, f"actual and expected {_rate_name(r)} by {xf}, a line per {by} "
+                   f"band ({d['label']})", cls="lbl")
+            for b, band_pts in enumerate(rates[i]):
+                g.path([(xs[c], lv_s(e)) for c, _, e, _ in band_pts], f"ib{b}")
+                _segments(g, [(xs[c], lv_s(min(a, lv_s.hi))) for c, a, _, _ in band_pts],
+                          [thin for _, _, _, thin in band_pts], cls=f"ib{b} dash",
+                          faded_cls=f"ib{b} dash fade")
             svg.group(f"ds ds-{i}", g.parts)
         for b in range(len(bands)):
             sc = strip(b)
@@ -1905,7 +1913,13 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
             if hit is not None:
                 tips.append(f"{band_label[tuple(bands[i])]} {show(shown(hit))}")
         a = x_band_of.get(c)
-        for _, d in ae_ds:
+        for i, d in ae_ds:
+            here = [(b, act, exp) for b, band_pts in enumerate(rates[i])
+                    for cc, act, exp, _ in band_pts if cc == c]
+            if here:
+                tips.append(f"{d['label']} actual / expected: " + ", ".join(
+                    f"{band_label[tuple(bands[b])]} {_num(act, 4)} / {_num(exp, 4)}"
+                    for b, act, exp in here))
             if a is not None and a < len(d["ae"]):
                 tips.append(f"{d['label']} A/E: " + ", ".join(
                     f"{band_label[tuple(bands[b])]} {_fixed(d['ae'][a][b], 2)}"
