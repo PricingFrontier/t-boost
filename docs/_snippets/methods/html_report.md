@@ -21,7 +21,7 @@ html_report(X, y, *,
             sample_weight=None, exposure=None, offset=None,
             ref_measure=None,
             eval_set=None, eval_sample_weight=None, eval_exposure=None, eval_offset=None,
-            labels=("train", "validation", "test"),
+            labels=None,
             name=None,
             thresholds=None)
 ```
@@ -39,9 +39,7 @@ A string: the HTML document.
 ```python
 # model: a TBoostRegressor(objective="poisson") trained with exposure="Exposure"
 html = model.html_report(train_data, "ClaimCount", exposure="Exposure",
-                         eval_set=[(validation_data, "ClaimCount"),
-                                   (test_data, "ClaimCount")],
-                         eval_exposure=["Exposure", "Exposure"],
+                         eval_set=(test_data, "ClaimCount"), eval_exposure="Exposure",
                          name="Motor frequency v3", thresholds={"ae_test": 0.03})
 with open("freq_report.html", "w") as f:
     f.write(html)

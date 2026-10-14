@@ -70,7 +70,7 @@ THRESHOLD_DESCRIPTIONS: dict[str, str] = {
     "thin_cell_mass": "one-way table cells under this share of the table's exposure count as thin",
     "psi_warn": "PSI per feature above value: warning",
     "psi_critical": "PSI per feature above value: critical",
-    "train_gap": "drop in deviance explained from train to validation, and to test",
+    "train_gap": "drop in deviance explained from train to each later dataset",
     "unseen_mass": "mass share of unseen categorical values in a dataset",
 }
 
@@ -117,18 +117,24 @@ def resolve_thresholds(thresholds: dict[str, Any] | None) -> dict[str, float | N
     return out
 
 
-DATASET_ROLES = ("train", "validation", "test")
+def dataset_roles(n: int) -> tuple[str, ...]:
+    """The role of each of ``n`` datasets: train, then test (two datasets), or train,
+    validation and test (three). t-boost's bags early-stop and prune on rows they hold back, so
+    a separate validation dataset is the exception, not the default."""
+    return ("train", "test") if n == 2 else ("train", "validation", "test")[:n]
 
 
 def resolve_labels(labels: Any, n: int) -> list[str]:
-    """The names of the ``n`` datasets: the first ``n`` of ``labels`` (by role: train,
-    validation, test), which must be distinct non-empty strings."""
+    """The names of the ``n`` datasets: ``labels`` (the first ``n``), which must be distinct
+    non-empty strings, or by default their roles (`dataset_roles`)."""
+    if labels is None:
+        return list(dataset_roles(n))
     if (not isinstance(labels, (tuple, list)) or len(labels) < n
             or not all(isinstance(v, str) and v.strip() for v in labels[:n])
             or len(set(labels[:n])) != n):
         raise ValueError(
             f"labels must give {n} distinct non-empty strings, one per dataset, e.g. "
-            "('train', 'validation', 'test')"
+            f"{dataset_roles(n)!r}"
         )
     return [str(v) for v in labels[:n]]
 
@@ -136,7 +142,7 @@ def resolve_labels(labels: Any, n: int) -> list[str]:
 def resolve_eval_sets(eval_set: Any, weights: Any, exposures: Any, offsets: Any
                       ) -> list[tuple[Any, Any, Any, Any, Any]]:
     """``eval_set`` as ``(X, y, sample_weight, exposure, offset)`` per dataset: one ``(X, y)``
-    pair (the ``fit`` convention) with single vectors, or a list of up to two pairs
+    pair (the test data, by default) with single vectors, or a list of up to two pairs
     (validation, then test) with the ``eval_*`` vectors as lists of the same length."""
     if eval_set is None:
         if any(v is not None for v in (weights, exposures, offsets)):
@@ -149,7 +155,7 @@ def resolve_eval_sets(eval_set: Any, weights: Any, exposures: Any, offsets: Any
     if not isinstance(eval_set, list) or not 1 <= len(eval_set) <= 2 or not all(
             isinstance(pair, tuple) and len(pair) == 2 for pair in eval_set):
         raise ValueError(
-            "eval_set must be a pair (X, y) or a list of up to two pairs: "
+            "eval_set must be a pair (X_test, y_test) or a list of up to two pairs: "
             "[(X_validation, y_validation), (X_test, y_test)]"
         )
     n = len(eval_set)
@@ -741,9 +747,10 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
     flags: list[dict[str, Any]] = []
     datasets = report["datasets"]
     multiclass = report["model"]["multiclass"]
+    roles = dataset_roles(len(datasets))
     for i, ds in enumerate(datasets):
         label = ds["label"]
-        tol = th[f"ae_{DATASET_ROLES[i]}"]
+        tol = th[f"ae_{roles[i]}"]
         if ds.get("error"):
             flags.append(_flag("scoring", "critical", ds["error"], dataset=label))
             continue
@@ -845,18 +852,25 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                     value=share, threshold=th["unseen_mass"], dataset=label, feature=feature))
     if len(datasets) == 1:
         flags.append(_flag("holdout_data", "info",
-                           "train data only: every metric is in-sample. Pass validation and test "
-                           "data as eval_set for out-of-sample evidence",
+                           "train data only: every metric is in-sample. Pass test data as "
+                           "eval_set for out-of-sample evidence",
                            dataset=datasets[0]["label"]))
-    elif len(datasets) == 2:
-        flags.append(_flag("holdout_data", "info",
-                           f"no test data: {datasets[1]['label']} is the only out-of-sample "
-                           "evidence", dataset=datasets[1]["label"]))
-    if len(datasets) > 1 and report["fit"]["early_stopping"]["eval_set"]:
+    # Train and test need no note: the bags early-stop and prune on rows they hold back. A fit
+    # that early-stopped on an eval_set gets an info note, not a warning: the report cannot tell
+    # whether that eval_set is one of these datasets, and stopping on (say) a later period while
+    # reporting on a separate test set is a sound workflow that a warning would flag.
+    if len(datasets) == 2 and report["fit"]["early_stopping"]["eval_set"]:
         flags.append(_flag(
             "holdout_data", "info",
-            "the fit early-stopped on an eval_set: if that was the validation data, its metrics "
-            "are not fully out-of-sample; the test data are the independent estimate",
+            f"the fit early-stopped on an eval_set: if {datasets[1]['label']} is that data, its "
+            "metrics are not fully out-of-sample",
+            dataset=datasets[1]["label"]))
+    elif len(datasets) == 3 and report["fit"]["early_stopping"]["eval_set"]:
+        flags.append(_flag(
+            "holdout_data", "info",
+            f"the fit early-stopped on an eval_set: if that was {datasets[1]['label']}, its "
+            f"metrics are not fully out-of-sample; {datasets[2]['label']} is the independent "
+            "estimate",
             dataset=datasets[1]["label"]))
     train = datasets[0]
     first = None if train.get("error") else train["metrics"]["deviance_explained"]
@@ -936,6 +950,13 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                     feature=f["feature"]))
     grad = report["fit"]["graduation"]["value"] or {}
     grad_tables = report["fit"]["graduation_tables"]["value"] or []
+    # A declined fixed `graduation_alpha` is a binding finding (below); a declined GCV choice
+    # is reported here.
+    if (grad.get("candidate_count") == 1 and grad.get("adopted") is False
+            and getattr(est, "graduation_alpha", None) is None):
+        flags.append(_flag(
+            "graduation", "info",
+            "graduation was not applied: " + str(grad.get("rejected") or "it was declined")))
     if grad and grad.get("adopted") and grad.get("evidence") == "none":
         smoothed = [g for g in grad_tables if (g.get("alpha") or 0) > 0 and not g.get("rejected")]
         plain = [g["features"][0] for g in grad_tables

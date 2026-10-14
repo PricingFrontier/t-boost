@@ -1,7 +1,7 @@
 # Model report
 
-The model report gathers, for one model and its train, validation and test data, what a reviewer needs to decide
-whether the model is ready for production: how well it fits in and out of sample, how it is
+The model report gathers, for one model and its train and test data, what a reviewer needs to
+decide whether the model is ready for production: how well it fits in and out of sample, how it is
 built, how the pruning chose its tables, every rating factor, the drift between the datasets
 and a list of review flags.
 
@@ -16,9 +16,7 @@ import json
 import t_boost
 
 report = model.pricing_report(train_data, "ClaimCount", exposure="Exposure",
-                              eval_set=[(validation_data, "ClaimCount"),
-                                        (test_data, "ClaimCount")],
-                              eval_exposure=["Exposure", "Exposure"],
+                              eval_set=(test_data, "ClaimCount"), eval_exposure="Exposure",
                               name="Motor frequency v3")
 with open("freq_report.json", "w") as f:
     json.dump(report, f)
@@ -26,12 +24,16 @@ with open("freq_report.html", "w") as f:
     f.write(t_boost.report_html(report))
 ```
 
-The train data is `X`, `y`; `eval_set` adds the validation data, or the validation and the test
-data (a list of two pairs), named `train`, `validation` and `test` unless `labels` says
-otherwise. The report describes the data passed to it; it cannot verify which rows were used to
-fit the model and which were held out. If the model was early-stopped on an `eval_set` passed to
-`fit`, that data is not fully out-of-sample, and the report says so: the test data are then the
-independent estimate.
+The train data is `X`, `y`; `eval_set` adds the test data, or the validation and the test data
+(a list of two pairs), named `train` and `test`, or `train`, `validation` and `test`, unless
+`labels` says otherwise. Train and test are the usual pair: t-boost's bags early-stop and prune
+on objects they hold back, so a model needs no separate validation data. Keep some only to
+early-stop on chosen data (for example the latest period) or to compare settings.
+
+The report describes the data passed to it; it cannot verify which rows were used to fit the
+model and which were held out. If the model was early-stopped on an `eval_set` passed to `fit`,
+that data is not fully out-of-sample, and the report says so: pass it as the validation data and
+keep a test set for the independent estimate.
 
 All three kinds of model are supported: regression, binary classification and
 multiclassification (one-vs-rest per class, with a class selector on the page). The per-row work
@@ -56,9 +58,9 @@ viewer.
 
 ## The page {#sections}
 
-The page has seven tabs and one dataset switch (train, validation, test; it opens on the last
-dataset given, the most independent one). The selected dataset is drawn in colour in every chart
-and the others in grey, so train, validation and test compare without scrolling. Blue is
+The page has seven tabs and one dataset switch (train and test, or train, validation and test;
+it opens on the last dataset given, the most independent one). The selected dataset is drawn in
+colour in every chart and the others in grey, so the datasets compare without scrolling. Blue is
 observed data and orange is the model throughout. Each chart has a one-line caption and its
 numbers collapsed beneath it; hovering a point shows its values. The tabs, the switches and the
 collapsed sections are plain HTML and CSS, so they work where scripts are blocked.
@@ -164,10 +166,12 @@ verdict. The thresholds are set with the `thresholds` parameter of `pricing_repo
 team can apply its own:
 
 - the overall A/E of each dataset (`ae_train`, `ae_validation`, `ae_test`);
-- whether the validation and test deviance explained is positive (the model beats a constant);
-- the drop in deviance explained from train to validation and to test (`train_gap`);
-- which out-of-sample data the report has (no validation, no test, or validation data that
-  drove early stopping);
+- whether the deviance explained on each later dataset is positive (the model beats a constant);
+- the drop in deviance explained from train to each later dataset (`train_gap`);
+- whether the report has out-of-sample data at all, and whether the fit early-stopped on an
+  `eval_set` (if that is one of the datasets, its metrics are not fully out-of-sample);
+- whether graduation, the smoothing of the tables, was declined (see
+  [Graduation settings](../training-parameters/graduation.md));
 - whether any bag reached `n_trees` without [early stopping](../algorithm/early-stopping.md);
 - deciles of predicted rate whose A/E is off by more than `decile_ae` and at least `factor_z`
   standard deviations (with `factor_z` set to `None`, the tolerance alone);

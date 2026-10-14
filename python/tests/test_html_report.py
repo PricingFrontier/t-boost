@@ -42,7 +42,7 @@ def poisson():
         tr.select("age", "veh", "dens"), tr["y"], exposure=tr["exp"])
     report = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"),
                               eval_exposure="exp", name="Freq <v1>")
-    assert [d["label"] for d in report["datasets"]] == ["train", "validation"]
+    assert [d["label"] for d in report["datasets"]] == ["train", "test"]
     return m, tr, ev, report
 
 
@@ -63,8 +63,7 @@ def test_report_is_strict_json_and_renders_from_json(poisson):
 def test_summary_metrics_are_mlflow_ready(poisson):
     _, _, _, report = poisson
     sm = report["summary_metrics"]
-    assert {"train_deviance", "validation_deviance_explained", "validation_gini",
-            "validation_ae"} <= set(sm)
+    assert {"train_deviance", "test_deviance_explained", "test_gini", "test_ae"} <= set(sm)
     for key, value in sm.items():
         assert _MLFLOW_KEY.match(key) and isinstance(value, float) and np.isfinite(value)
 
@@ -229,7 +228,7 @@ def test_multiclass_report():
     for row in ae:
         k = list(m.classes_).index(row["class"])
         assert sum(row["expected"]) == pytest.approx(float(np.sum(w[:1600] * proba[:, k])))
-    assert {"train_ae_0", "train_gini_2", "validation_accuracy"} <= set(report["summary_metrics"])
+    assert {"train_ae_0", "train_gini_2", "test_accuracy"} <= set(report["summary_metrics"])
     html = report_html(report)
     assert 'name="cl"' in html and "logit contribution" in html
     mm = m._multi_model
@@ -691,3 +690,46 @@ def test_multinomial_deviance_needs_probability_rows():
     proba = np.array([[0.2, 0.8], [0.6, 0.4]], dtype=np.float32).astype(np.float64)
     assert metrics.mean_multinomial_deviance(np.array([1, 0]), proba) == pytest.approx(
         -math.log(0.8) - math.log(0.6), rel=1e-6)
+
+
+def test_two_datasets_are_train_and_test(poisson):
+    # The bags early-stop and prune on rows they hold back, so one eval pair is the test data:
+    # named so, held to `ae_test`, and with no note about missing test data.
+    m, tr, ev, report = poisson
+    assert [d["label"] for d in report["datasets"]] == ["train", "test"]
+    assert not any(f["check"] == "holdout_data" for f in report["review"])
+    strict = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp",
+                              thresholds={"ae_validation": None, "ae_test": 1e-6})
+    flag = next(f for f in strict["review"]
+                if f["check"] == "overall_ae" and f["dataset"] == "test")
+    assert flag["status"] == "warning" and flag["threshold"] == 1e-6
+    alone = m.pricing_report(tr, "y", exposure="exp")
+    assert any(f["check"] == "holdout_data" and "Pass test data" in f["message"]
+               for f in alone["review"])
+    # A fit that early-stopped on an eval_set: the second dataset may be that data.
+    features = ["age", "veh", "dens"]
+    stopped = TBoostRegressor(objective="poisson", **FAST).fit(
+        tr.select(features), tr["y"], exposure=tr["exp"],
+        eval_set=(ev.select(features), ev["y"]), eval_exposure=ev["exp"])
+    r = stopped.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp")
+    note = next(f for f in r["review"] if f["check"] == "holdout_data")
+    assert note["status"] == "info" and "if test is that data" in note["message"]
+
+
+def alternating(n=4000, seed=11):
+    """An effect that alternates level by level: smoothing it costs far more than 1% of the
+    training deviance, so graduation is declined."""
+    rng = np.random.default_rng(seed)
+    x = rng.integers(0, 40, n).astype(float)[:, None]
+    return x, rng.poisson(np.exp(-0.2 + 0.9 * (x[:, 0] % 2)))
+
+
+def test_a_declined_graduation_is_reported():
+    x, y = alternating()
+    m = TBoostRegressor(objective="poisson", **FAST).fit(x, y)  # strengths chosen by GCV
+    assert m.graduation_validation_["adopted"] is False
+    assert "training deviance" in m.graduation_validation_["rejected"]
+    assert not any(r["param"] == "graduation_alpha" for r in m.binding_report_)
+    flags = m.pricing_report(x, y)["review"]
+    assert any(f["check"] == "graduation" and f["status"] == "info"
+               and f["message"].startswith("graduation was not applied") for f in flags)

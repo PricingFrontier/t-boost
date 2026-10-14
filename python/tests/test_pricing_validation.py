@@ -111,8 +111,8 @@ def test_graduation_withholds_no_rows_from_the_fit(monkeypatch, grouped):
 
 @pytest.mark.parametrize('train_adopted', [True, False])
 def test_graduation_adopts_on_the_native_reanchor_verdict(monkeypatch, train_adopted):
-    # There is no accuracy gate: the smoothed bank ships whenever the native re-anchor
-    # accepts it. Nothing is scored against held-out outcomes, because nothing is held out.
+    # No held-out gate: the smoothed bank ships whenever the native check (the training
+    # deviance rises by at most 1%) accepts it. Nothing held out is scored, because nothing is.
     class Model:
         def graduation_tables(self, limit):
             return [None]
@@ -127,7 +127,31 @@ def test_graduation_adopts_on_the_native_reanchor_verdict(monkeypatch, train_ado
     result = m._graduate_table_model(base, x, np.zeros(10), np.ones(10), None, None)
     assert m.graduation_validation_['adopted'] is train_adopted
     assert m.graduation_validation_['n_smoothed'] == 1
+    assert ('rejected' in m.graduation_validation_) is not train_adopted
     assert (result is not base) is train_adopted
+
+
+def test_a_declined_graduation_alpha_warns_and_does_not_bind():
+    # A fixed strength that would flatten a real alternating effect raises the training
+    # deviance by far more than 1%: the tables stay as fitted, and that is never silent.
+    rng = np.random.default_rng(11)
+    x = rng.integers(0, 40, 4000).astype(float)[:, None]
+    y = rng.poisson(np.exp(-0.2 + 0.9 * (x[:, 0] % 2)))
+    with pytest.warns(RuntimeWarning, match="graduation_alpha=1000000000.0.*NO EFFECT"):
+        m = estimator(objective='poisson', graduation_alpha=1e9).fit(x, y)
+    assert m.graduation_validation_['adopted'] is False
+    row = next(r for r in m.binding_report_ if r['param'] == 'graduation_alpha')
+    assert row['status'] == 'INERT' and 'training deviance' in row['reason']
+    with pytest.raises(ValueError, match='graduation_alpha'):
+        m.check_bindings()
+    flags = m.pricing_report(x, y)['review']
+    assert any(f['check'] == 'binding' and f['status'] == 'warning'
+               and f['message'].startswith('graduation_alpha=') for f in flags)
+    # A strength the check accepts binds as usual.
+    ok = estimator(objective='poisson', graduation_alpha=1e-3).fit(x, y)
+    assert ok.graduation_validation_['adopted'] is True
+    assert not any(r['param'] == 'graduation_alpha' and r['status'] == 'INERT'
+                   for r in ok.binding_report_)
 
 
 def test_offset_guard_measures_expected_counts(monkeypatch):

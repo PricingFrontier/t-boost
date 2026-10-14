@@ -781,6 +781,10 @@ _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
 # VehGas pair on freMTPL2 because the VehGas main was 0.085%). 0 = off, so existing fits are
 # unchanged.
 _PRUNE_MIN_VARIANCE_SHARE_DEFAULT = 0.0
+# Why graduation can be declined: the native check keeps the smoothed tables only if they raise
+# the training deviance by at most 1% (`_graduate_table_model`).
+_GRADUATION_REJECTED = ("the smoothed tables raised the training deviance by more than 1%, so "
+                        "every table was kept as fitted")
 # Which knobs each keep-set selector reads, for `binding_report_`. The ranked path reads only its
 # own three. The fold vote reads the others: its CV and vote, the evidence gate, the walk's size
 # prices, the guard and the slope re-anchor, plus the K>=3 selection fits, legacy split and guard.
@@ -2993,6 +2997,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             add("validation_fraction", "INERT",
                 "eval_set supplied the early-stopping rows, so no holdout was carved", "eval_set")
 
+        # A fixed graduation strength the training-deviance check declined: the tables were
+        # deployed as fitted. (Under GCV-chosen strengths a decline is reported, not a binding.)
+        graduation = getattr(self, "graduation_validation_", None) or {}
+        if ("graduation_alpha" in defaults and getattr(self, "graduation_alpha", None) is not None
+                and graduation.get("candidate_count") == 1
+                and graduation.get("adopted") is False):
+            add("graduation_alpha", "INERT",
+                str(graduation.get("rejected") or _GRADUATION_REJECTED))
+
         # deprecated spellings still work, but say so here as well as in the warning
         for old, (new, _why) in self._DEPRECATED.items():
             if old in defaults and getattr(self, old, None) != defaults[old]:
@@ -3016,10 +3029,23 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         whose bank holds 24 tables, which is INERT and entirely harmless. `OVERRIDDEN` is the
         class where another knob is actively cancelling yours, which is never benign and is always
         worth interrupting for. `INERT` stays in `binding_report_` and in `check_bindings()`.
+
+        One INERT row warns too: a `graduation_alpha` the training-deviance check declined. You
+        asked for that smoothing and the deployed tables have none, which is never benign.
         """
         import warnings as _warnings
 
         for row in self.binding_report_:
+            if row["param"] == "graduation_alpha" and row["status"] == "INERT":
+                # Unlike other INERT knobs this is never benign: you asked for this smoothing
+                # strength and the deployed tables have none.
+                _warnings.warn(
+                    f"`graduation_alpha={row['value']!r}` had NO EFFECT on this fit: "
+                    f"{row['reason']}. Use a smaller `graduation_alpha`, or None to let each "
+                    "table choose its own strength. See `graduation_validation_`.",
+                    RuntimeWarning, stacklevel=3,
+                )
+                continue
             if row["status"] != "OVERRIDDEN":
                 continue
             _warnings.warn(
@@ -3823,16 +3849,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
         eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
         eval_offset: Any | None = None,
-        labels: tuple[str, ...] = ("train", "validation", "test"),
+        labels: tuple[str, ...] | None = None,
         name: str | None = None,
         thresholds: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return the model report: fit quality, structure, pruning evidence, rating tables,
         A/E by factor level, drift and review flags, as plain JSON (``report_version`` 2).
 
-        ``X``/``y`` are the train data; ``eval_set`` adds the validation data as one ``(X, y)``
-        pair (the ``fit`` convention), or validation and test data as a list of two pairs, with
-        the ``eval_*`` vectors as lists to match. ``labels`` names the datasets in that order.
+        ``X``/``y`` are the train data; ``eval_set`` adds the test data as one ``(X, y)`` pair
+        (the ``fit`` convention), or validation and test data as a list of two pairs, with the
+        ``eval_*`` vectors as lists to match. The bags early-stop and prune on rows they hold
+        back, so train and test are the usual pair. ``labels`` names the datasets in that order:
+        ``("train", "test")`` or ``("train", "validation", "test")`` by default.
         Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``. ``thresholds`` overrides the review thresholds
         (``t_boost._report.DEFAULT_THRESHOLDS``; ``None`` disables a check). The report
         describes the supplied data; it is not evidence that those data were held out. Render
@@ -3854,7 +3882,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
         eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
         eval_offset: Any | None = None,
-        labels: tuple[str, ...] = ("train", "validation", "test"),
+        labels: tuple[str, ...] | None = None,
         name: str | None = None,
         thresholds: dict[str, Any] | None = None,
     ) -> str:
@@ -6076,15 +6104,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 adopted=False, candidate_count=0, skipped="no eligible smoothing updates",
             )
             return table_model
-        # NO ACCEPT/REJECT GATE (2026-09-20): see `_fit_and_prune` for the measurement that
-        # retired it. `train_adopted` is the native layer's own consistency check on the
-        # re-anchored candidate -- it declines when the smoothed bank cannot be balanced back
-        # onto the fit rows -- NOT a generalization test. Nothing here scores the candidate
-        # against held-out outcomes, because nothing is held out any more.
+        # No held-out gate (2026-09-20): see `_fit_and_prune` for the measurement that retired
+        # it. `train_adopted` is the native layer's check on the re-anchored candidate
+        # (`apply_graduation_updates_impl`): it declines when the smoothed bank's TRAINING
+        # deviance exceeds the fitted bank's by more than 1% -- a training-data check, NOT a
+        # generalization test. A declined candidate keeps every table as fitted.
         adopted = bool(train_adopted)
         self.graduation_validation_.update(
             adopted=adopted, candidate_count=1, n_smoothed=len(updates),
         )
+        if not adopted:
+            self.graduation_validation_["rejected"] = _GRADUATION_REJECTED
         self.graduation_report_ = [
             {**r, "rejected": not adopted, "alpha": r["alpha"] if adopted else 0.0}
             for r in report
@@ -6837,11 +6867,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``graduation_report_`` is then never set. NO ROWS ARE WITHHELD: the fit, the
         prune and the smoothing all see every row, and the smoothed bank is adopted
         whenever the native re-anchor accepts it (``graduation_validation_["adopted"]``).
-        There is deliberately NO accuracy gate -- between 2026-09-09 and 2026-09-20 one
-        existed, paid for by a ``prune_validation_fraction`` holdout carved out of every
-        fit, and it cost +1.29% mean test deviance on the arena catalog to decide a bit
-        worth -0.015%. Whether a smoothed tariff is what you want is your call, not a
-        deviance comparison's: set ``graduate=False`` for the raw pruned bank.
+        There is deliberately no held-out accuracy gate -- between 2026-09-09 and
+        2026-09-20 one existed, paid for by a ``prune_validation_fraction`` holdout carved
+        out of every fit, and it cost +1.29% mean test deviance on the arena catalog to
+        decide a bit worth -0.015%. Whether a smoothed tariff is what you want is your call,
+        not a deviance comparison's: set ``graduate=False`` for the raw pruned bank. The
+        smoothing is kept only if it raises the training deviance by at most 1%; otherwise
+        every table is kept as fitted and ``graduation_validation_`` says why.
         Monotone fits retain the full bank without smoothing. Explicit ``True`` requires
         ``prune=True``. Multiclass (K>=3) graduation is unsupported.
     graduation_alpha : float or None, default=None
@@ -6850,7 +6882,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         default) lets each table pick its own GCV-optimal alpha independently, including
         ``alpha=0`` (left untouched) for a table whose apparent roughness is real,
         well-supported shape rather than noise. Only relevant when ``graduate`` resolves to
-        ``True``.
+        ``True``. A strength that raises the training deviance by more than 1% is declined:
+        the tables are kept as fitted, the fit warns and ``binding_report_`` lists it INERT.
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
         step on factored interactions of orders 3 through 8. Requires ``prune=True``
@@ -8191,7 +8224,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         2-way admissions.
     graduate : bool or None, default=None
         Binary (K=2) fits use the regressor's graduation policy -- smoothing on the
-        full fit, no holdout, no accuracy gate (see :class:`TBoostRegressor`).
+        full fit, no holdout, kept only if the training deviance rises by at most 1% (see
+        :class:`TBoostRegressor`).
         Multiclass (K>=3) graduation is unavailable; explicit ``True`` raises.
     graduation_alpha : float or None, default=None
         Fixed smoothing strength on binary fits; unused for multiclass.

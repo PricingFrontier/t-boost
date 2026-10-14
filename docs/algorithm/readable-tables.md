@@ -64,7 +64,8 @@ it off. See [Banding settings](../training-parameters/banding.md).
 
 Finally, the tables are smoothed with Whittaker-Henderson graduation, the actuarial smoother for
 rating factors. Each table picks its own strength by generalized cross-validation, so a table
-whose roughness is real shape is left untouched. No objects are held out for it.
+whose roughness is real shape is left untouched. No objects are held out for it: the smoothing is
+kept only if it raises the training deviance by at most 1%.
 
 `graduation_alpha` fixes one strength for every table. `graduation_high_order_alpha` (off by
 default) adds a light neighbour smoothing for factored 3-way and higher interactions. Details are

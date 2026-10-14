@@ -18,7 +18,9 @@ Smooth the deployed tables with Whittaker-Henderson graduation.
 `None` and `True` turn graduation on, and `False` turns it off (the `graduation_report_`
 attribute is then not set). An explicit `True` requires `prune=True`, and raises an error for
 multiclassification. Whether a smoothed table is what you want to deploy is a modelling
-decision: graduation has no accuracy gate.
+decision: graduation is not tested on held-out data. It is kept only if it raises the training
+deviance by at most 1%; otherwise every table is kept as fitted, and `graduation_validation_`
+records `"adopted": False` and why.
 
 **Type**
 
@@ -35,6 +37,11 @@ None (on)
 A fixed smoothing strength for every table, instead of the strength each table picks by
 generalized cross-validation. 0 turns off the smoothing of the dense tables, which is useful
 together with [`graduation_high_order_alpha`](#graduation_high_order_alpha).
+
+A strength that raises the training deviance by more than 1% is declined, and every table is kept
+as fitted: the fit warns, `binding_report_` lists `graduation_alpha` as INERT and
+`check_bindings()` raises. Use a smaller strength. The scale depends on the data: the penalty is
+weighed against each cell's exposure.
 
 **Type**
 
