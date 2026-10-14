@@ -115,6 +115,7 @@ svg .guide{stroke:var(--axis);stroke-width:1;stroke-dasharray:4 3}
 svg .data{stroke:var(--data);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}
 svg .model{stroke:var(--model);stroke-width:2;fill:none;stroke-linejoin:round;stroke-linecap:round}
 svg .faded{stroke:var(--model);stroke-width:2;fill:none;opacity:.3;stroke-linejoin:round;stroke-linecap:round}
+svg .dfaded{stroke:var(--data);stroke-width:2;fill:none;opacity:.3;stroke-linejoin:round;stroke-linecap:round}
 svg .ddot{fill:var(--data);stroke:var(--surface);stroke-width:1.5}
 svg .mdot{fill:var(--model);stroke:var(--surface);stroke-width:1.5}
 svg .dsl{stroke:var(--other);stroke-width:1.5;fill:none;stroke-linejoin:round}
@@ -1367,8 +1368,9 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
     """One feature on one x-axis of its levels: the deployed one-way table (log scale for a
     multiplier, thin cells faded) with the feature's Shapley value across the first dataset's
     policies (its mean and the 10th to 90th percentile: the one-way table plus its share of the
-    interactions), A/E by the review's bands for every dataset (the selected one in colour with
-    its ±2σ band) and the train exposure. Categorical levels are ordered by their effect."""
+    interactions); the selected dataset's actual and expected rate by level (thin levels
+    faded); A/E by the review's bands for every dataset (the selected one in colour with its
+    ±2σ band); and the train exposure. Categorical levels are ordered by their effect."""
     link = r["model"]["link"]
     scored = _scored(r)
     key = None if k is None else cls
@@ -1434,11 +1436,31 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
     two_sd = min(2 * max(_fv(b.get("sd") for mp in band_of for b in mp.values()), default=0.0), 0.3)
     ae_lo = max(min(aes + [1 - (tol or 0.1) * 1.3, 1 - two_sd]), 0.4)
     ae_hi = min(max(aes + [1 + (tol or 0.1) * 1.3, 1 + two_sd]), 1.8)
-    top_h, mid_h, mass_h, gap, t0, foot = 180.0, 120.0, 48.0, 30.0, 22.0, 26.0
+    # Actual and expected rate per level, per dataset; a level under the thin-cell share of the
+    # dataset's exposure is faded, and its actual does not set the scale.
+    thin_share = th.get("thin_cell_mass") or 0.0
+    level: list[dict[int, tuple[float, float, bool]]] = []
+    for e in entries:
+        lv: dict[int, tuple[float, float, bool]] = {}
+        if e is not None:
+            total = sum(float(m) for m in e["mass"]) or 1.0
+            for c in cells:
+                m = float(e["mass"][c]) if c < len(e["mass"]) else 0.0
+                if m > 0 and e["rows"][c]:
+                    lv[c] = (e["actual"][c] / m, e["expected"][c] / m, m / total < thin_share)
+        level.append(lv)
+    lvl_vals = _fv([v[1] for lv in level for v in lv.values()]
+                   + [v[0] for lv in level for v in lv.values() if not v[2]])
+    top_h, lvl_h, mid_h, mass_h, gap, t0, foot = 180.0, 120.0, 120.0, 48.0, 30.0, 22.0, 26.0
     r0 = t0
-    a0 = (r0 + top_h + gap) if has_rel else t0
+    l0 = (r0 + top_h + gap) if has_rel else t0
+    a0 = l0 + lvl_h + gap
     m0 = a0 + mid_h + gap
     h = m0 + mass_h + foot
+    lvl_s = _Lin(0.0, max(lvl_vals or [1.0]), l0 + lvl_h, l0, zero=True, n=4)
+
+    def rate_fmt(v: float) -> str:
+        return _num(v, 3)
     rel_s: _Scale | None = None
     if has_rel:
         rel_s = (_Log(min(rel), max(rel), r0 + top_h, r0, max_ticks=5) if mult
@@ -1448,12 +1470,13 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
     def rel_fmt(v: float) -> str:
         return _mult_tick(v) if mult else _num(v, 2)
 
-    lw = max(_label_w(rel_s, rel_fmt) if rel_s is not None else 0.0, _label_w(ae_s, _fixed2))
+    lw = max(_label_w(rel_s, rel_fmt) if rel_s is not None else 0.0, _label_w(ae_s, _fixed2),
+             _label_w(lvl_s, rate_fmt))
     left, right = 6 + lw + 6, w - 10
     n = len(cells)
     slot = (right - left) / n
     xs = {c: left + (j + 0.5) * slot for j, c in enumerate(cells)}
-    svg = _Svg(w, h, f"{feature}: one-way table, A/E by band and exposure")
+    svg = _Svg(w, h, f"{feature}: one-way table, actual and expected, A/E by band and exposure")
     if rel_s is not None:
         scale = rel_s
         _yaxis(svg, scale, left, right, rel_fmt)
@@ -1498,11 +1521,30 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
                         + (' style="opacity:.35"' if f else "") + "/>")
         for run in runs("mean"):
             svg.path([(xs[c], scale(shap_at("mean", c) or 0.0)) for c in run], "shapmean")
+    _yaxis(svg, lvl_s, left, right, rate_fmt)
+    svg.hline(left, right, l0 + lvl_h, "ax")
+    for i, lv in enumerate(level):
+        g = _Svg(w, h, "")
+        title = f"actual and expected {_rate_name(r)} ({scored[i]['label']})"
+        g.text(left, l0 - 8, title, cls="lbl")
+        _legend(g, left + _text_w(title) + 18, l0 - 8,
+                [("line", "data", "actual"), ("line", "model", "expected")])
+        at = [c for c in cells if c in lv]
+        if len(at) == 1:
+            c0 = at[0]
+            g.add(f'<circle class="mdot" cx="{xs[c0]:.1f}" cy="{lvl_s(lv[c0][1]):.1f}" r="4"/>')
+            g.add(f'<circle class="ddot" cx="{xs[c0]:.1f}" '
+                  f'cy="{lvl_s(min(lv[c0][0], lvl_s.hi)):.1f}" r="4"/>')
+        elif at:
+            g.path([(xs[c], lvl_s(lv[c][1])) for c in at], "model")
+            _segments(g, [(xs[c], lvl_s(min(lv[c][0], lvl_s.hi))) for c in at],
+                      [lv[c][2] for c in at], cls="data", faded_cls="dfaded")
+        svg.group(f"ds ds-{i}", g.parts)
     _yaxis(svg, ae_s, left, right, _fixed2)
     if tol:
-        for g in (1 - tol, 1 + tol):
-            if ae_s.lo <= g <= ae_s.hi:
-                svg.hline(left, right, ae_s(g), "guide")
+        for g_ in (1 - tol, 1 + tol):
+            if ae_s.lo <= g_ <= ae_s.hi:
+                svg.hline(left, right, ae_s(g_), "guide")
     svg.hline(left, right, ae_s(1.0), "ref")
     for i in range(len(scored)):
         g = _Svg(w, h, "")
@@ -1562,46 +1604,15 @@ def factor_chart(r: dict[str, Any], feature: str, cls: str, k: int | None, w: fl
                          f"policies {show(shap_at('p10', c))} to {show(shap_at('p90', c))}")
         lines.append(f"exposure ({scored[0]['label']}) {_num(mass[c])}, {_pct(mass[c] / total, 2)}")
         for i, mp in enumerate(band_of):
+            if c in level[i]:
+                act, exp, _ = level[i][c]
+                lines.append(f"{scored[i]['label']}: actual {_num(act, 4)}, expected "
+                             f"{_num(exp, 4)}")
             b = mp.get(c)
             if b is not None:
                 lines.append(f"{scored[i]['label']}: band {b['label']}, A/E {_fixed(b.get('ae'))}, "
                              f"z {_signed(b.get('z'))}")
         svg.hit(xs[c] - slot / 2, t0, slot, m0 + mass_h - t0, "\n".join(lines))
-    return svg.render()
-
-
-def level_chart(r: dict[str, Any], entry: dict[str, Any], w: float, h: float) -> str:
-    """Actual and expected rate per level for one dataset."""
-    labels = cell_labels(entry["axis"])
-    mass = entry["mass"]
-    idx = [c for c, n in enumerate(entry["rows"]) if n and mass[c]]
-    if not idx:
-        return _none()
-    act = [entry["actual"][c] / mass[c] for c in idx]
-    exp = [entry["expected"][c] / mass[c] for c in idx]
-    top, bottom = 24.0, h - 24
-    s = _Lin(0.0, max(act + exp), bottom, top, zero=True, n=4)
-
-    def rate_fmt(v: float) -> str:
-        return _num(v, 3)
-
-    left, right = 6 + _label_w(s, rate_fmt) + 6, w - 10
-    svg = _Svg(w, h, "actual and expected by level")
-    _legend(svg, left, 12, [("line", "data", "actual"), ("line", "model", "expected")])
-    _yaxis(svg, s, left, right, rate_fmt)
-    slot = (right - left) / len(idx)
-    xs = [left + (j + 0.5) * slot for j in range(len(idx))]
-    svg.path([(x, s(v)) for x, v in zip(xs, exp)], "model")
-    svg.path([(x, s(v)) for x, v in zip(xs, act)], "data")
-    if len(idx) == 1:
-        svg.add(f'<circle class="ddot" cx="{xs[0]:.1f}" cy="{s(act[0]):.1f}" r="4"/>')
-    svg.hline(left, right, bottom, "ax")
-    _xlabels(svg, xs, [labels[c] for c in idx], bottom + 16, slot)
-    zs = entry.get("z") or [None] * len(mass)
-    for j, c in enumerate(idx):
-        svg.hit(xs[j] - slot / 2, top, slot, bottom - top,
-                f"{labels[c]}: actual {_num(act[j], 4)}, expected {_num(exp[j], 4)}, "
-                f"rows {entry['rows'][c]:,}, z {_signed(zs[c])}")
     return svg.render()
 
 
@@ -2286,13 +2297,13 @@ def _factors(r: dict[str, Any], fx: _Radio, classes: _Radio | None) -> str:
                 lvl_rows = [[_e(labels[c2]), _num(e["rows"][c2]), _amt(e["mass"][c2]),
                              _amt(e["actual"][c2]), _amt(e["expected"][c2]), _fixed(e["ae"][c2]),
                              _signed(zs[c2])] for c2, n in enumerate(e["rows"]) if n]
-                lv.append(f'<div class="ds ds-{i}">' + level_chart(r, e, _W_FACTOR, 220)
+                lv.append(f'<div class="ds ds-{i}">'
                           + "<h4>By band</h4>" + _table(cols, band_rows, numeric=range(1, 7))
                           + "<h4>By level</h4>"
                           + _table(cols, lvl_rows, numeric=range(1, 7), scroll="scroll") + "</div>")
             named = "".join(f'<span class="ds ds-{i}">({_e(str(d["label"]))})</span>'
                             for i, d in enumerate(scored))
-            return (chart + "<details><summary>Actual and expected by level, and the numbers "
+            return (chart + "<details><summary>The numbers by band and by level "
                     f"{named}</summary>" + "".join(lv) + "</details>")
 
         body.append(_per_class(r, classes, one))

@@ -112,10 +112,11 @@ table, then its share of the interactions it is in, split evenly over their feat
 with its band furthest from balance on the selected dataset. Selecting a feature shows, on one
 x-axis of its levels: the deployed one-way table (relativities on a log scale for a log link,
 odds multipliers for a logit link; cells holding under `thin_cell_mass` of the table's exposure
-faded), the A/E of the factor check's bands for every dataset, with the `factor_ae` tolerance
-dashed and ±2 standard deviations shaded, and the train exposure. Categorical levels are ordered
-by their effect. The findings about the feature are listed above the chart; the actual and
-expected rate by level and the numbers by band and by level are collapsed below it.
+faded); the actual and expected rate by level on the selected dataset (levels under
+`thin_cell_mass` of its exposure faded); the A/E of the factor check's bands for every dataset,
+with the `factor_ae` tolerance dashed and ±2 standard deviations shaded; and the train exposure.
+Categorical levels are ordered by their effect. The findings about the feature are listed above
+the chart; the numbers by band and by level are collapsed below it.
 
 Over the one-way table, the chart draws the feature's SHAP value per level on the train data: its
 mean (dashed) and the band holding 80% of the policies at that level (10th to 90th percentile,
