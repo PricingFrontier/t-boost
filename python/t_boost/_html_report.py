@@ -1203,17 +1203,29 @@ def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
     for all features at a glance. Each dataset's A/E steps across the feature's bands (the
     selected dataset in colour with its ±2σ band, the others in grey) between the dashed
     tolerance; on the selected dataset the bands the review flags are red and its near misses
-    amber, and the band furthest from balance is marked and named above the chart."""
+    amber, and the band furthest from balance is marked and named above the chart.
+
+    A band is as wide as its share of the first dataset's exposure, so a thin band's noise takes
+    little room, and the scale is set by the bands the review checks (`factor_min_mass`): the
+    rest are clipped at its edge."""
     scored = _scored(r)
     feats = [str(f["feature"]) for f in r.get("features") or []]
     if not scored or not feats:
         return _none()
     tol = r["thresholds"].get("factor_ae")
+    fmin = r["thresholds"].get("factor_min_mass") or 0.0
     cls = None if k is None else _classes(r)[k]
     bands = {(i, f): [b for b in ((_ae_entry(d, f, cls) or {}).get("bands") or [])
                       if b.get("ae") is not None] for i, d in enumerate(scored) for f in feats}
-    vals = _fv(b["ae"] for v in bands.values() for b in v)
-    two_sd = min(2 * max(_fv(b.get("sd") for v in bands.values() for b in v), default=0.0), 0.3)
+    share: dict[tuple[int, str], dict[str, float]] = {}
+    for key, bs in bands.items():
+        total = sum(float(b.get("mass") or 0.0) for b in bs)
+        share[key] = {str(b["label"]): float(b.get("mass") or 0.0) / total if total > 0 else 0.0
+                      for b in bs}
+    checked = [b for key, bs in bands.items() for b in bs if share[key][str(b["label"])] >= fmin]
+    checked = checked or [b for bs in bands.values() for b in bs]
+    vals = _fv(b["ae"] for b in checked)
+    two_sd = min(2 * max(_fv(b.get("sd") for b in checked), default=0.0), 0.3)
     span = (tol or 0.1) * 1.3
     lo = max(min(vals + [1 - span, 1 - two_sd]), 0.4)
     hi = min(max(vals + [1 + span, 1 + two_sd]), 1.8)
@@ -1245,10 +1257,17 @@ def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
             return ys(min(max(v, ys.lo), ys.hi))
 
         svg.text(px, py + 12, _short(f, chars), cls="strong")
-        order = [str(b["label"]) for b in bands[(0, f)]] or \
-            [str(b["label"]) for i in range(len(scored)) for b in bands[(i, f)]]
-        slot = pw / max(len(order), 1)
-        x_of = {lab: px + (j + 0.5) * slot for j, lab in enumerate(order)}
+        first = next((i for i in range(len(scored)) if bands[(i, f)]), 0)
+        order = [str(b["label"]) for b in bands[(first, f)]]
+        # Widths by the first dataset's exposure; a band too thin to see keeps a sliver.
+        raw = [max(share[(first, f)].get(lab, 0.0), 0.004) for lab in order]
+        x0: dict[str, float] = {}
+        wid: dict[str, float] = {}
+        edge = px
+        for lab, v in zip(order, raw):
+            x0[lab], wid[lab] = edge, pw * v / (sum(raw) or 1.0)
+            edge += wid[lab]
+        x_of = {lab: x0[lab] + wid[lab] / 2 for lab in order}
         svg.hline(px, px + pw, ys(1.0), "ref")
         if tol:
             for g in (1 - tol, 1 + tol):
@@ -1257,14 +1276,14 @@ def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
         for i in range(len(scored)):
             bs = [b for b in bands[(i, f)] if str(b["label"]) in x_of]
             if any((b.get("sd") or 0) > 0 for b in bs):
-                up = [(x_of[str(b["label"])] + e * slot / 2, y_of(1 + 2 * (b.get("sd") or 0.0)))
-                      for b in bs for e in (-1, 1)]
-                dn = [(x_of[str(b["label"])] + e * slot / 2, y_of(1 - 2 * (b.get("sd") or 0.0)))
-                      for b in bs for e in (-1, 1)]
+                up = [(x0[str(b["label"])] + e * wid[str(b["label"])],
+                       y_of(1 + 2 * (b.get("sd") or 0.0))) for b in bs for e in (0, 1)]
+                dn = [(x0[str(b["label"])] + e * wid[str(b["label"])],
+                       y_of(1 - 2 * (b.get("sd") or 0.0))) for b in bs for e in (0, 1)]
                 svg.add(f'<path class="dsw dsw-{i}" d="{_d(up + dn[::-1])}Z"/>')
         for i in range(len(scored)):
-            svg.path([(x_of[str(b["label"])] + e * slot / 2, y_of(b["ae"]))
-                      for b in bands[(i, f)] if str(b["label"]) in x_of for e in (-1, 1)],
+            svg.path([(x0[str(b["label"])] + e * wid[str(b["label"])], y_of(b["ae"]))
+                      for b in bands[(i, f)] if str(b["label"]) in x_of for e in (0, 1)],
                      f"dsl dsl-{i}")
         for i in range(len(scored)):
             bs = [b for b in bands[(i, f)] if str(b["label"]) in x_of]
@@ -1290,7 +1309,9 @@ def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
                         str(b.get("flag")), "")
                     lines.append(f"{d['label']}: A/E {_fixed(b['ae'])}, z {_signed(b.get('z'))}"
                                  + verdict)
-            svg.hit(x_of[lab] - slot / 2, top, slot, plot_h, "\n".join(lines))
+            lines.append(f"{_pct(share[(first, f)].get(lab, 0.0), 1)} of the "
+                         f"{scored[first]['label']} exposure")
+            svg.hit(x0[lab], top, max(wid[lab], 1.0), plot_h, "\n".join(lines))
     return svg.render()
 
 
@@ -1746,7 +1767,7 @@ def _balance_rule(r: dict[str, Any]) -> str:
     if tol is None:
         return "A/E across each feature's bands; the factor check is off"
     rule = f"outside ±{_pct(tol, 0)}" + (f" and ≥ {fz:g}σ from balance" if fz else "")
-    return f"Each feature's A/E by band; flagged {rule}"
+    return f"A/E by band, width by exposure; flagged {rule}"
 
 
 def _balance_takeaway(r: dict[str, Any], i: int, k: int | None = None) -> str:

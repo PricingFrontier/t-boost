@@ -436,7 +436,7 @@ def test_factor_check_reads_equal_mass_bands_shared_by_every_dataset(poisson):
     passing = [f for f in report["review"] if f["check"] == "factor_ae" and f["status"] == "pass"]
     assert passing and all("of the mass" in f["message"] for f in passing)
     html = report_html(report)
-    assert "A/E by band (the review check)" in html and "A/E by band; flagged outside" in html
+    assert "A/E by band (the review check)" in html and "width by exposure; flagged outside" in html
 
 
 def test_page_is_css_only_tabs_with_one_dataset_switch(poisson):
