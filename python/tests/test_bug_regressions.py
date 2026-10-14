@@ -700,3 +700,43 @@ def test_bug064_joint_exports_preserve_fit_mass_and_require_it_after_loading(cla
         with pytest.raises(ValueError, match=key):
             loaded.tables(x, ref_measure="joint")
         assert json.loads(loaded.tables(x, ref_measure="joint", **{key: mass})) == expected
+
+
+# Audit of 2026-10-14 (specs/roadmap/monotone-pruning.md, "Also on this branch").
+
+
+def test_audit_binary_classifier_warns_when_a_parameter_has_no_effect():
+    # The K=2 branch of `TBoostClassifier.fit` returned before `_warn_voided_params`, so a binary
+    # fit never warned, while the regressor and K>=3 did. A fixed graduation strength this large
+    # is declined by the training-deviance check, which warns on every task.
+    import warnings
+
+    rng = np.random.default_rng(0)
+    n = 2000
+    x = pd.DataFrame({"a": rng.normal(size=n), "b": rng.normal(size=n)})
+    y = (rng.uniform(size=n) < 1 / (1 + np.exp(-(x.a - 0.5 * x.b)))).astype(int)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        TBoostClassifier(n_trees=40, seed=0, n_jobs=2, graduation_alpha=1e9).fit(x, y)
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert any("graduation_alpha" in m and "NO EFFECT" in m for m in messages)
+
+
+def test_audit_a_callback_keeps_the_group_holdout_of_an_unpruned_fit():
+    # With `prune=False` and groups, a callback made the deploy extras non-empty, which skipped the
+    # group-aware early-stopping carve and fell back to a row-level carve that leaks a group's rows
+    # into validation. Only an eval_set replaces the carve, so an observer that never stops the fit
+    # must leave the model byte-identical.
+    from _artifact import model_bytes
+
+    rng = np.random.default_rng(0)
+    n_groups, per_group = 200, 5
+    groups = np.repeat(np.arange(n_groups), per_group)
+    effect = rng.normal(scale=0.5, size=n_groups)
+    x = pd.DataFrame({"a": rng.normal(size=n_groups * per_group),
+                      "b": rng.normal(size=n_groups * per_group)})
+    y = rng.poisson(np.exp(0.3 * x.a + effect[groups])).astype(float)
+    options = dict(objective="poisson", n_trees=60, seed=0, n_jobs=2, prune=False)
+    plain = TBoostRegressor(**options).fit(x, y, groups=groups)
+    observed = TBoostRegressor(**options).fit(x, y, groups=groups, callbacks=lambda info: None)
+    assert model_bytes(observed) == model_bytes(plain)

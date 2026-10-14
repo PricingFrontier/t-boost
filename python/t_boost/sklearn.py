@@ -3374,9 +3374,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         value means the caller explicitly asked for something that cannot be honored, so it
         RAISES: there is no ordinary multiclass fit this would break.
 
-        `n_bags`/`bag_subsample` (outer bags souped per class) and
-        `leaf_refine_steps`/`leaf_refine_backtracks` (per-round Jacobi re-linearization with a
-        joint-deviance backtrack) are HONORED for K>=3 as of 2026-07-14,
+        `n_bags`/`bag_subsample` (outer bags souped per class) are HONORED for K>=3 as of
+        2026-07-14 (`leaf_refine_steps` is not: see the note at the end of this method),
         `subsample`/`mvs_min_rows` (§06.5 MVS row sampling) as of 2026-08-23, and
         `cell_refit_base`/`cell_refit_gamma` (the §G1 OOB cell refit, as K decoupled
         diagonal-Hessian cell solves accepted by ONE joint backtrack on the multinomial loss —
@@ -4418,7 +4417,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         else:
             es_holdout: list[bool] | None = None
-            if groups_arr is not None and self.validation_fraction is not None and not deploy:
+            # An eval_set replaces the carve; a callback alone does not (it only adds an observer).
+            if (groups_arr is not None and self.validation_fraction is not None
+                    and "eval_x" not in deploy):
                 seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
                 es_holdout = _carve_group_holdout(
                     groups_arr, float(self.validation_fraction), [seed, 1]
@@ -4657,8 +4658,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 **self._measure_kwargs(),
             )
         except ValueError as exc:
-            # No per-bag replicates to measure noise against (e.g. a §G1 cell-corrected soup):
-            # ship the unbanded tables and say so.
+            # No per-bag replicates to measure noise against (e.g. a model without its bag
+            # partition; a §G1 cell-corrected soup is fine, see `bag_score_variance`): ship the
+            # unbanded tables and say so.
             if isinstance(getattr(self, "pruning_report_", None), dict):
                 self.pruning_report_["banding"] = {"skipped": f"no bag noise estimate: {exc}"}
             return table_model
@@ -9463,6 +9465,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 )
             finally:
                 self.__dict__.pop("_fit_extras_", None)
+            self._warn_voided_params()
             return self
         # K >= 3: native-softmax (multinomial) multiclass path.
         if eval_set is not None or callbacks is not None or offset is not None:

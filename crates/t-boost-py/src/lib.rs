@@ -5605,9 +5605,10 @@ impl PyModel {
     }
 
     /// Whether `bag_oob_group_raw` can run on this model: it needs the outer-bag soup's
-    /// runtime bag partition AND membership (so a single fit or a wire round-trip is out) and
-    /// no §G1 cell correction. Ask this instead of catching the error, so a genuine failure in
-    /// the evidence pass is not misread as "no out-of-bag rows".
+    /// runtime bag partition AND membership (so a single fit or a wire round-trip is out). A §G1
+    /// cell correction is fine: the evidence pass shares it across the bags. Ask this instead of
+    /// catching the error, so a genuine failure in the evidence pass is not misread as "no
+    /// out-of-bag rows".
     fn bag_oob_available(&self) -> bool {
         bag_oob_evidence_available(&self.model)
     }
