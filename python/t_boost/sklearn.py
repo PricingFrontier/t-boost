@@ -8329,8 +8329,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         self._ae_requires_weight_ = weight32 is not None
         self._ae_requires_exposure_ = self._ae_requires_offset_ = False
         monotone = self._resolve_monotone(n_features, feature_names)
-        if self.graduation_high_order_alpha > 0 and monotone and any(monotone):
-            raise ValueError("higher-order smoothing does not support monotone constraints")
         if monotone is not None and cat_idx:
             cat_set = set(cat_idx)
             numeric_idx = [i for i in range(n_features) if i not in cat_set]

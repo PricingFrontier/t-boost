@@ -1586,6 +1586,31 @@ mod tests {
     }
 
     #[test]
+    fn a_clipped_table_keeps_its_error_band() {
+        // The display-only `se_band` describes the bag spread of a table; re-purification drops
+        // it, and the repair puts it back on every table whose grid kept its shape.
+        let mut fx = fit(3, pair_target, &[(0, true)], 2, TableBudget::default());
+        perturb(&mut fx.bank, &[0, 1], 0.4);
+        let i = find(&fx.bank, &[0, 1]);
+        let shape = fx.bank.tables[i].values.shape();
+        let n: usize = shape.iter().product();
+        let band = crate::explain::SeBand {
+            per_cell: Tensor::from_vec(shape, (0..n).map(|k| 0.01 * k as f64).collect()).unwrap(),
+        };
+        fx.bank.tables[i].se_band = Some(band.clone());
+        let rows = RepairRows {
+            cells: &fx.cells,
+            h: &fx.h,
+        };
+        let (out, rep) = repair_bank(&fx.bank, &[sign(0, true)], &rows).unwrap();
+        assert!(
+            rep.features[0].clipped.contains(&vec![0, 1]),
+            "the pair must be clipped"
+        );
+        assert_eq!(out.tables[find(&out, &[0, 1])].se_band, Some(band));
+    }
+
+    #[test]
     fn two_constrained_features_sharing_a_table_both_end_monotone() {
         let f = |x: &[f64]| 2.0 * x[0].tanh() - 1.5 * x[1].tanh() + 0.7 * x[0] * x[1] + 0.2 * x[2];
         let mut fx = fit(3, f, &[(0, true), (1, false)], 2, TableBudget::default());
