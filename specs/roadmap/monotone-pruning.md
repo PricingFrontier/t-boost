@@ -204,6 +204,38 @@ the largest change to any main effect (the visible distortion in a rating table)
 touched, and runtime. The simplest candidate within noise of the best wins. Clipping is built
 only if it earns its place.
 
+**Benchmark (2026-10-14).** A Python prototype applied each candidate to the deployed bank's
+JSON. It skipped re-purification, which does not change predictions, and re-anchored the
+intercept on the training rows. Each dataset was fitted once (80/20 split), with the bypass
+removed by a subclass. Every candidate removed every reversal; they differ in cost.
+
+freMTPL2 (Poisson with exposure; BonusMalus and Density increasing):
+
+| Pipeline | Before repair (not monotone) | (i) main-only | (ii) scaling | (iii) clipping |
+|---|---|---|---|---|
+| All defaults | 0.30699 | +0.33%, BonusMalus main moves 28% | +0.32%, α = 0 (interactions zeroed) | −0.004%, mains move ≤ 4% |
+| Graduation off | 0.30692 | **+24.8%**, BonusMalus main moves 972% | +0.32%, α = 0 | +0.02%, mains move ≤ 9% |
+| Rebalance off | 0.30748 | −0.001% | +0.03% | −0.000% |
+
+- **beMTPL97** (Poisson; `bm` and `power` increasing): the ranked path keeps no interaction
+  with either feature. All three candidates coincide, and a main effect moves by at most 0.016%.
+- **Swedish motorcycle** (Tweedie pure premium; `mcklass` increasing, `fordald` and `bonuskl`
+  decreasing): `bonuskl` is unused and `mcklass`'s one interaction is already monotone, so every
+  candidate is a no-op.
+
+Conclusions:
+- **Clipping (iii) is built.** Correcting only the main effect can be catastrophic when banding
+  has put large swings into interactions. Scaling zeroes a constrained feature's interactions
+  wherever its main effect is flat.
+- **Rebalance stays on.** With the repair, all defaults reach 0.30698, against 0.30748 with
+  rebalance off and 0.30726 for today's full bank, with 51 tables instead of 113.
+- **Not yet exercised:**
+  - a table holding two constrained features (no dataset produced one);
+  - re-purification (skipped by the prototype);
+  - factored three-way tables (banding was on throughout).
+
+  The native implementation is tested on each of these first.
+
 ### Rebalance
 
 Rebalance runs on everything, and the repair projects its output.
@@ -339,8 +371,8 @@ Each bug fix gets its own regression test.
 
 ## Implementation order
 
-1. Bugs 2–4 (small and independent), each with its test.
-2. Remove the guards (item 1).
+1. Bugs 2–4 (small and independent), each with its test. Done: 52f4232.
+2. Remove the guards (item 1). Done: 7e1f070.
 3. `monotone.rs` primitives:
    - the certificate;
    - shifted PAVA with positive weights;
