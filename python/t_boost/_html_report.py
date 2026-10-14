@@ -131,8 +131,9 @@ svg .ib0,svg .ib1,svg .ib2,svg .ib3{stroke-width:2;fill:none;stroke-linejoin:rou
 svg .ib0{stroke:var(--i0)}svg .ib1{stroke:var(--i1)}svg .ib2{stroke:var(--i2)}svg .ib3{stroke:var(--i3)}
 svg .fade{opacity:.3}
 svg .shapmean{stroke:var(--ink2);stroke-width:1.5;stroke-dasharray:5 3;fill:none}
-svg .tick{stroke:var(--data);stroke-width:2}
-svg .rng{stroke:var(--data);stroke-width:2;stroke-linecap:round;opacity:.3}
+svg .flagdot{fill:var(--crit);stroke:var(--surface);stroke-width:1.5}
+svg .neardot{fill:var(--warn);stroke:var(--surface);stroke-width:1.5}
+svg .bandbox{fill:var(--band)}
 svg .hit{fill:transparent}
 svg .hit:hover{fill:var(--wash)}
 table{border-collapse:collapse;width:100%%;font-size:13px;line-height:18px}
@@ -549,12 +550,14 @@ def _label_w(scale: _Scale, fmt: _Fmt) -> float:
 
 
 def _legend(svg: _Svg, x: float, y: float, items: Sequence[tuple[str, str, str]]) -> float:
-    """``(kind, class, label)`` items left to right from ``x``; ``kind`` is line or box.
+    """``(kind, class, label)`` items left to right from ``x``; ``kind`` is line, dot or box.
     Returns where the legend ends."""
     for kind, cls, label in items:
         if kind == "line":
             svg.add(f'<line class="{cls}" x1="{x:.1f}" x2="{x + 16:.1f}" y1="{y - 4:.1f}" '
                     f'y2="{y - 4:.1f}"/>')
+        elif kind == "dot":
+            svg.add(f'<circle class="{cls}" cx="{x + 8:.1f}" cy="{y - 4:.1f}" r="4"/>')
         else:
             svg.add(f'<rect class="{cls}" x="{x + 3:.1f}" y="{y - 9:.1f}" width="10" height="10" '
                     'rx="2"/>')
@@ -1196,60 +1199,98 @@ def spread_chart(r: dict[str, Any], w: float) -> str:
 
 
 def balance_chart(r: dict[str, Any], w: float, *, k: int | None = None) -> str:
-    """Each feature's A/E by band (one tick per band, the spread as a line) against the
-    tolerance: which factor, if any, is out of balance."""
+    """Every feature's A/E by band as a small chart on one shared scale: the Factors tab's check
+    for all features at a glance. Each dataset's A/E steps across the feature's bands (the
+    selected dataset in colour with its ±2σ band, the others in grey) between the dashed
+    tolerance; on the selected dataset the bands the review flags are red and its near misses
+    amber, and the band furthest from balance is marked and named above the chart."""
     scored = _scored(r)
     feats = [str(f["feature"]) for f in r.get("features") or []]
     if not scored or not feats:
         return _none()
-    tol = r["thresholds"].get("factor_ae") or 0.1
+    tol = r["thresholds"].get("factor_ae")
     cls = None if k is None else _classes(r)[k]
-    idx = list(range(len(scored)))
-    bands = {(i, f): [b for b in ((_ae_entry(scored[i], f, cls) or {}).get("bands") or [])
-                      if b.get("ae") is not None] for i in idx for f in feats}
+    bands = {(i, f): [b for b in ((_ae_entry(d, f, cls) or {}).get("bands") or [])
+                      if b.get("ae") is not None] for i, d in enumerate(scored) for f in feats}
     vals = _fv(b["ae"] for v in bands.values() for b in v)
-    row_h = 24.0
-    name_w = min(max(_text_w(f) for f in feats) + 16, w * 0.22)
-    worst_w = min(230.0, w * 0.32)
-    top = 26.0
-    bottom = top + row_h * len(feats)
-    h = bottom + 22
-    left, right = name_w, w - worst_w
-    lo = max(min(vals + [1 - tol * 1.5]), 0.5)
-    hi = min(max(vals + [1 + tol * 1.5]), 1.6)
-    xs = _Lin(lo, hi, left, right, pad=0.03, n=6)
+    two_sd = min(2 * max(_fv(b.get("sd") for v in bands.values() for b in v), default=0.0), 0.3)
+    span = (tol or 0.1) * 1.3
+    lo = max(min(vals + [1 - span, 1 - two_sd]), 0.4)
+    hi = min(max(vals + [1 + span, 1 + two_sd]), 1.8)
+
+    cols = max(1, min(len(feats), int((w + 16) // 186)))
+    gap_x, gap_y, legend_h, name_h, plot_h = 16.0, 14.0, 28.0, 32.0, 56.0
+    pw = (w - gap_x * (cols - 1)) / cols
+    step = name_h + plot_h + gap_y
+    rows = -(-len(feats) // cols)
+    h = legend_h + rows * step - gap_y + 4
     svg = _Svg(w, h, "A/E by band for every feature")
-    x_lo, x_hi = xs(max(1 - tol, xs.lo)), xs(min(1 + tol, xs.hi))
-    svg.add(f'<rect class="tol" x="{x_lo:.1f}" y="{top:.1f}" width="{x_hi - x_lo:.1f}" '
-            f'height="{bottom - top:.1f}"/>')
-    for t in xs.ticks:
-        svg.vline(xs(t), top, bottom, "gl")
-        svg.text(xs(t), bottom + 16, _fixed(t, 2), anchor="middle")
-    svg.vline(xs(1.0), top, bottom, "ref")
-    svg.text(left, 12, f"A/E by band; shaded ±{_pct(tol, 0)}", cls="lbl")
-    svg.text(right + 16, 12, "furthest from balance (z)", cls="lbl")
-    chars = int((name_w - 14) / (_FONT * 0.56))
-    for j, f in enumerate(feats):
-        y = top + (j + 0.5) * row_h
-        svg.text(left - 10, y + 4, _short(f, chars), anchor="end", cls="lbl")
-        for i in idx:
-            bs = bands[(i, f)]
+    items = [("line", "data", "A/E by band"), ("box", "bandbox", "±2σ")]
+    if tol:
+        items.append(("line", "guide", f"±{_pct(tol, 0)}"))
+    items += [("dot", "flagdot", "flagged"), ("dot", "neardot", "near miss")]
+    if len(scored) > 1:
+        items.append(("line", "dsl", "other datasets"))
+    while sum(40 + _text_w(label) for _, _, label in items) - 18 > w:
+        items.pop()  # a narrow card keeps the leading items
+    _legend(svg, 0, 12, items)
+    chars = int(pw / (_FONT * 0.6))
+    for n, f in enumerate(feats):
+        px = (n % cols) * (pw + gap_x)
+        py = legend_h + (n // cols) * step
+        top, bottom = py + name_h, py + name_h + plot_h
+        ys = _Lin(lo, hi, bottom, top, pad=0.04)
+
+        def y_of(v: float) -> float:
+            return ys(min(max(v, ys.lo), ys.hi))
+
+        svg.text(px, py + 12, _short(f, chars), cls="strong")
+        order = [str(b["label"]) for b in bands[(0, f)]] or \
+            [str(b["label"]) for i in range(len(scored)) for b in bands[(i, f)]]
+        slot = pw / max(len(order), 1)
+        x_of = {lab: px + (j + 0.5) * slot for j, lab in enumerate(order)}
+        svg.hline(px, px + pw, ys(1.0), "ref")
+        if tol:
+            for g in (1 - tol, 1 + tol):
+                if ys.lo <= g <= ys.hi:
+                    svg.hline(px, px + pw, ys(g), "guide")
+        for i in range(len(scored)):
+            bs = [b for b in bands[(i, f)] if str(b["label"]) in x_of]
+            if any((b.get("sd") or 0) > 0 for b in bs):
+                up = [(x_of[str(b["label"])] + e * slot / 2, y_of(1 + 2 * (b.get("sd") or 0.0)))
+                      for b in bs for e in (-1, 1)]
+                dn = [(x_of[str(b["label"])] + e * slot / 2, y_of(1 - 2 * (b.get("sd") or 0.0)))
+                      for b in bs for e in (-1, 1)]
+                svg.add(f'<path class="dsw dsw-{i}" d="{_d(up + dn[::-1])}Z"/>')
+        for i in range(len(scored)):
+            svg.path([(x_of[str(b["label"])] + e * slot / 2, y_of(b["ae"]))
+                      for b in bands[(i, f)] if str(b["label"]) in x_of for e in (-1, 1)],
+                     f"dsl dsl-{i}")
+        for i in range(len(scored)):
+            bs = [b for b in bands[(i, f)] if str(b["label"]) in x_of]
             if not bs:
                 continue
             g = _Svg(w, h, "")
-            clipped = [min(max(b["ae"], xs.lo), xs.hi) for b in bs]
-            g.add(f'<line class="rng" x1="{xs(min(clipped)):.1f}" x2="{xs(max(clipped)):.1f}" '
-                  f'y1="{y:.1f}" y2="{y:.1f}"/>')
-            for b, v in zip(bs, clipped):
-                tip = f"{f} {b['label']}: A/E {_fixed(b['ae'])}, z {_signed(b.get('z'))}"
-                g.add(f'<line class="tick" x1="{xs(v):.1f}" x2="{xs(v):.1f}" y1="{y - 7:.1f}" '
-                      f'y2="{y + 7:.1f}"><title>{_e(tip)}</title></line>')
-            wb = max(bs, key=lambda b: abs(b.get("z") or 0.0))
-            tail = f": {_fixed(wb['ae'], 2)}, z {_signed(wb.get('z'))}"
-            room = int((worst_w - 18) / (_FONT * 0.56)) - len(tail)
-            text = _short(str(wb["label"]), max(room, 4)) + tail
-            g.text(right + 16, y + 4, text, cls="lbl")
+            worst = max(bs, key=lambda b: abs(b.get("z") or 0.0))
+            for b in bs:
+                mark = {"warning": "flagdot", "near_miss": "neardot"}.get(str(b.get("flag")))
+                if mark or b is worst:
+                    g.add(f'<circle class="{mark or "ddot"}" cx="{x_of[str(b["label"])]:.1f}" '
+                          f'cy="{y_of(b["ae"]):.1f}" r="{4 if mark else 3}"/>')
+            tail = f": {_fixed(worst['ae'], 2)}"
+            room = max(chars - len(tail) - 6, 4)
+            g.text(px, py + 27, "worst " + _short(str(worst["label"]), room) + tail, cls="lbl")
             svg.group(f"ds ds-{i}", g.parts)
+        for lab in order:
+            lines = [f"{f}, band {lab}"]
+            for i, d in enumerate(scored):
+                b = next((b for b in bands[(i, f)] if str(b["label"]) == lab), None)
+                if b is not None:
+                    verdict = {"warning": " (flagged)", "near_miss": " (near miss)"}.get(
+                        str(b.get("flag")), "")
+                    lines.append(f"{d['label']}: A/E {_fixed(b['ae'])}, z {_signed(b.get('z'))}"
+                                 + verdict)
+            svg.hit(x_of[lab] - slot / 2, top, slot, plot_h, "\n".join(lines))
     return svg.render()
 
 
@@ -1698,6 +1739,16 @@ def _gain_takeaway(r: dict[str, Any]) -> str:
     return text
 
 
+def _balance_rule(r: dict[str, Any]) -> str:
+    """The factor check's rule, with the thresholds in force."""
+    th = r["thresholds"]
+    tol, fz = th.get("factor_ae"), th.get("factor_z")
+    if tol is None:
+        return "A/E across each feature's bands; the factor check is off"
+    rule = f"outside ±{_pct(tol, 0)}" + (f" and ≥ {fz:g}σ from balance" if fz else "")
+    return f"Each feature's A/E by band; flagged {rule}"
+
+
 def _balance_takeaway(r: dict[str, Any], i: int, k: int | None = None) -> str:
     d = _scored(r)[i]
     cls = None if k is None else _classes(r)[k]
@@ -2037,7 +2088,7 @@ def _performance(r: dict[str, Any], classes: _Radio | None) -> str:
         lor = _card("Lorenz curve", lorenz_chart(r, k, _W_HALF, 300),
                     what="Share of actual against share of exposure, highest predicted rate first")
         bal = _card(_balance_takeaway(r, last, k), balance_chart(r, _W_HALF, k=k),
-                    what="A/E of each feature's bands, selected dataset, against the tolerance")
+                    what=_balance_rule(r))
         return _row(lor, bal)
 
     parts = [metrics, _per_class(r, classes, cal), _per_class(r, classes, pair)]

@@ -214,7 +214,8 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
   `actual_vs_expected` (each cell with a `z` score; on the first dataset, `shap`: each cell's
   exposure-weighted mean and 10th and 90th percentile of the feature's exact Shapley value, on
   the link scale, read from the report's `tables`), `bands` (the factor check's bands per
-  feature), missing values and unseen values. Each cell's `axis` is its feature's merged grid; a
+  feature; a band the review flags carries `"flag": "warning"`, a near miss
+  `"flag": "near_miss"`), missing values and unseen values. Each cell's `axis` is its feature's merged grid; a
   numeric axis carries `integer`, true when the feature took only whole values in the first
   dataset, and its cells are then labelled as integers (`51`, `22–25`). The numeric axes of
   `tables` carry the same flag.

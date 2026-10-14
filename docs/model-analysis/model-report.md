@@ -94,8 +94,11 @@ Then calibration by decile: ten bands of equal exposure by ascending predicted r
 tied predictions stays in one band), the actual and predicted rate of the selected dataset above
 and the A/E of every dataset below, with ±2 standard deviations shaded for the selected one. A
 standard deviation is the objective's variance function times the Pearson dispersion, summed over
-the band's rows. Beside the Lorenz curves, every feature's A/E by band on one chart against the
-`factor_ae` tolerance, and below, the spread of the predictions. A multiclassification model has
+the band's rows. Beside the Lorenz curves, every feature's A/E by band as a small chart on one
+shared scale: the selected dataset in colour with ±2 standard deviations shaded, the
+`factor_ae` tolerance dashed, the bands the review flags in red and its near misses in amber,
+and each feature's band furthest from balance named above its chart. Below, the spread of the
+predictions. A multiclassification model has
 a class switch, one-vs-rest views per class and the class matrices.
 
 ### Factors {#factors}

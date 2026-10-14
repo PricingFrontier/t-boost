@@ -797,6 +797,9 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                                    f"no predicted-rate decile off by more than {dtol:g}"
                                    + (f" and {fz:g} standard deviations" if fz is not None else ""),
                                    threshold=dtol, dataset=label))
+        for factor in ds["actual_vs_expected"]:  # a fresh verdict on every band
+            for b in factor.get("bands") or []:
+                b.pop("flag", None)
         if ftol is not None:
             flagged = len(flags)
             covered, total_mass = 0.0, 0.0
@@ -812,6 +815,11 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                 near = [b for b in eligible if b not in bad and nz is not None and out_of_sample
                         and b["ae"] is not None and abs(b["ae"] - 1.0) > ftol
                         and b["z"] is not None and abs(b["z"]) >= nz]
+                # The verdict on the band itself, for the page's charts.
+                for b in bad:
+                    b["flag"] = "warning"
+                for b in near:
+                    b["flag"] = "near_miss"
                 for b in near:
                     flags.append(_flag(
                         "factor_ae", "info",

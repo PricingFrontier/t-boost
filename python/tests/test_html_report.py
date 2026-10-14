@@ -436,7 +436,7 @@ def test_factor_check_reads_equal_mass_bands_shared_by_every_dataset(poisson):
     passing = [f for f in report["review"] if f["check"] == "factor_ae" and f["status"] == "pass"]
     assert passing and all("of the mass" in f["message"] for f in passing)
     html = report_html(report)
-    assert "A/E by band (the review check)" in html and "furthest from balance" in html
+    assert "A/E by band (the review check)" in html and "A/E by band; flagged outside" in html
 
 
 def test_page_is_css_only_tabs_with_one_dataset_switch(poisson):
@@ -733,3 +733,27 @@ def test_a_declined_graduation_is_reported():
     flags = m.pricing_report(x, y)["review"]
     assert any(f["check"] == "graduation" and f["status"] == "info"
                and f["message"].startswith("graduation was not applied") for f in flags)
+
+
+def test_balance_chart_marks_the_bands_the_review_flags(poisson):
+    # The review records its verdict on each band; the Performance chart draws one small A/E
+    # chart per feature and marks those bands, so the chart and the flags always agree.
+    m, tr, ev, _ = poisson
+    strict = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp",
+                              thresholds={"factor_ae": 1e-6, "factor_z": None})
+    test = strict["datasets"][1]
+    flagged = [b for e in test["actual_vs_expected"] for b in e["bands"]
+               if b.get("flag") == "warning"]
+    warned = {f["feature"] for f in strict["review"]
+              if f["check"] == "factor_ae" and f["status"] == "warning" and f["dataset"] == "test"}
+    assert flagged and warned == {e["feature"] for e in test["actual_vs_expected"]
+                                  if any(b.get("flag") == "warning" for b in e["bands"])}
+    html = report_html(strict)
+    assert html.count('class="flagdot"') >= len(flagged)
+    assert "flagged outside ±0%" in html and f"{len(warned)} factors out of balance on test" in html
+    # A fresh review drops the verdicts of the last one.
+    relaxed = _report.review(m, strict, _report.resolve_thresholds({"factor_ae": None}))
+    assert not any(b.get("flag") for d in strict["datasets"]
+                   for e in d["actual_vs_expected"] for b in e["bands"])
+    assert not any(f["check"] == "factor_ae" and f["status"] == "warning" for f in relaxed)
+
