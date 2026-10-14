@@ -1788,16 +1788,20 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
                   for b in range(len(bands)) if not thin_pair(d, a, b))
     span = (tol or 0.1) * 1.3
     # One strip per partner band, on the x-axis of the chart above and one shared scale.
-    strip_h, strip_gap = 58.0, 22.0
+    # First every partner band's line on one panel (the context), then one strip per band with
+    # its ±2σ band (the evidence).
+    strip_h, strip_gap, ov_h = 58.0, 22.0, 130.0
     ae_h = len(bands) * (strip_h + strip_gap) - strip_gap if ae_ds else 0.0
     t0 = 12 + 18 * len(rows_of_legend) + 4
-    a0 = t0 + top_h + 44
+    o0 = t0 + top_h + 44
+    a0 = o0 + ov_h + 58
     m0 = (a0 + ae_h + 30) if ae_ds else (t0 + top_h + 26)
     h = m0 + mass_h + foot
     ys: _Scale = (_Log(min(vals), max(vals), t0 + top_h, t0, max_ticks=5) if mult
                   else _Lin(min(vals), max(vals), t0 + top_h, t0, n=4))
     ae_lo = max(min(ae_vals + [1 - span]), 0.5)
     ae_hi = min(max(ae_vals + [1 + span]), 1.6)
+    ov_s = _Lin(ae_lo, ae_hi, o0 + ov_h, o0, pad=0.04, n=4)
 
     def strip(b: int) -> _Lin:
         y0 = a0 + b * (strip_h + strip_gap)
@@ -1806,7 +1810,7 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
     def fmt(v: float) -> str:
         return _mult_tick(v) if mult else _num(v, 2)
 
-    left = 6 + max(_label_w(ys, fmt), _text_w("0.90") if ae_ds else 0.0) + 6
+    left = 6 + max(_label_w(ys, fmt), _label_w(ov_s, _fixed2) if ae_ds else 0.0) + 6
     right = w - 10
     n = len(cells)
     slot = (right - left) / n
@@ -1821,8 +1825,33 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
         pts = [(xs[c], ys(shown(v))) for c, v, _ in line]
         _segments(svg, pts, [thin for _, _, thin in line], cls=f"ib{i}", faded_cls=f"ib{i} fade")
     if ae_ds:
+        _yaxis(svg, ov_s, left, right, _fixed2)
+        svg.hline(left, right, ov_s(1.0), "ref")
         if tol:
+            for v in (1 - tol, 1 + tol):
+                if ov_s.lo <= v <= ov_s.hi:
+                    svg.hline(left, right, ov_s(v), "guide")
+            svg.text(right, o0 - 8, f"dashed: ±{_pct(tol, 0)}", anchor="end")
             svg.text(right, a0 - 24, f"dashed: ±{_pct(tol, 0)}; shaded: ±2σ", anchor="end")
+        for i, d in ae_ds:
+            g = _Svg(w, h, "")
+            g.text(left, o0 - 8, f"A/E by {xf} band, a line per {by} band ({d['label']})",
+                   cls="lbl")
+            for b in range(len(bands)):
+                seg: list[tuple[float, float]] = []
+                seg_thin: list[bool] = []
+                for c in cells + [-1]:  # -1 ends the last run
+                    a = x_band_of.get(c)
+                    v = d["ae"][a][b] if a is not None and a < len(d["ae"]) else None
+                    if v is None or a is None:
+                        if seg:
+                            _segments(g, seg, seg_thin, cls=f"ib{b}", faded_cls=f"ib{b} fade")
+                        seg, seg_thin = [], []
+                        continue
+                    y = ov_s(min(max(float(v), ov_s.lo), ov_s.hi))
+                    seg += [(xs[c] - slot / 2, y), (xs[c] + slot / 2, y)]
+                    seg_thin += [thin_pair(d, a, b)] * 2
+            svg.group(f"ds ds-{i}", g.parts)
         for b in range(len(bands)):
             sc = strip(b)
             _legend(svg, left, sc.b - 6, [("line", f"ib{b}", f"{by} {band_label[tuple(bands[b])]}")])
@@ -1833,8 +1862,7 @@ def interaction_chart(r: dict[str, Any], inter: dict[str, Any], cls: str, w: flo
                     svg.text(left - 6, sc(v) + 4, _fixed2(v), anchor="end")
         for i, d in ae_ds:
             g = _Svg(w, h, "")
-            g.text(left, a0 - 24, f"A/E by {xf} band within each {by} band ({d['label']})",
-                   cls="lbl")
+            g.text(left, a0 - 24, f"each {by} band on its own ({d['label']})", cls="lbl")
             for b in range(len(bands)):
                 sc = strip(b)
 
