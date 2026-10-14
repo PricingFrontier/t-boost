@@ -6794,6 +6794,71 @@ impl PyMultiClassModel {
         })
     }
 
+    /// Band every class bank of `tables`, this model's tables-only form (see
+    /// `band_multiclass_table_model`), against the noise of every bag's full bank: an unpruned
+    /// multiclass fit is banded as a pruned one is. Returns the banded model and the per-class
+    /// banding reports as JSON.
+    #[pyo3(signature = (tables, x, y, weight, tolerance, deviance_cap, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: the design plus the banding and measure knobs.
+    fn band_tables(
+        &self,
+        py: Python<'_>,
+        tables: PyRef<'_, PyMultiClassTableModel>,
+        x: PyReadonlyArray2<'_, f32>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        tolerance: f64,
+        deviance_cap: f64,
+        cat_x: Option<Vec<Vec<String>>>,
+        ref_measure: Option<String>,
+        laplace: f32,
+        measure_floor: f32,
+    ) -> PyResult<(PyMultiClassTableModel, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
+        let w_vec = weight
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
+            .to_vec();
+        let model = Arc::clone(&self.model);
+        let tm = Arc::clone(&tables.model);
+        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
+        let (banded, reports) = py
+            .detach(move || {
+                let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                    what: "multiclass model has no classes".into(),
+                })?;
+                let serve =
+                    ServeBinnedMatrix(serve_binned_for_model(first, &columns, cat_x.as_deref())?);
+                band_multiclass_table_model(
+                    &tm,
+                    &model,
+                    &serve,
+                    &columns,
+                    cat_x.as_deref(),
+                    &w_vec,
+                    w_measure,
+                    None,
+                    tolerance,
+                    &labels,
+                    deviance_cap,
+                )
+            })
+            .map_err(py_err)?;
+        let json = serde_json::to_string(&reports).map_err(|err| {
+            py_err(PbError::Serialization(format!(
+                "could not serialize banding report: {err}"
+            )))
+        })?;
+        Ok((
+            PyMultiClassTableModel {
+                model: Arc::new(banded),
+                serve: Default::default(),
+            },
+            json,
+        ))
+    }
+
     /// PROBE (2026-09-07): retain an arbitrary keep-set on this model (the K>=3 deploy step).
     #[pyo3(signature = (x, y, weight, keep, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
     #[allow(clippy::too_many_arguments)]
@@ -6810,21 +6875,7 @@ impl PyMultiClassModel {
         measure_floor: f32,
     ) -> PyResult<PyMultiClassTableModel> {
         let columns = raw_columns_from_array(x)?;
-        let n_classes = self.model.n_classes();
-        let labels: Vec<u32> = y
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
-            .iter()
-            .map(|&l| {
-                if !l.is_finite() || l < 0.0 || l.fract() != 0.0 || l as usize >= n_classes {
-                    Err(PyValueError::new_err(format!(
-                        "label {l} not in 0..{n_classes}"
-                    )))
-                } else {
-                    Ok(l as u32)
-                }
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
         let w_vec = weight
             .as_slice()
             .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
@@ -9253,7 +9304,7 @@ fn fit_multiclass_pruned_owned(
                         cat_x.as_deref(),
                         &full_weight,
                         w_measure_band.clone(),
-                        &shipped_keep,
+                        Some(&shipped_keep),
                         tol,
                         &labels,
                         band_deviance_cap,
@@ -9701,8 +9752,23 @@ fn loss_choice_from_tag(tag: &t_boost_core::loss::ObjectiveTag) -> Result<LossCh
     })
 }
 
-/// Bin raw serve columns through a [`TableModel`]'s frozen grids/encoders (mirrors
-/// [`serve_binned_for_model`] but for the tables-only served model — same fields, no trees).
+/// Multiclass labels as class indices: each `y` must be an integer in `0..n_classes`.
+fn class_labels_from_array(y: &PyReadonlyArray1<'_, f32>, n_classes: usize) -> PyResult<Vec<u32>> {
+    y.as_slice()
+        .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
+        .iter()
+        .map(|&l| {
+            if !l.is_finite() || l < 0.0 || l.fract() != 0.0 || l as usize >= n_classes {
+                Err(PyValueError::new_err(format!(
+                    "label {l} not in 0..{n_classes}"
+                )))
+            } else {
+                Ok(l as u32)
+            }
+        })
+        .collect()
+}
+
 /// Band every class bank of a multiclass tables model (see `t_boost_core::banding`). Each class is
 /// banded on its own softmax curvature `w · p_k (1 - p_k)`, its own logits as the distil target and
 /// its own bag noise (the deploy soup's class-`k` bags restricted to the keep-set).
@@ -9715,7 +9781,7 @@ fn band_multiclass_table_model(
     cat_x: Option<&[Vec<String>]>,
     w: &[f32],
     w_measure: RefMeasure,
-    keep: &[FeatureSet],
+    keep: Option<&[FeatureSet]>,
     tolerance: f64,
     labels: &[u32],
     deviance_cap: f64,
@@ -9815,7 +9881,7 @@ fn band_multiclass_table_model(
                 serve,
                 w_measure.clone(),
                 bag_mass.as_deref(),
-                Some(keep),
+                keep,
                 &all_rows,
             )
         })?;
@@ -10014,6 +10080,8 @@ fn table_merged_axes_json(tm: &TableModel) -> Result<String, PbError> {
         .map_err(|err| PbError::Serialization(format!("could not serialize merged axes: {err}")))
 }
 
+/// Bin raw serve columns through a [`TableModel`]'s frozen grids/encoders (mirrors
+/// [`serve_binned_for_model`] but for the tables-only served model — same fields, no trees).
 fn serve_binned_for_tables(
     tm: &TableModel,
     numeric_cols: Vec<Vec<f32>>,

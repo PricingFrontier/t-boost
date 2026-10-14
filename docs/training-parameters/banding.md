@@ -1,14 +1,14 @@
 # Banding settings
 
-After pruning, each deployed interaction table is condensed into a small product grid of bands.
+Each deployed interaction table is condensed into a small product grid of bands.
 Adjacent cells are merged where the model barely distinguishes them, cheapest merge first. Every
 table that contains a feature cuts it at the same nested places, so the bands line up across
 tables. Missing values always keep their own band.
 
 How coarse the bands get is set by the model's own noise: the change to the predictions is held
 within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between the bags. Banding
-therefore needs bagging (`n_bags` of at least 2) and a pruned model (`prune=True`). The outcome
-is recorded in `pruning_report_["banding"]`. See
+therefore needs bagging (`n_bags` of at least 2); pruned and unpruned (`prune=False`) models
+are banded alike. The outcome is recorded in `pruning_report_["banding"]`. See
 [Pruning, banding and graduation](../algorithm/readable-tables.md) for details.
 
 ## band_tolerance {#band_tolerance}

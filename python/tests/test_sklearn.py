@@ -170,12 +170,13 @@ def test_stale_pruning_and_graduation_reports_cleared_on_set_params_and_refit() 
     assert not hasattr(est, "pruning_report_")
     assert not hasattr(est, "graduation_report_")
 
-    # A direct refit with prune/graduate turned off must not leave the PREVIOUS fit's reports.
+    # A direct refit with prune/graduate turned off must not leave the PREVIOUS fit's reports:
+    # the unpruned fit records its own (no selection), and no graduation report at all.
     est2 = TBoostRegressor(**common).fit(xn, yn)
     assert hasattr(est2, "pruning_report_") and hasattr(est2, "graduation_report_")
     est2.set_params(prune=False, graduate=False)
     est2.fit(xn, yn)
-    assert not hasattr(est2, "pruning_report_")
+    assert est2.pruning_report_["selector"] == "none"
     assert not hasattr(est2, "graduation_report_")
 
 
@@ -454,26 +455,26 @@ def test_wh_graduation_never_smooths_the_populated_missing_bin() -> None:
     assert not np.allclose(out2[1:, :], v2_arr[1:, :]), "2-D: the real rows must actually smooth"
 
 
-def test_graduate_without_prune_raises_but_auto_default_stays_silent() -> None:
+def test_graduation_runs_on_unpruned_fits_too() -> None:
+    # 2026-10-14: an unpruned fit skips the selection and nothing else, so graduate=True (and
+    # the default None, which resolves to on) graduate its full table bank.
     x, y = regression_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect without prune=True"):
-        small_regressor(graduate=True, prune=False).fit(x, y)
-
-    # The auto-default (graduate=None, resolves to True for poisson/gamma) must NOT raise when
-    # prune is off -- the whole resolution block lives inside the pruned path, so it truthfully
-    # never engages (not a special-cased silence).
-    est = small_regressor(
-        objective="poisson", graduate=None, prune=False
-    ).fit(x.astype(np.float32), np.abs(y))
-    assert not hasattr(est, "graduation_report_")
-    # Explicit False must never raise either, prune or not.
-    small_regressor(graduate=False, prune=False).fit(x, y)
-    small_regressor(graduate=False, prune=True).fit(x, y)
+    for graduate in (True, None):
+        est = small_regressor(
+            objective="poisson", graduate=graduate, prune=False
+        ).fit(x.astype(np.float32), np.abs(y))
+        assert hasattr(est, "graduation_report_")
+        assert "skipped" not in est.graduation_validation_
+    # Explicit False never graduates, prune or not.
+    for prune in (False, True):
+        est = small_regressor(graduate=False, prune=prune).fit(x, y)
+        assert not hasattr(est, "graduation_report_")
+        assert est.graduation_validation_["skipped"] == "disabled"
 
     # Binary classifier (K=2) routes through the same _fit_model, so the same rule applies.
     xc, yc = classifier_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect without prune=True"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xc, yc)
+    est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xc, yc)
+    assert hasattr(est, "graduation_report_")
 
     # Multiclass (K>=3): graduate=True always raises, prune or not -- there is no graduation
     # path for the multiclass per-class banks at all.

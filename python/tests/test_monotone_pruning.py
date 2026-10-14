@@ -125,10 +125,15 @@ def test_settings_that_used_to_be_refused_now_combine(data, kwargs) -> None:
     _assert_monotone(est)
 
 
-def test_an_unpruned_fit_keeps_the_full_bank_and_is_already_monotone(data) -> None:
+def test_an_unpruned_fit_is_banded_graduated_and_repaired(data) -> None:
     X, y = data
     est = TBoostRegressor(objective="poisson", n_trees=150, seed=0, n_jobs=2, prune=False,
                           monotone_constraints=SIGNS).fit(X, y)
+    rep = est.pruning_report_
+    assert rep["selector"] == "none"
+    assert rep["banding"].get("skipped") is None
+    assert "skipped" not in est.graduation_validation_
+    assert "monotone" in rep
     _assert_monotone(est)
 
 

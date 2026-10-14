@@ -15,8 +15,7 @@ Graduation is not supported for multiclassification.
 Smooth the deployed tables with Whittaker-Henderson graduation.
 
 `None` and `True` turn graduation on, and `False` turns it off (the `graduation_report_`
-attribute is then not set). An explicit `True` requires `prune=True`, and raises an error for
-multiclassification. Whether a smoothed table is what you want to deploy is a modelling
+attribute is then not set). An explicit `True` raises an error for multiclassification. Whether a smoothed table is what you want to deploy is a modelling
 decision: graduation is not tested on held-out data. It is kept only if it raises the training
 deviance by at most 1%; otherwise every table is kept as fitted, and `graduation_validation_`
 records `"adopted": False` and why.
@@ -63,8 +62,7 @@ non-missing values are not smoothed. Effects with more than 1 024 stored boxes, 
 add more than 4 096 boxes in total or 2 000 000 cells, are skipped; the details are in
 `graduation_report_`.
 
-0 turns it off. Requires `prune=True` and graduation turned on; not supported for
-multiclassification.
+0 turns it off. Requires graduation turned on; not supported for multiclassification.
 
 **Type**
 

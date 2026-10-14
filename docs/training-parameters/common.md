@@ -471,9 +471,9 @@ Supported formats for setting the value of this parameter:
 !!! note
 
     Monotonic constraints apply to numeric features only; a constraint on a categorical feature
-    raises an error. The trees enforce the constraints. With `prune=True`, pruning, banding and
-    graduation run as for any other model, and the deployed tables are then projected back onto
-    the constraints, changing as little as possible. The `pruning_report_["monotone"]` attribute
+    raises an error. The trees enforce the constraints. Pruning, banding and graduation run as
+    for any other model, and the deployed tables are then projected back onto the constraints,
+    changing as little as possible. The `pruning_report_["monotone"]` attribute
     records what changed.
 
 **Type**

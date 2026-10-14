@@ -52,7 +52,8 @@ the value keeps an effect.
 
 [`n_bags`](training-parameters/bagging.md#n_bags) (8 by default) trades training time for
 accuracy: the training costs about `n_bags` times a single model. For the cheapest single-model
-baseline, pass `n_bags=1, validation_fraction=None, prune=False`.
+baseline, pass `n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+graduate=False`.
 
 ## Smaller rating structures {#smaller-models}
 

@@ -667,6 +667,19 @@ class _MultiClassModel:
         laplace: float = 1.0,
         measure_floor: float = 0.001,
     ) -> _MultiClassTableModel: ...
+    def band_tables(
+        self,
+        tables: _MultiClassTableModel,
+        x: np.ndarray,
+        y: np.ndarray,
+        weight: np.ndarray,
+        tolerance: float,
+        deviance_cap: float,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        measure_floor: float = 0.001,
+    ) -> tuple[_MultiClassTableModel, str]: ...
     def mc_apply_keepset(
         self,
         x: np.ndarray,

@@ -2673,8 +2673,11 @@ def _build(r: dict[str, Any]) -> str:
                                f"{pd['bank'][best]} tables")))
     elif fit["available"] and fit["value"]:
         rep = fit["value"]
-        body = (f'<p class="note">Selector {_e(rep.get("selector"))}: kept '
-                f'{len(rep.get("kept") or [])} tables.</p>'
+        n_kept = len(rep.get("kept") or [])
+        lead = (f"No selection (prune=False): all {n_kept} tables kept."
+                if rep.get("selector") == "none"
+                else f"Selector {rep.get('selector')}: kept {n_kept} tables.")
+        body = (f'<p class="note">{_e(lead)}</p>'
                 + ("<details><summary>Table scores</summary>" + _kv(rep.get("table_scores") or [])
                    + "</details>" if rep.get("table_scores") else ""))
         out.append(_card("Pruning", body))
@@ -2690,7 +2693,7 @@ def _build(r: dict[str, Any]) -> str:
 
 def _monotone(r: dict[str, Any]) -> str:
     """One row per constrained feature: how far the deployed tables were moved back onto its
-    sign after pruning (empty when the fit has no monotone constraints)."""
+    sign after the other post-fit stages (empty when the fit has no monotone constraints)."""
     fit = r["fit"]["pruning"]
     rep = (fit["value"] or {}).get("monotone") if fit["available"] else None
     if not rep:

@@ -44,8 +44,8 @@ longer affects predictions.
 
 A fit without out-of-bag objects (for example `n_bags=1`) falls back to a K-fold
 cross-validated vote, which judges main effects the same way when `prune_main_effects=True`. The
-selection is recorded in `pruning_report_`. `prune=False` deploys the full, unpruned set of
-tables instead. See [Pruning settings](../training-parameters/pruning.md).
+selection is recorded in `pruning_report_`. `prune=False` keeps every table instead, and the
+stages below still run. See [Pruning settings](../training-parameters/pruning.md).
 
 ## Banding {#banding}
 

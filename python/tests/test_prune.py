@@ -116,7 +116,7 @@ def test_se_rule_is_honored_on_the_multiclass_path() -> None:
 
 def test_prune_default_on_deploys_table_model() -> None:
     # 2026-07-15 benchmark parity: prune defaults ON (every insur-arena cell deployed the
-    # CV-pruned tables-only artifact); prune=False deploys the full, unpruned table bank.
+    # CV-pruned tables-only artifact); prune=False keeps the full table bank.
     x, y = _noisy_poisson(n=1000)
     est = TBoostRegressor(objective="poisson", n_trees=100, n_bags=1, seed=0).fit(x, y)
     assert isinstance(est._model, _TableModel)
@@ -127,7 +127,37 @@ def test_prune_default_on_deploys_table_model() -> None:
     ).fit(x, y)
     assert isinstance(off._model, _TableModel)
     assert off._model.deployed_table_count() >= est._model.deployed_table_count()
-    assert not hasattr(off, "pruning_report_")
+    # No selection ran: every table is kept, and the report says so.
+    assert off.pruning_report_["selector"] == "none"
+    assert off.pruning_report_["kept"] == off.pruning_report_["deployed"]
+    assert "table_scores" not in off.pruning_report_
+
+
+def test_an_unpruned_multiclass_fit_is_banded() -> None:
+    # Only the selection is skipped on an unpruned fit (2026-10-14): every class bank is banded,
+    # against the spread of the bags' full banks, as a pruned fit's are.
+    rng = np.random.default_rng(5)
+    n = 3000
+    x = rng.normal(size=(n, 3)).astype(np.float32)
+    logits = np.stack([np.zeros(n), x[:, 0] + 0.5 * x[:, 0] * x[:, 1], -x[:, 1]], axis=1)
+    p = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+    y = (rng.uniform(size=(n, 1)) > np.cumsum(p, axis=1)).sum(axis=1)
+    kw = dict(n_trees=60, n_bags=4, seed=0, n_jobs=2, prune=False)
+    # (explicit tolerance: this module pins `band_tolerance=None`, see the fixture at its end)
+    banded = TBoostClassifier(**kw, band_tolerance=0.75).fit(x, y)
+    lossless = TBoostClassifier(**kw, band_tolerance=None).fit(x, y)
+    rep = banded.pruning_report_
+    assert rep["selector"] == "none"
+    assert len(rep["banding"]) == 3
+    assert "banding" not in lossless.pruning_report_
+
+    def cells(est: TBoostClassifier) -> int:
+        return sum(est._multi_model.deployed_census()["cells"].values())
+
+    assert cells(banded) < cells(lossless)
+    np.testing.assert_allclose(banded.predict_proba(x).sum(axis=1), 1.0, rtol=1e-5)
+    restored = TBoostClassifier.from_bytes(banded.to_bytes())
+    np.testing.assert_array_equal(restored.predict_proba(x), banded.predict_proba(x))
 
 
 def test_scalar_prune_accepts_sklearn_all_core_n_jobs() -> None:

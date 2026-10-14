@@ -27,9 +27,10 @@ The selection is recorded in the `pruning_report_` attribute.
 
 Select the tables to deploy after the training, and deploy the smaller set.
 
-`False` deploys the full, unpruned set of tables: faster to train, but a much larger model.
-Either way the model is stored as rating tables. [Banding](banding.md) and
-[graduation](graduation.md) are only applied to a pruned model.
+`False` keeps the full set of tables: faster to train, but more tables. Only the selection is
+skipped: [banding](banding.md), [graduation](graduation.md) and the monotone repair run either
+way, and the model is always stored as rating tables. `band_tolerance=None, graduate=False`
+keeps the full set exactly as the trees fitted it.
 
 **Type**
 

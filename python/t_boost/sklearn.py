@@ -195,7 +195,8 @@ _ES_ADAPTIVE_DEFAULT = 1.5
 # (the adapter forced prune=True on all val-is-None fits), so the constructors now default to
 # the same artifact. The selection is held-out-guarded (neutral-or-better by construction) and
 # costs a handful of extra single-bag fold fits on top of the deploy fit. prune=False deploys the
-# full, unpruned table bank instead: every fit's artifact is rating tables.
+# full, unpruned table bank instead: every fit's artifact is rating tables. Only the selection is
+# skipped; banding, graduation and the monotone repair run as for a pruned fit (2026-10-14).
 _PRUNE_DEFAULT = True
 
 
@@ -2478,7 +2479,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         if mono:
             if "monotone" in rep:
                 how = ("the trees enforce the signs, and the deployed tables were projected back "
-                       "onto them after pruning; see pruning_report_['monotone']")
+                       "onto them after the other post-fit stages; see "
+                       "pruning_report_['monotone']")
             else:
                 how = "the trees enforce the signs; the full table bank is monotone as fitted"
             add("monotone_constraints", "HONOURED", how)
@@ -3753,20 +3755,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 or not isinstance(high_alpha, (int, float, np.integer, np.floating))
                 or not np.isfinite(high_alpha) or not 0.0 <= high_alpha <= 1.0):
             raise ValueError("graduation_high_order_alpha must be finite and in [0, 1]")
-        if high_alpha > 0 and (not self.prune or self.graduate is False):
-            raise ValueError("graduation_high_order_alpha requires prune=True and graduation enabled")
-        # No silent no-op: Whittaker-Henderson graduation only exists inside `_fit_and_prune`
-        # (see below) — an explicit graduate=True with prune=False is currently un-satisfiable,
-        # not a quiet pass-through. The auto-default (graduate=None, resolved to True for
-        # poisson/gamma) stays silent here: it never reaches this branch when prune is off
-        # (the resolution itself lives inside `_fit_and_prune`), so it truthfully has no effect
-        # for non-pruned fits without needing a special case.
-        if self.graduate and not self.prune:
-            raise ValueError(
-                "graduate=True has no effect without prune=True: Whittaker-Henderson "
-                "graduation only applies to the pruned tables-only artifact. Set prune=True, "
-                "or leave graduate at its default (None)."
-            )
+        if high_alpha > 0 and self.graduate is False:
+            raise ValueError("graduation_high_order_alpha requires graduation enabled")
         if BUILD_PROFILE == "debug":
             warnings.warn(
                 "the t_boost extension is a DEBUG build — fit timings are unrepresentative"
@@ -3930,8 +3920,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._record_fit_report(model)
         if not self.prune and isinstance(model, _Model):
             self.delta_step_gate_ = model.delta_step_gate
-            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
+            # Every fit deploys rating tables: an unpruned fit keeps all of them, then runs the
+            # post-fit stages a pruned fit runs (see `_finish_unpruned`).
+            full_model = model
             model = self._full_tables(model, x32, y32, weight32, exposure32, cat_x)
+            if isinstance(model, _TableModel):
+                model = self._finish_unpruned(
+                    full_model, model, x32, y32, weight32, exposure32, cat_x, monotone
+                )
         self._model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features
@@ -3993,6 +3989,19 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         other fit and is then projected back onto its signs (`_enforce_monotone`), last.
         Multiclass (K>=3) has no graduation path at all and never reaches this method.
         """
+        model = self._fit_and_prune_core(
+            booster, x32, y32, weight32, exposure32, axis_names, class_labels,
+            monotone, cat_x, groups_arr,
+        )
+        return self._graduate_and_repair(model, x32, y32, weight32, exposure32, cat_x, monotone)
+
+    def _graduate_and_repair(
+        self, model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int] | None,
+    ) -> "_TableModel":
+        """The last post-fit stages, for pruned and unpruned fits alike: graduation (unless
+        `graduate=False`), then the monotone repair when a sign is set."""
         n = len(y32)
         do_graduate = self.graduate is not False
         if do_graduate:
@@ -4004,10 +4013,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.graduation_validation_: dict[str, Any] = {
             "evidence": "none", "training_rows": n, "holdout_rows": 0, "adopted": False,
         }
-        model = self._fit_and_prune_core(
-            booster, x32, y32, weight32, exposure32, axis_names, class_labels,
-            monotone, cat_x, groups_arr,
-        )
         if do_graduate:
             w = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
             model = self._graduate_table_model(
@@ -4021,6 +4026,33 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 model, x32, y32, weight32, exposure32, cat_x, monotone
             )
         return model
+
+    def _finish_unpruned(
+        self, full_model: _Model, table_model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int] | None,
+    ) -> "_TableModel":
+        """An unpruned fit keeps every table, then runs the post-fit stages a pruned fit runs:
+        banding, graduation and the monotone repair. Only the selection is skipped, so
+        `prune=False` switches off pruning and nothing else; `band_tolerance=None,
+        graduate=False` keeps the lossless full bank, which predicts as the ensemble does."""
+        supports = [list(u) for u in table_model.deployed_supports()]
+        report: dict[str, Any] = {"selector": "none", "kept": supports,
+                                  "n_candidates": len(supports)}
+        self.pruning_report_ = report
+        band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
+        if band_tol is not None:
+            n = len(y32)
+            w_full = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
+            expo_full = np.ascontiguousarray(exposure32) if exposure32 is not None else None
+            table_model = self._band_deployed(
+                table_model, full_model, None, x32, y32, w_full, expo_full, cat_x,
+                _canonical_objective(self.objective), float(band_tol),
+            )
+        self._reconcile_deployed(table_model)
+        return self._graduate_and_repair(
+            table_model, x32, y32, weight32, exposure32, cat_x, monotone
+        )
 
     def _enforce_monotone(
         self, model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
@@ -4176,10 +4208,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         return keep, report
 
     def _band_deployed(
-        self, table_model: Any, full_model: Any, keep: list[Any], x32: np.ndarray, y32: np.ndarray,
-        w_full: np.ndarray, expo_full: np.ndarray | None, cat_x: Any, obj: str, tolerance: float,
+        self, table_model: Any, full_model: Any, keep: list[Any] | None, x32: np.ndarray,
+        y32: np.ndarray, w_full: np.ndarray, expo_full: np.ndarray | None, cat_x: Any, obj: str,
+        tolerance: float,
     ) -> Any:
-        """Band the deployed tables (see `_BAND_TOLERANCE_DEFAULT`); records the report."""
+        """Band the deployed tables (see `_BAND_TOLERANCE_DEFAULT`); records the report. The
+        noise is the spread of the bags' banks restricted to `keep` (all of each bag's bank
+        when None, as an unpruned fit deploys)."""
         n_jobs = self._resolve_n_jobs()
         target = np.asarray(table_model.predict_raw(x32, cat_x=cat_x), dtype=np.float64)
         w = np.asarray(w_full, dtype=np.float64)
@@ -4191,7 +4226,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             # Each bag's bank is purified under the same row mass (weight x exposure) as every
             # other fit-time bank, so the noise is measured on the tables that actually ship.
             var, n_bags = full_model.bag_score_variance(
-                x32, keep=[list(u) for u in keep], cat_x=cat_x, n_jobs=n_jobs,
+                x32, keep=None if keep is None else [list(u) for u in keep], cat_x=cat_x,
+                n_jobs=n_jobs,
                 weight=np.ascontiguousarray(w_full), exposure=expo_full,
                 **self._measure_kwargs(),
             )
@@ -5610,8 +5646,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
     (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
     tables are graduated (``graduate``). The fitted artifact is that tables-only model.
-    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
-    baseline.
+    Pass ``n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+    graduate=False`` for the cheapest single-fit baseline: one fit's full table bank, as the
+    trees fitted it.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -5765,7 +5802,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fade, and additionally requires 3-way admissions to clear a stricter multiplier than
         2-way admissions.
     graduate : bool or None, default=None
-        Whittaker-Henderson smoothing of the deployed fANOVA tables after pruning.
+        Whittaker-Henderson smoothing of the deployed fANOVA tables, pruned or not.
         ``None`` (the default) and ``True`` both enable it; ``False`` disables it and
         ``graduation_report_`` is then never set. NO ROWS ARE WITHHELD: the fit, the
         prune and the smoothing all see every row, and the smoothed bank is adopted
@@ -5777,8 +5814,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         not a deviance comparison's: set ``graduate=False`` for the raw pruned bank. The
         smoothing is kept only if it raises the training deviance by at most 1%; otherwise
         every table is kept as fitted and ``graduation_validation_`` says why.
-        Monotone fits retain the full bank without smoothing. Explicit ``True`` requires
-        ``prune=True``. Multiclass (K>=3) graduation is unsupported.
+        Multiclass (K>=3) graduation is unsupported.
     graduation_alpha : float or None, default=None
         Fixed Whittaker-Henderson smoothing strength, overriding the per-table generalized
         cross-validation (GCV) alpha selection that ``graduate`` normally uses. ``None`` (the
@@ -5789,8 +5825,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         the tables are kept as fitted, the fit warns and ``binding_report_`` lists it INERT.
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
-        step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for multiclass fits. Numeric
+        step on factored interactions of orders 3 through 8. Requires graduation
+        enabled; unsupported for multiclass fits. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -5972,9 +6008,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
         ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
-        categorical feature raises. The trees enforce the signs; with ``prune=True`` every
-        pruning stage then runs as usual and the deployed tables are projected back onto the
-        signs last, changing as little as they can (``pruning_report_["monotone"]``).
+        categorical feature raises. The trees enforce the signs; every post-fit stage then
+        runs as usual and the deployed tables are projected back onto the signs last,
+        changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -6056,9 +6092,11 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
         the pruned artifact. ``prune_selector`` decides how the tables are judged: the default
         ranked path reads the bags' out-of-bag rows and costs little extra, while the fold vote
-        refits the model on cross-validation folds. ``False`` deploys the full, unpruned table
-        bank instead (fitted faster, but a much larger artifact than the pruned bank or the
-        trees it is built from). Either way the model is stored as rating tables.
+        refits the model on cross-validation folds. ``False`` keeps the full table bank
+        instead (fitted faster, but more tables than the pruned bank). Only the selection is
+        skipped: banding, graduation and the monotone repair run either way, and the model is
+        always stored as rating tables. ``band_tolerance=None, graduate=False`` keeps the full
+        bank exactly as the trees fitted it.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too. ``False`` deploys every main effect the fit
         built and prunes interactions only. ``True`` makes the main effects candidates in every
@@ -6321,14 +6359,14 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
         to deploy the drop-only pruned model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
-        Banding: after pruning, each deployed interaction table is condensed into a small
-        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        Banding: each deployed interaction table is condensed into a small product grid of
+        bands. Adjacent cells are merged where the model barely distinguishes
         them, every table containing a feature cuts it at the same nested places, and missing
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
-        outcome is in ``pruning_report_["banding"]``.
+        off. Banding runs on every bagged fit (``n_bags >= 2``), pruned or not; the outcome
+        is in ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
         The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
         0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
@@ -6366,9 +6404,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
-        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        kept, and deployed, and the evidence they were judged on; saved with the model.
+        ``["selector"]`` names the selector that ran: ``"none"`` on an unpruned fit
+        (``prune=False``), which keeps every table, ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
         (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
         admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
         which the evidence fields below describe.
@@ -6900,8 +6938,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
     (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
     tables are graduated (``graduate``; not for multiclass). The fitted artifact is that tables-only model.
-    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
-    baseline.
+    Pass ``n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+    graduate=False`` for the cheapest single-fit baseline: one fit's full table bank, as the
+    trees fitted it.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -7076,8 +7115,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Fixed smoothing strength on binary fits; unused for multiclass.
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
-        step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for multiclass fits. Numeric
+        step on factored interactions of orders 3 through 8. Requires graduation
+        enabled; unsupported for multiclass fits. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -7285,9 +7324,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
         ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
-        categorical feature raises. The trees enforce the signs; with ``prune=True`` every
-        pruning stage then runs as usual and the deployed tables are projected back onto the
-        signs last, changing as little as they can (``pruning_report_["monotone"]``).
+        categorical feature raises. The trees enforce the signs; every post-fit stage then
+        runs as usual and the deployed tables are projected back onto the signs last,
+        changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -7383,9 +7422,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         place on held-out rows, and deploy the smaller, more explainable tables-only model
         (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
         the pruned artifact. ``prune_selector`` decides how the tables are judged (see
-        :class:`TBoostRegressor`). ``False`` deploys the full, unpruned table bank instead
-        (fitted faster, but a much larger artifact). Either way the model is stored as rating
-        tables. Available on both the binary and multiclass (K>=3) paths.
+        :class:`TBoostRegressor`). ``False`` keeps the full table bank instead (fitted faster,
+        but more tables); only the selection is skipped, and the model is always stored as
+        rating tables. Available on both the binary and multiclass (K>=3) paths.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too; see :class:`TBoostRegressor`. Honored by
         every selector on the binary and multiclass (K>=3) paths.
@@ -7647,14 +7686,14 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         to deploy the drop-only pruned model. Binary (K=2) path only. Only has an effect
         together with ``prune=True``.
     band_tolerance : float or None, default=0.75
-        Banding: after pruning, each deployed interaction table is condensed into a small
-        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        Banding: each deployed interaction table is condensed into a small product grid of
+        bands. Adjacent cells are merged where the model barely distinguishes
         them, every table containing a feature cuts it at the same nested places, and missing
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
-        outcome is in ``pruning_report_["banding"]``.
+        off. Banding runs on every bagged fit (``n_bags >= 2``), pruned or not; the outcome
+        is in ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
         The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
         0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
@@ -7695,9 +7734,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
-        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        kept, and deployed, and the evidence they were judged on; saved with the model.
+        ``["selector"]`` names the selector that ran: ``"none"`` on an unpruned fit
+        (``prune=False``), which keeps every table, ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
         (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
         admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
         which the evidence fields below describe.
@@ -8501,11 +8540,29 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 bag_groups=bag_codes,
             )
             self.cell_refit_report_ = model.cell_refit_report
-            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
-            w_full = weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
-            model = model.to_tables(
-                x32, np.ascontiguousarray(w_full), cat_x=cat_x, **self._measure_kwargs()
+            # Every fit deploys rating tables: an unpruned fit keeps all of them and bands them
+            # as a pruned fit does; only the selection is skipped.
+            w_full = np.ascontiguousarray(
+                weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
             )
+            full_model = model
+            model = model.to_tables(x32, w_full, cat_x=cat_x, **self._measure_kwargs())
+            supports = sorted({tuple(int(i) for i in u)
+                               for bank in model.sobol() for u, _ in bank if u})
+            report: dict[str, Any] = {"selector": "none", "kept": [list(u) for u in supports],
+                                      "n_candidates": len(supports)}
+            self.pruning_report_ = report
+            band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
+            if band_tol is not None:
+                try:
+                    model, band_json = full_model.band_tables(
+                        model, x32, np.ascontiguousarray(y_labels), w_full, float(band_tol),
+                        float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)),
+                        cat_x=cat_x, **self._measure_kwargs(),
+                    )
+                    self.pruning_report_["banding"] = json.loads(band_json)
+                except ValueError as exc:
+                    self.pruning_report_["banding"] = {"skipped": f"no bag noise estimate: {exc}"}
         self._multi_model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features

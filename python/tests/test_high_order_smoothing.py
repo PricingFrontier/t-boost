@@ -17,10 +17,9 @@ def test_invalid_strength_fails_before_fit(alpha):
             np.zeros((20, 3), dtype=np.float32), np.zeros(20, dtype=np.float32))
 
 
-@pytest.mark.parametrize('kwargs', [dict(prune=False), dict(graduate=False)])
-def test_unsupported_configuration_is_not_silently_ignored(kwargs):
-    with pytest.raises(ValueError, match='smoothing|graduation_high_order_alpha'):
-        TBoostRegressor(graduation_high_order_alpha=0.5, **kwargs).fit(
+def test_unsupported_configuration_is_not_silently_ignored():
+    with pytest.raises(ValueError, match='graduation_high_order_alpha'):
+        TBoostRegressor(graduation_high_order_alpha=0.5, graduate=False).fit(
             np.zeros((20, 3), dtype=np.float32), np.zeros(20, dtype=np.float32))
 
 
@@ -138,3 +137,7 @@ def test_estimator_fit_default_noop_and_enabled_reporting():
     assert enabled.graduation_validation_['candidate_count'] == 1
     for restored in [TBoostRegressor.from_json(enabled.to_json()), TBoostRegressor.from_bytes(enabled.to_bytes())]:
         np.testing.assert_array_equal(restored.predict(x), enabled.predict(x))
+    # An unpruned fit smooths its factored effects too: only the selection is skipped.
+    unpruned = TBoostRegressor(**params, prune=False, graduation_high_order_alpha=0.2).fit(x, y)
+    high = [r for r in unpruned.graduation_report_ if r.get('method') == 'reference_diffusion']
+    assert high and any(r['applied'] for r in high)

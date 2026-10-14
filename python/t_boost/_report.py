@@ -1229,11 +1229,8 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
                        if multiclass else "not recorded with this model (saved before 0.7.0)")
     history = getattr(est, "evals_result_", None)
     pruning = getattr(est, "pruning_report_", None)
-    if pruning is None:
-        why = ("prune=False: no table selection ran" if not getattr(est, "prune", False)
-               else "the pruning report was not stored with this model (saved before it was)")
-    else:
-        why = ""
+    why = ("" if pruning is not None
+           else "the pruning report was not stored with this model (saved before it was)")
     try:
         binding = est.binding_report_
     except Exception as exc:  # pragma: no cover - defensive
