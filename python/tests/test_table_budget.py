@@ -76,9 +76,9 @@ def _n_ge3(model) -> int:
 
 
 # Sized for a test suite, not for a battery: n=900 keeps the fit above
-# `_PRUNE_GUARD_MIN_ROWS` (500) so the prune guard is LIVE — the regime the no-op regression
-# below was hiding in — while 30 trees keep each fit to a few seconds. The first cut ran
-# 1,200 rows x 60 trees and took over twenty minutes, which is a defect of its own.
+# `_PRUNE_GUARD_MIN_ROWS` (500) out-of-bag rows, while 30 trees keep each fit to a few seconds.
+# The first cut ran 1,200 rows x 60 trees and took over twenty minutes, which is a defect of
+# its own.
 def _fit(*, k: int = 0, n: int | None = None, n_trees: int | None = None, **kw):
     """The multiclass case needs its own, heavier settings and that is a finding, not a knob.
 
@@ -103,8 +103,9 @@ def _fit(*, k: int = 0, n: int | None = None, n_trees: int | None = None, **kw):
 
 
 def test_fixture_actually_deploys_multi_way_tables_to_cap() -> None:
-    """Guard the guard: every assertion below is vacuous on a bank with no >=3-way table."""
-    assert _n_ge3(_fit()) >= 8
+    """Guard the guard: every assertion below is vacuous on a bank with no >=3-way table, and the
+    cap test needs at least three to cap at one and at half."""
+    assert _n_ge3(_fit()) >= 3
 
 
 @pytest.mark.parametrize("k", [0, 3])
@@ -159,12 +160,9 @@ def test_a_cap_at_or_above_the_banks_own_count_is_a_verbatim_no_op() -> None:
     """Monotone/no-op is what makes "budget off is byte-identical" checkable rather than
     hopeful, and it must hold at the BOUNDARY, not only far above it.
 
-    This is the assertion that caught a real regression. An earlier cut skipped the prune
-    guard's out-of-bag path whenever a budget was armed — reasoning that the guard scores the
-    pre-budget keep-set and so cannot describe a budgeted deploy. But `_PRUNE_GUARD_MIN_ROWS`
-    is 500, so the guard is live on this 1,200-row fixture, and suppressing it turned a
-    NON-BINDING cap into a model change: 10 three-way tables became 4. The guard's blindness is
-    now reported (`pruning_report_["guard"]["budget_blind"]`) rather than routed around.
+    This is the assertion that caught a real regression: an earlier cut changed control flow
+    whenever a budget was armed, which turned a NON-BINDING cap into a model change (10
+    three-way tables became 4).
     """
     baseline = _fit()
     n = _n_ge3(baseline)
@@ -172,18 +170,6 @@ def test_a_cap_at_or_above_the_banks_own_count_is_a_verbatim_no_op() -> None:
         est = _fit(prune_table_budget=cap)
         assert model_json(est) == model_json(baseline), cap
         assert est.pruning_report_["table_budget"]["engaged"] is False, cap
-
-
-def test_a_guard_that_cannot_see_the_budget_says_so_in_the_report() -> None:
-    """The out-of-bag guard scores raw per-support sums over the SELECTION keep-set, so once a
-    budget ENGAGES its verdict describes a bank that did not ship. That is a real limitation and
-    the report has to carry it; a silent wrong verdict is worse than a flagged one."""
-    base = _fit()
-    assert base.pruning_report_["guard"].get("budget_blind") is None
-    tight = _fit(prune_table_budget=1)
-    assert tight.pruning_report_["table_budget"]["engaged"] is True
-    if tight.pruning_report_["guard"].get("evidence") == "oob":
-        assert tight.pruning_report_["guard"]["budget_blind"] is True
 
 
 def test_the_cap_never_touches_a_main_effect_or_a_pair() -> None:
@@ -210,9 +196,10 @@ def test_the_price_is_monotone_in_the_priced_band() -> None:
     """A selection-time price must never GROW the priced band — that monotonicity is what makes
     it usable as a tuned dial. It is deliberately not asserted to reach zero: it re-picks a
     waypoint on a fixed deviance-greedy path and saturates, which is why the BUDGET exists."""
-    last = _n_ge3(_fit())
+    # The price is a fold-vote knob: the ranked path does not read it.
+    last = _n_ge3(_fit(prune_selector="fold_vote"))
     for lam in (1e-2, 1.0, 100.0):
-        n = _n_ge3(_fit(prune_lambda_tables=lam))
+        n = _n_ge3(_fit(prune_selector="fold_vote", prune_lambda_tables=lam))
         assert n <= last, f"lambda={lam} grew the >=3-way count {last} -> {n}"
         last = n
 
@@ -258,13 +245,12 @@ def test_a_budget_without_pruning_raises_rather_than_no_opping() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
-    unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
+def _unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budgets apply after either selector; this module runs them on the default ranked path,
+    on unbanded tables so the over-budget 3-way effects stay factored and carry boxes."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R
 
     for cls in (_R, _C):
         defaults = cls.__init__.__kwdefaults__
-        monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)

@@ -311,9 +311,9 @@ def _row(m, param):
 
 
 def test_fold_vote_knobs_are_INERT_when_the_ranked_path_selects():
-    m, warns = _fit(prune_selector="ranked_path", prune_min_stability=1.0, prune_guard_tol=0.1)
+    m, warns = _fit(prune_selector="ranked_path", prune_min_stability=1.0, prune_n_folds=3)
     assert m.pruning_report_["selector"] == "ranked_path"
-    for param in ("prune_min_stability", "prune_guard_tol"):
+    for param in ("prune_min_stability", "prune_n_folds"):
         row = _row(m, param)
         assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
     assert warns == []                              # INERT stays silent at fit
@@ -352,24 +352,20 @@ def test_multiclass_selection_knobs_follow_the_task():
     rng = np.random.default_rng(1)
     noisy = X.a + rng.normal(size=len(X))
     kw = dict(n_trees=60, seed=0, n_jobs=2, prune_selector="ranked_path")
-    multi = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
+    multi = TBoostClassifier(**kw, multiclass_prune_sel_bags=2).fit(
         X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
-    row = _row(multi, "multiclass_prune_guard_floor")
+    row = _row(multi, "multiclass_prune_sel_bags")
     assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
     # The legacy single split's fraction only carves the selection rows the path never reads.
     legacy = TBoostClassifier(**kw, multiclass_prune_cv=False, prune_validation_fraction=0.2).fit(
         X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
     row = _row(legacy, "prune_validation_fraction")
     assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
-    # A binary fit never reads a multiclass knob, so the ranked path is not its reason.
-    binary = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
-        X[["a", "b"]], (noisy > 0).astype(int))
-    assert not [r for r in binary.binding_report_ if r["param"] == "multiclass_prune_guard_floor"]
 
 
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
+    """This module pins the fold-vote selector (its evidence gate and vote machinery) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R

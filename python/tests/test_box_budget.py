@@ -196,13 +196,12 @@ def test_budget_round_trips_through_get_params() -> None:
 
 
 @pytest.fixture(autouse=True)
-def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence and box-budget mechanics) on
-    unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
+def _unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The budgets apply after either selector; this module runs them on the default ranked path,
+    on unbanded tables so the over-budget 3-way effects stay factored and carry boxes."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R
 
     for cls in (_R, _C):
         defaults = cls.__init__.__kwdefaults__
-        monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)

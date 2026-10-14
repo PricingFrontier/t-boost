@@ -7,8 +7,8 @@
 #![allow(unsafe_code)]
 
 use numpy::{
-    IntoPyArray, PyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadwriteArray1, PyUntypedArrayMethods,
+    IntoPyArray, PyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadwriteArray1, PyUntypedArrayMethods,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
@@ -47,12 +47,11 @@ use t_boost_core::loss::{
 };
 use t_boost_core::prune::{
     bag_banks_for_keepset, bag_oob_evidence_available, bag_oob_group_sums_with,
-    bag_raw_scores_for_rows, multiclass_bag_oob_evidence_available, multiclass_carve_arms,
-    multiclass_full_tables, multiclass_oob_arms, multiclass_prune_guard, multiclass_ranked_path,
-    multiclass_realized_supports, prune_model_to_keepset, prune_model_to_tables,
-    prune_model_to_tables_pinned, prune_multiclass_to_keepset,
-    prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, MulticlassGuardEvidence,
-    MulticlassGuardReport, PruneConfig, PruneReport, PruneTableScore, DEFAULT_TABLE_MIN_ARITY,
+    bag_raw_scores_for_rows, multiclass_bag_oob_evidence_available, multiclass_full_tables,
+    multiclass_ranked_path, multiclass_realized_supports, prune_model_to_keepset,
+    prune_model_to_tables, prune_model_to_tables_pinned, prune_multiclass_to_keepset,
+    prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, PruneConfig, PruneReport,
+    PruneTableScore, DEFAULT_TABLE_MIN_ARITY,
 };
 use t_boost_core::serialize::{
     decode_multiclass, decode_multiclass_json, encode_multiclass, encode_multiclass_json,
@@ -3526,7 +3525,7 @@ fn aggregate_prune_selection(
     // Candidate admissions the EVIDENCE gate wants but the legacy rule refuses. `(mean_gain,
     // ids, u)`: the budget below spends on the highest mean gain first, with the feature-set
     // ids as a total, seed-free tie-break, so the admitted prefix is a pure function of the
-    // fold scores. Same ranking the guard's re-admission ladder uses, for the same reason.
+    // fold scores.
     let mut evidence_extra: Vec<(f64, Vec<u32>, FeatureSet)> = Vec::new();
     let mut evidence_rows: Vec<serde_json::Value> = Vec::new();
     for fs in &full_supports_vec {
@@ -4362,7 +4361,7 @@ impl PyBooster {
     /// Fit native-softmax on the complement of `sel_rows`, then prune the per-class banks with a
     /// shared keep-set selected on those held-out rows. The full design crosses the Python boundary
     /// once; row gathering, fitting, full-data serving, and pruning run on one bounded Rayon pool.
-    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0))]
+    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard_min_rows=500, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0))]
     #[allow(clippy::too_many_arguments)]
     fn fit_multiclass_pruned(
         &self,
@@ -4387,16 +4386,8 @@ impl PyBooster {
         es_holdout: Option<Vec<bool>>,
         // Honest ES holdout for the full-data DEPLOY fit, expressed over ALL rows.
         deploy_es_holdout: Option<Vec<bool>>,
-        // Set-level no-harm guard on the DEPLOYED per-class banks, with out-of-bag evidence
-        // (see `prune::multiclass_prune_guard`). OFF by default: unlike the single-output path
-        // this one is new, so a K>=3 fit that does not ask for it stays byte-identical.
-        prune_guard: bool,
-        prune_guard_tol: f64,
+        // Minimum out-of-bag rows the ranked path needs to score its prefixes.
         prune_guard_min_rows: usize,
-        // Whether OUT-OF-BAG rows are honest for this fit — true iff no group can straddle the
-        // in-bag/out-of-bag boundary (ungrouped, or an all-singleton grouping). Only the caller
-        // knows the grouping, so it decides; false routes the guard to the shared carve.
-        guard_oob_honest: bool,
         // Bag count of the SELECTION fit (the K>=3 analogue of the single-output path's
         // `prune_fold_bags`). 1 = the shipped single, unbagged selection fit, byte-identical to
         // every earlier release. See `fit_multiclass_pruned_owned` for why the knob exists.
@@ -4426,11 +4417,8 @@ impl PyBooster {
         min_mean_gain: f64,
         drop_z: Option<f64>,
         keep_budget: usize,
-        // SE-aware guard bar: `min(tol*dev_full, max(guard_z*SE, guard_floor*(null-full)))`.
-        guard_z: f64,
-        guard_floor: f64,
         bag_groups: Option<PyReadonlyArray1<'_, u32>>,
-        // Ranked-path selector (see `multiclass_ranked_path`): replaces the fold CV and the guard.
+        // Ranked-path selector (see `multiclass_ranked_path`): replaces the fold CV.
         ranked_path: bool,
         path_steps: usize,
         path_fraction: f64,
@@ -4482,10 +4470,7 @@ impl PyBooster {
                     n_folds,
                     es_holdout,
                     deploy_es_holdout,
-                    prune_guard,
-                    prune_guard_tol,
                     prune_guard_min_rows,
-                    guard_oob_honest,
                     sel_bags,
                     box_budget,
                     lambda_tables,
@@ -4499,8 +4484,6 @@ impl PyBooster {
                     min_mean_gain,
                     drop_z,
                     keep_budget,
-                    guard_z,
-                    guard_floor,
                     bag_groups,
                     ranked_path,
                     path_steps,
@@ -5718,15 +5701,14 @@ impl PyModel {
         })
     }
 
-    /// The prune guard's out-of-bag evidence in ONE pass: for each fit row, the sums over the
+    /// The ranked path's out-of-bag evidence in ONE pass: for each fit row, the sums over the
     /// bags that never trained on it of (a) the full bag bank's raw score, (b) the bag bank
     /// intercepts, and (c) each passed table GROUP's tables alone, plus the count of such bags.
     ///
     /// `groups` is a list of table groups, each a list of supports (raw feature id lists).
     /// Because table scores are additive, any PREFIX union of the groups is
-    /// `(f0_sum + Σ_{g ≤ k} group_sums[g]) / counts` — which is what lets the guard evaluate
-    /// its whole re-admission ladder (keep-set first, then each doubling chunk in rank order)
-    /// without rebuilding a single bank per rung.
+    /// `(f0_sum + Σ_{g ≤ k} group_sums[g]) / counts` — which is what lets the ranked path score
+    /// every prefix of its admission sequence without rebuilding a single bank per prefix.
     ///
     /// `x` MUST be the fit design — same rows, SAME ORDER — since the recorded membership is
     /// positional. Only the row COUNT is checked (a permuted design cannot be detected and
@@ -6764,105 +6746,6 @@ impl PyMultiClassModel {
             model: Arc::new(tm),
             serve: Default::default(),
         })
-    }
-
-    /// PROBE (2026-09-07): carve arms on `mask` rows — `(rows, f0[K,n], full[K,n], group[G,K,n])`.
-    #[pyo3(signature = (x, weight, groups, mask, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn mc_carve_arms<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyReadonlyArray2<'_, f32>,
-        weight: PyReadonlyArray1<'_, f32>,
-        groups: Vec<Vec<Vec<u32>>>,
-        mask: Vec<bool>,
-        cat_x: Option<Vec<Vec<String>>>,
-        ref_measure: Option<String>,
-        laplace: f32,
-        measure_floor: f32,
-    ) -> PyResult<(
-        Vec<usize>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray3<f64>>,
-    )> {
-        let columns = raw_columns_from_array(x)?;
-        let w_vec = weight
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
-            .to_vec();
-        let groups_fs: Vec<Vec<FeatureSet>> = groups
-            .iter()
-            .map(|g| g.iter().map(|ids| feature_set_from_raw_ids(ids)).collect())
-            .collect();
-        let model = Arc::clone(&self.model);
-        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let arms = py
-            .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let serve = ServeBinnedMatrix(binned);
-                multiclass_carve_arms(&model, &serve, w_measure, &w_vec, &groups_fs, &mask)
-            })
-            .map_err(py_err)?;
-        let f0 = PyArray2::from_vec2(py, &arms.f0)
-            .map_err(|e| PyValueError::new_err(format!("f0 shape: {e}")))?;
-        let full = PyArray2::from_vec2(py, &arms.full)
-            .map_err(|e| PyValueError::new_err(format!("full shape: {e}")))?;
-        let group = PyArray3::from_vec3(py, &arms.group)
-            .map_err(|e| PyValueError::new_err(format!("group shape: {e}")))?;
-        Ok((arms.rows, f0, full, group))
-    }
-
-    /// PROBE (2026-09-07): out-of-bag arms — `(rows, f0[K,n], full[K,n], group[G,K,n])`.
-    #[pyo3(signature = (x, weight, groups, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn mc_oob_arms<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyReadonlyArray2<'_, f32>,
-        weight: PyReadonlyArray1<'_, f32>,
-        groups: Vec<Vec<Vec<u32>>>,
-        cat_x: Option<Vec<Vec<String>>>,
-        ref_measure: Option<String>,
-        laplace: f32,
-        measure_floor: f32,
-    ) -> PyResult<(
-        Vec<usize>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray3<f64>>,
-    )> {
-        let columns = raw_columns_from_array(x)?;
-        let w_vec = weight
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
-            .to_vec();
-        let groups_fs: Vec<Vec<FeatureSet>> = groups
-            .iter()
-            .map(|g| g.iter().map(|ids| feature_set_from_raw_ids(ids)).collect())
-            .collect();
-        let model = Arc::clone(&self.model);
-        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let arms = py
-            .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let serve = ServeBinnedMatrix(binned);
-                multiclass_oob_arms(&model, &serve, w_measure, &w_vec, &groups_fs)
-            })
-            .map_err(py_err)?;
-        let f0 = PyArray2::from_vec2(py, &arms.f0)
-            .map_err(|e| PyValueError::new_err(format!("f0 shape: {e}")))?;
-        let full = PyArray2::from_vec2(py, &arms.full)
-            .map_err(|e| PyValueError::new_err(format!("full shape: {e}")))?;
-        let group = PyArray3::from_vec3(py, &arms.group)
-            .map_err(|e| PyValueError::new_err(format!("group shape: {e}")))?;
-        Ok((arms.rows, f0, full, group))
     }
 
     #[pyo3(signature = (x, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None))]
@@ -8663,7 +8546,7 @@ fn mc_stage<T>(name: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// K>=3 fit-and-prune. Two selection regimes share one deploy/guard/apply tail:
+/// K>=3 fit-and-prune. Two selection regimes share one deploy/apply tail:
 ///
 /// * **CV selection** (`fold_of` given; the default since 2026-09-07): the single-output prune's
 ///   design ported to K>=3. The DEPLOY soup is fitted first and its realized supports are the
@@ -8676,9 +8559,7 @@ fn mc_stage<T>(name: &str, f: impl FnOnce() -> T) -> T {
 ///   `sel_rows`, walked on that slice. Kept for A/B and for the historical artifacts; it is the
 ///   path measured to drop tables on noise (see `design/multiclass-design.md` §9g).
 ///
-/// The guard then measures the shipped keep-set against the full deploy bank on honest rows
-/// with an SE-aware bar (`guard_z`, `guard_floor`), and the keep-set is retained on the deploy
-/// banks with the box/table budgets.
+/// The keep-set is then retained on the deploy banks with the box/table budgets.
 #[allow(clippy::too_many_arguments)]
 fn fit_multiclass_pruned_owned(
     mut state: PyBooster,
@@ -8697,10 +8578,7 @@ fn fit_multiclass_pruned_owned(
     n_folds: usize,
     es_holdout: Option<Vec<bool>>,
     deploy_es_holdout: Option<Vec<bool>>,
-    prune_guard: bool,
-    prune_guard_tol: f64,
     prune_guard_min_rows: usize,
-    guard_oob_honest: bool,
     sel_bags: u16,
     box_budget: usize,
     lambda_tables: f64,
@@ -8714,8 +8592,6 @@ fn fit_multiclass_pruned_owned(
     min_mean_gain: f64,
     drop_z: Option<f64>,
     keep_budget: usize,
-    guard_z: f64,
-    guard_floor: f64,
     bag_groups: Option<Vec<u32>>,
     ranked_path: bool,
     path_steps: usize,
@@ -8856,7 +8732,6 @@ fn fit_multiclass_pruned_owned(
             };
             st
         };
-        let deploy_es_holdout_mask = deploy_es_holdout.clone();
         let fit_deploy = |st: PyBooster| -> Result<MultiClassModel, PbError> {
             fit_multiclass_owned_bagged(
                 st,
@@ -9242,45 +9117,7 @@ fn fit_multiclass_pruned_owned(
             })?;
         let deploy_binned = serve_binned_for_model(deploy_first, &columns, cat_x.as_deref())?;
         let deploy_serve = ServeBinnedMatrix(deploy_binned);
-        let (shipped_keep, guard) = if prune_guard && !ranked_used {
-            let ev = if guard_oob_honest {
-                Some(MulticlassGuardEvidence::OutOfBag)
-            } else {
-                deploy_es_holdout_mask
-                    .as_deref()
-                    .map(MulticlassGuardEvidence::Carve)
-            };
-            match ev {
-                Some(ev) => {
-                    let (k, g) = mc_stage("guard", || {
-                        multiclass_prune_guard(
-                            &deploy_model,
-                            &deploy_serve,
-                            &labels,
-                            &full_weight,
-                            w_measure.clone(),
-                            &report.kept,
-                            &report.table_scores,
-                            ev,
-                            prune_guard_tol,
-                            prune_guard_min_rows,
-                            guard_z,
-                            guard_floor,
-                        )
-                    })?;
-                    (k, Some(g))
-                }
-                None => (
-                    report.kept.clone(),
-                    Some(MulticlassGuardReport::skipped(
-                        true,
-                        "no honest evidence: a panel fit with validation_fraction unset",
-                    )),
-                ),
-            }
-        } else {
-            (report.kept.clone(), None)
-        };
+        let shipped_keep = report.kept.clone();
         let evidence: BTreeMap<FeatureSet, f64> = report
             .table_scores
             .iter()
@@ -9349,18 +9186,6 @@ fn fit_multiclass_pruned_owned(
             if let Some(sel) = selection_json {
                 obj.insert("selection".into(), sel);
             }
-            let mut g = match &guard {
-                Some(g) => serde_json::to_value(g).map_err(|err| {
-                    PbError::Serialization(format!("could not serialize guard report: {err}"))
-                })?,
-                None => serde_json::json!({ "enabled": false, "fired": false }),
-            };
-            if (box_report.engaged || table_report.engaged) && guard.is_some() {
-                if let Some(obj) = g.as_object_mut() {
-                    obj.insert("budget_blind".into(), serde_json::Value::Bool(true));
-                }
-            }
-            obj.insert("guard".into(), g);
             if let Some(reps) = &banding_reports {
                 obj.insert(
                     "banding".into(),

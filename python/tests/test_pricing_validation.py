@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from t_boost import TBoostRegressor
-from t_boost.sklearn import _Booster, _guard_mean_deviance, _guard_reanchor
+from t_boost.sklearn import _Booster
 
 
 def fixture(n=600):
@@ -154,32 +154,6 @@ def test_a_declined_graduation_alpha_warns_and_does_not_bind():
                    for r in ok.binding_report_)
 
 
-def test_offset_guard_measures_expected_counts(monkeypatch):
-    x, y, e = fixture()
-    captured = []
-    fit = _Booster.fit
-    def capture(self, *a, **kw):
-        model = fit(self, *a, **kw)
-        captured.append(model)
-        return model
-    monkeypatch.setattr(_Booster, 'fit', capture)
-    m = estimator(objective='poisson', graduate=False, prune_guard_min_rows=20).fit(x, y, exposure=e)
-    g = m.pruning_report_['guard']
-    assert g['evidence'] == 'oob' and g['exposure_offset']
-    assert 'skipped' not in g
-    sums, _, _, counts = captured[0].bag_oob_group_raw(
-        x, [[]], weight=np.ones(len(y), dtype=np.float32), exposure=e,
-        n_jobs=1, **m._measure_kwargs())
-    counts = np.asarray(counts)
-    valid = counts > 0
-    raw = np.asarray(sums)[valid] / counts[valid] + np.log(e[valid].astype(float))
-    w = np.ones(valid.sum())
-    raw = _guard_reanchor('poisson', raw, y[valid], w, True)
-    expected = _guard_mean_deviance('poisson', y[valid], raw, w, m.tweedie_rho)
-    assert g['dev_full'] == pytest.approx(expected, rel=1e-10)
-    assert 'fixed offset' in m.pruning_report_['slope']['skipped']
-
-
 def test_monotone_final_tables_retain_full_function():
     x, y, _ = fixture()
     m = estimator(objective='squared_error', monotone_constraints=[1, 0]).fit(x, y)
@@ -215,7 +189,7 @@ def test_legacy_unwrapped_log_model_restores_objective():
 
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
+    """This module pins the fold-vote selector (its evidence gate and vote machinery) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R

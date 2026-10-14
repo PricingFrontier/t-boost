@@ -161,10 +161,7 @@ class _Booster:
         n_folds: int = 5,
         es_holdout: Sequence[bool] | None = None,
         deploy_es_holdout: Sequence[bool] | None = None,
-        prune_guard: bool = False,
-        prune_guard_tol: float = 0.05,
         prune_guard_min_rows: int = 500,
-        guard_oob_honest: bool = True,
         sel_bags: int = 1,
         box_budget: int = 0,
         lambda_tables: float = 0.0,
@@ -178,8 +175,6 @@ class _Booster:
         min_mean_gain: float = 0.0,
         drop_z: float | None = None,
         keep_budget: int = 0,
-        guard_z: float = 0.0,
-        guard_floor: float = 0.0,
         bag_groups: np.ndarray | None = None,
         ranked_path: bool = False,
         path_steps: int = 32,
@@ -671,29 +666,6 @@ class _MultiClassModel:
         laplace: float = 1.0,
         measure_floor: float = 0.001,
     ) -> _MultiClassTableModel: ...
-
-    def mc_carve_arms(
-        self,
-        x: np.ndarray,
-        weight: np.ndarray,
-        groups: Sequence[Sequence[Sequence[int]]],
-        mask: Sequence[bool],
-        cat_x: Sequence[Sequence[str]] | None = None,
-        ref_measure: str | None = None,
-        laplace: float = 1.0,
-        measure_floor: float = 0.001,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]: ...
-
-    def mc_oob_arms(
-        self,
-        x: np.ndarray,
-        weight: np.ndarray,
-        groups: Sequence[Sequence[Sequence[int]]],
-        cat_x: Sequence[Sequence[str]] | None = None,
-        ref_measure: str | None = None,
-        laplace: float = 1.0,
-        measure_floor: float = 0.001,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]: ...
 
     def tables(
         self,

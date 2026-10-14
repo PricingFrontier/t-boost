@@ -55,7 +55,7 @@ def test_predicate_singleton_vs_panel():
 
 def test_predicate_nan_ids_are_not_singletons():
     """A NaN id is not an identity — a column of them must not read as a column of singletons
-    (the prune guard's OOB-honesty test has always taken this line; both now share it)."""
+    (the ranked path's OOB-honesty test takes the same line; both share it)."""
     g = np.arange(10, dtype=np.float64)
     g[3] = np.nan
     assert not _is_degenerate_grouping(g)

@@ -2648,7 +2648,7 @@ def _ranked(r: dict[str, Any], pd: dict[str, Any]) -> str:
                                    "note"], groups[g], numeric=(2, 3, 4, 5)) + "</details>")
     if len(seq) > _RANKED_ROWS:
         parts.append(f'<p class="note">{len(seq) - _RANKED_ROWS} more in the JSON report.</p>')
-    stages = {k: rep[k] for k in ("table_budget", "box_budget", "guard", "banding", "slope") if k in rep}
+    stages = {k: rep[k] for k in ("table_budget", "box_budget", "banding") if k in rep}
     if stages:
         parts.append("<details><summary>After selection: " + _e(", ".join(stages)) + "</summary>"
                      + _kv(stages) + "</details>")

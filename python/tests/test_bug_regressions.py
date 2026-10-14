@@ -26,7 +26,6 @@ from t_boost.metrics import (
     mean_tweedie_deviance,
     ordered_gini,
 )
-from t_boost.sklearn import _guard_mu, _guard_reanchor
 
 
 OPTIONS = dict(
@@ -92,18 +91,6 @@ def test_bug003_multiclass_encoder_excludes_holdout_labels(channels, bags):
                                       es_holdout=holdout)
         encoders.append(json.loads(model.to_json())["model"]["classes"][0]["schema"]["cat_encoders"])
     assert encoders[0] == encoders[1]
-
-
-@pytest.mark.parametrize("objective", ["logistic", "poisson"])
-@pytest.mark.parametrize("varying", [False, True])
-def test_bug008_guard_intercept_balances_weighted_response(objective, varying):
-    rng = np.random.default_rng(0)
-    raw = rng.normal(size=100) if varying else np.zeros(100)
-    w = rng.uniform(0.5, 2, 100)
-    y = np.r_[np.ones(10), np.zeros(90)]
-    shifted = _guard_reanchor(objective, raw, y, w, True)
-    assert np.dot(w, _guard_mu(objective, shifted)) == pytest.approx(np.dot(w, y), rel=1e-9)
-    np.testing.assert_array_equal(_guard_reanchor(objective, raw, y, w, False), raw)
 
 
 @pytest.mark.parametrize("marker", ["t-boost-multiclass", "t-boost-multiclass-tables", "t-boost-tables"])

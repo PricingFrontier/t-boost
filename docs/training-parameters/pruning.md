@@ -173,11 +173,8 @@ int
 
 #### Description
 
-The minimum number of objects with honest evidence needed to judge the tables on.
-
-For the `ranked_path` selector, these are the objects that are out of bag for at least one bag:
-with fewer, the ranked path is not used. For the `fold_vote` selector, it is the minimum number
-of evidence objects for its [no-harm guard](pruning-fold-vote.md#prune_guard) to act.
+The minimum number of objects that are out of bag for at least one bag, needed to score the
+prefixes of the `ranked_path` selector. With fewer, the ranked path is not used.
 
 **Type**
 

@@ -47,21 +47,9 @@ def test_group_bags_are_deterministic_and_differ_from_row_bags() -> None:
     assert rows._model.to_bytes() != a._model.to_bytes()
 
 
-def test_grouped_multiclass_prune_guard_reads_honest_out_of_bag_rows() -> None:
-    frame, lin, g = _panel(n_groups=900, rows_per_group=3)
-    rng = np.random.default_rng(3)
-    y = np.digitize(lin + rng.normal(scale=0.5, size=lin.size), np.quantile(lin, [0.33, 0.66]))
-    est = TBoostClassifier(n_trees=120, n_bags=4, seed=0, prune=True).fit(frame, y, groups=g)
-    guard = est.pruning_report_["guard"]
-    # Before group-aware bags a grouped K>=3 fit had to fall back to the 10% carve; now the
-    # deploy soup's own out-of-bag rows are the evidence.
-    assert guard["enabled"] and guard["evidence"] == "oob", guard
-    assert guard["oob_rows"] > 0.5 * y.size
-
-
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence and box-budget mechanics) on
+    """This module pins the fold-vote selector (its evidence and box-budget mechanics) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R

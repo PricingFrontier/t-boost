@@ -2017,7 +2017,7 @@ fn bag_bank(
 }
 
 /// Raw (link-scale) scores of every bag's keep-restricted bank on `rows` — the per-bag raw
-/// scorer behind the prune guard's out-of-bag evidence, and the general "score this bank
+/// scorer behind the ranked path's out-of-bag evidence, and the general "score this bank
 /// restricted to a table keep-set on these rows" primitive.
 ///
 /// `keep = None` scores the FULL bag bank (every realized table, which reproduces that bag's
@@ -2132,7 +2132,7 @@ pub fn bag_score_variance_for_rows(
         .collect())
 }
 
-/// The prune guard's out-of-bag evidence, accumulated in ONE pass over the per-bag banks.
+/// The ranked path's out-of-bag evidence, accumulated in ONE pass over the per-bag banks.
 ///
 /// For every fit row `r`, the bags that never trained on `r` (`!Model::bag_in_bag[b][r]`) are
 /// its honest jury. This returns, per row, the sums over exactly that jury of
@@ -2142,11 +2142,10 @@ pub fn bag_score_variance_for_rows(
 ///   * `group_sums[g]`: the tables of table-group `g` ONLY (no intercept),
 ///
 /// plus `counts[r]` = the jury size. A caller reconstructs any prefix union of the groups as
-/// `(f0_sum[r] + Σ_{g ≤ k} group_sums[g][r]) / counts[r]`, which is why the guard can pass its
-/// whole re-admission ladder (keep-set, then each doubling chunk, in rank order) as groups and
-/// evaluate every rung from a single pass — table scores are ADDITIVE, so no rung needs its own
-/// bank build. Rows with `counts[r] == 0` (no bag left them out) carry zeros and must be
-/// dropped by the caller.
+/// `(f0_sum[r] + Σ_{g ≤ k} group_sums[g][r]) / counts[r]`, which is why the ranked path can pass
+/// its admission sequence as groups and score every prefix from a single pass — table scores
+/// are ADDITIVE, so no prefix needs its own bank build. Rows with `counts[r] == 0` (no bag left
+/// them out) carry zeros and must be dropped by the caller.
 ///
 /// Why the mean over the jury is the right estimator: each bag bank is that bag's standalone-
 /// scale effect surface, and the mean over ALL bags reproduces the soup's deployed bank
@@ -3367,47 +3366,11 @@ fn reanchor_logit_link(
 }
 
 // =============================================================================================
-// Multiclass (K>=3) set-level prune no-harm guard — the softmax analogue of the single-output
-// guard that `TBoostRegressor._fit_and_prune` runs in Python (sklearn.py, "Set-level prune
-// no-harm guard"). It lives in Rust because the K>=3 fit-select-deploy flow is orchestrated
-// entirely inside `fit_multiclass_pruned_owned`: that is the only place the deployed
-// `MultiClassModel` (pre-keepset, with its bag partition and membership) and the selection
-// report are both in hand.
-//
-// WHY IT EXISTS. The keep-set is chosen from PER-TABLE leave-one-out held-out gains, which are
-// structurally blind to mass carried JOINTLY by correlated tables: each table's marginal
-// drop-gain is ~0 when its siblings absorb the signal, so a whole correlated family can be
-// dropped while the fold evidence says the total cost is ~0. On the single-output path that
-// mis-selection was measured detonating a split by +23% test deviance. Nobody had ever
-// measured it on a K>=3 fit, because no guard existed there.
-//
-// THE EVIDENCE. Out-of-bag, exactly as the ungrouped single-output path: for each fit row `r`
-// the bags that never drew `r` are its honest jury, and the jury mean of the per-bag per-class
-// banks is an unbiased estimate of the deployed per-class logit at `r` (purify is linear at a
-// fixed grid/measure, so the mean over ALL bags reproduces the soup's bank). A K>=3 bag draws
-// its rows ONCE and fits all K columns on that subset, so the K classes share one membership
-// vector and therefore one jury per row — the softmax over the per-class jury means is a
-// coherent probability vector, not K independently-sampled ones. `fit_multiclass_bagged`
-// publishes that membership on every per-class soup for this reason.
-//
-// BOTH ARMS ARE RE-ANCHORED before they are measured (`multiclass_intercept_shifts`), for the
-// same reason the single-output guard re-anchors: dropping most of the tables moves the
-// empirical class balance a lot (purification centres under the REFERENCE measure, not the
-// empirical one), and the shipped artifact carries that correction — `prune_multiclass_to_
-// keepset` re-anchors the deployed banks. Measuring un-anchored arms would test a level
-// artifact the shipped model does not have. `level_shift_*` reports the correction so the
-// artifact stays visible.
-//
-// HONEST LIMITS, mirroring the single-output guard's:
-//   * A ~2-bag jury is noisier than the deployed 8-bag soup, and that variance sits in BOTH
-//     arms — the measured ratio is diluted toward 1, so the bias errs toward SILENCE.
-//   * Neither arm carries the deploy re-anchor's *full* pipeline: they are raw jury-mean banks
-//     plus the intercept IPF. There is no rebalance or graduation on the K>=3 path at all, so
-//     unlike the single-output OOB path there is no selected-arm-only correction being omitted
-//     here — the two arms are treated symmetrically.
-//   * The SELECTION is not honest with respect to this evidence (the keep-set was voted on by
-//     folds of the selection slice, and the deploy fit saw every row). The guard's job is to
-//     catch a catastrophic set-level miss, not to be an unbiased generalization estimate.
+// Multiclass (K>=3) out-of-bag evidence, on which the K>=3 ranked path scores its prefixes. A
+// K>=3 bag draws its rows ONCE and fits all K columns on that subset, so the K classes share one
+// membership vector and one jury per row: the softmax over the per-class jury means is a coherent
+// probability vector, not K independently-sampled ones. `fit_multiclass_bagged` publishes that
+// membership on every per-class soup for this reason.
 // =============================================================================================
 
 /// Per-class out-of-bag evidence for a bagged [`MultiClassModel`], plus the shared jury size.
@@ -3495,253 +3458,6 @@ pub fn multiclass_bag_oob_group_sums_with(
     Ok(MulticlassOobEvidence { per_class, counts })
 }
 
-/// The report-ranked re-admission ladder: dropped tables ordered by `mean_gain` descending and
-/// cut into DOUBLING chunks (the first chunk is at most `|keep|` tables, then the grown keep-set
-/// is the next chunk's cap, and so on). A dropped main effect (main-effect pruning) moves up to
-/// just before the first dropped interaction that contains it, so no rung re-admits an
-/// interaction without its main effects.
-///
-/// Fixing the ladder BEFORE any evidence is scored is what lets the guard price every rung from
-/// a single pass over the per-bag banks: rung `k` is the prefix union of chunks `0..k`, and
-/// table scores are additive. This is the same rule the single-output Python guard uses.
-#[must_use]
-pub fn guard_readmission_chunks(
-    keep: &[FeatureSet],
-    table_scores: &[PruneTableScore],
-) -> Vec<Vec<FeatureSet>> {
-    guard_readmission_chunks_with_growth(keep, table_scores, 1.0)
-}
-
-/// [`guard_readmission_chunks`] with a finer ladder: each rung grows the kept set by `growth`
-/// times its current size (`1.0` is the doubling ladder above; `0.2` re-admits 20% more tables
-/// per rung, so a guard that fires lands near the SMALLEST keep-set within its bar instead of
-/// overshooting to the next power of two — the K>=3 guard uses this, since its selection can
-/// under-keep by a factor of four on a 700-table bank and the doubling ladder then jumps
-/// straight past the honest optimum, measured on fremotor_payfreq 2026-09-07).
-#[must_use]
-pub fn guard_readmission_chunks_with_growth(
-    keep: &[FeatureSet],
-    table_scores: &[PruneTableScore],
-    growth: f64,
-) -> Vec<Vec<FeatureSet>> {
-    guard_readmission_chunks_ranked(keep, table_scores, growth, |t| t.mean_gain)
-}
-
-/// The K>=3 ladder: rungs ordered by the DEPLOY bank's purified table variance (largest first)
-/// rather than by selection-time drop-gain. The CV selection's fold models are unbagged and
-/// realize far fewer supports than the bagged deploy soup (fremotor_payfreq 2026-09-07: ~265
-/// per fold against 698 deployed), so most dropped deploy tables carry NO fold evidence and a
-/// gain-ranked ladder re-admits them last — after every table that merely looked good on a
-/// fold. Variance is the deploy model's own signal size and the ordering the
-/// price-of-simplicity probes found robust on every panel.
-#[must_use]
-pub fn guard_readmission_chunks_by_variance(
-    keep: &[FeatureSet],
-    table_scores: &[PruneTableScore],
-    growth: f64,
-) -> Vec<Vec<FeatureSet>> {
-    guard_readmission_chunks_ranked(keep, table_scores, growth, |t| t.variance)
-}
-
-fn guard_readmission_chunks_ranked(
-    keep: &[FeatureSet],
-    table_scores: &[PruneTableScore],
-    growth: f64,
-    rank: impl Fn(&PruneTableScore) -> f64,
-) -> Vec<Vec<FeatureSet>> {
-    let kept: std::collections::BTreeSet<&FeatureSet> = keep.iter().collect();
-    let mut ranked: Vec<&FeatureSet> = table_scores
-        .iter()
-        .map(|t| &t.u)
-        .filter(|u| !kept.contains(*u))
-        .collect();
-    // Stable sort by mean_gain desc, keyed by position so equal gains keep report order (the
-    // Python guard's `sorted(..., key=-mean_gain)` is likewise stable).
-    let gain: BTreeMap<&FeatureSet, f64> = table_scores.iter().map(|t| (&t.u, rank(t))).collect();
-    ranked.sort_by(|a, b| {
-        gain[b]
-            .partial_cmp(&gain[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    ranked.dedup();
-    let ranked = mains_before_their_interactions(ranked);
-    let mut chunks: Vec<Vec<FeatureSet>> = Vec::new();
-    let mut grown = keep.len();
-    let mut rest: &[&FeatureSet] = &ranked;
-    while !rest.is_empty() {
-        // `growth * grown`, rounded up, never below one table — with `growth = 1.0` this is the
-        // historical doubling ladder byte for byte.
-        let step = (growth * grown as f64).ceil().max(1.0) as usize;
-        let take = step.clamp(1, rest.len());
-        chunks.push(rest[..take].iter().map(|u| (*u).clone()).collect());
-        rest = &rest[take..];
-        grown += take;
-    }
-    chunks
-}
-
-/// `ranked` with each main effect in it moved to just before the first interaction in it that
-/// contains that feature (or left where it is if it already comes first). The identity when
-/// `ranked` holds no main effect, which is every ladder over sticky mains.
-fn mains_before_their_interactions(ranked: Vec<&FeatureSet>) -> Vec<&FeatureSet> {
-    let mains: BTreeMap<u32, &FeatureSet> = ranked
-        .iter()
-        .filter(|u| u.order() == 1)
-        .filter_map(|u| u.0.first().map(|f| (f.0, *u)))
-        .collect();
-    if mains.is_empty() {
-        return ranked;
-    }
-    let mut placed: std::collections::BTreeSet<&FeatureSet> = std::collections::BTreeSet::new();
-    let mut out: Vec<&FeatureSet> = Vec::with_capacity(ranked.len());
-    for u in ranked {
-        if u.order() > 1 {
-            for f in &u.0 {
-                if let Some(&main) = mains.get(&f.0) {
-                    if placed.insert(main) {
-                        out.push(main);
-                    }
-                }
-            }
-        }
-        if placed.insert(u) {
-            out.push(u);
-        }
-    }
-    out
-}
-
-/// Rung growth of the K>=3 guard's re-admission ladder (see
-/// [`guard_readmission_chunks_with_growth`]): each rung re-admits 20% more tables.
-pub const MULTICLASS_GUARD_LADDER_GROWTH: f64 = 0.2;
-
-/// What the multiclass guard did, serialized into `pruning_report_["guard"]`.
-#[derive(Debug, Clone, Serialize)]
-pub struct MulticlassGuardReport {
-    /// Whether the guard was asked to run at all.
-    pub enabled: bool,
-    /// Whether the breach test tripped and the keep-set grew.
-    pub fired: bool,
-    /// Evidence estimator actually used (`"oob"`), or `None` when skipped.
-    pub evidence: Option<String>,
-    /// Why no evidence was scored (`None` when the guard ran).
-    pub skipped: Option<String>,
-    /// Rows carrying at least one out-of-bag bag.
-    pub oob_rows: u64,
-    /// Fit rows every bag drew (no jury, dropped from the evidence).
-    pub oob_rows_uncovered: u64,
-    /// Mean jury size over the covered rows.
-    pub oob_mean_jury: f64,
-    /// Bags in the deployed soup.
-    pub n_bags: u64,
-    /// Relative-deviance tolerance the breach test used.
-    pub tol: f64,
-    /// Weighted mean multinomial deviance of the FULL arm — every candidate table id the
-    /// selector could have kept — re-anchored. This is the breach threshold's base.
-    pub dev_full: f64,
-    /// Diagnostic: the same, for the deploy soup's WHOLE realized bank (which can carry
-    /// supports the selection fit never grew, so no keep-set can reach it). A large
-    /// `dev_bank` < `dev_full` gap means the deploy fit found structure the selector never
-    /// voted on — worth knowing, never the guard's threshold.
-    pub dev_bank: f64,
-    /// Same, for the selected keep-set before any re-admission.
-    pub dev_selected_initial: f64,
-    /// Same, for the keep-set actually shipped.
-    pub dev_selected_final: f64,
-    /// Tables in the keep-set before / after the ladder.
-    pub kept_initial: u64,
-    /// Tables in the shipped keep-set.
-    pub kept_final: u64,
-    /// Re-admission chunks consumed (`0` ⇒ silent).
-    pub steps: u64,
-    /// Rungs the ladder could have offered.
-    pub rungs_available: u64,
-    /// Per-class intercept re-anchor applied to the SELECTED arm — the level artifact the guard
-    /// would otherwise have been testing.
-    pub level_shift_selected: Vec<f64>,
-    /// Same, for the full-bank arm.
-    pub level_shift_full: Vec<f64>,
-    /// Weighted mean over evidence rows of the per-row standard deviation of the K class
-    /// logits, for the shipped keep-set. Compare with `spread_full`: a ratio below 1 is the
-    /// COMPRESSION a slope/temperature re-anchor would exist to undo.
-    pub spread_selected: f64,
-    /// Same, for the full-bank arm.
-    pub spread_full: f64,
-    /// The softmax analogue of the single-output post-prune SLOPE, MEASURED but never applied:
-    /// the shared temperature `b` minimizing the honest-row deviance of `softmax(a_k(b) + b·F_k)`
-    /// over the shipped bank's class logits, with the intercepts `a_k(b)` re-solved at each `b`
-    /// (profile likelihood — the intercepts are the re-anchor the artifact already carries, so
-    /// `b` is the only free scale). `b = 1` is the shipped model. See
-    /// `slope_gain` for what it would be worth.
-    ///
-    /// READ IT AGAINST [`Self::slope_b_full`], NOT AGAINST 1. On the out-of-bag path the arm
-    /// measured is a ~2-bag JURY MEAN, and averaging fewer models shrinks the score spread, so
-    /// the ABSOLUTE temperature of any OOB arm is biased above 1 by the jury size alone —
-    /// measured `b ≈ 1.12` on an arm whose spread ratio against the full bank is 0.9994, i.e.
-    /// essentially all artifact. The single-output slope handles exactly this by measuring the
-    /// keep-set's slope RELATIVE to the full bank on the same rows with the same estimator; the
-    /// ratio `slope_b / slope_b_full` is that relative statistic here, and it is the number a
-    /// decision may be taken on. On the carve path there is no jury, so both are absolute.
-    pub slope_b: f64,
-    /// The same profile temperature fitted to the FULL arm — the reference that cancels the
-    /// out-of-bag jury-shrinkage bias out of [`Self::slope_b`] (see its note).
-    pub slope_b_full: f64,
-    /// Honest-row deviance at `slope_b` minus the deviance at `b = 1`, i.e. the (non-positive)
-    /// improvement a temperature re-anchor could buy on the rows it was fitted on — an
-    /// OPTIMISTIC bound, since `b` is chosen on exactly those rows. A `slope_b` within a
-    /// fraction of a percent of 1 with a `slope_gain` in the 1e-5 range is the signature of a
-    /// prune that does not compress the class-score scale, and therefore of a slope re-anchor
-    /// with nothing to undo.
-    pub slope_gain: f64,
-    /// Wall-clock seconds spent building the per-class per-bag evidence.
-    pub evidence_seconds: f64,
-    /// Intercept-only (class-prior) deviance on the evidence rows — the skill scale's zero.
-    pub dev_null: f64,
-    /// Paired per-row standard error of the selected-minus-full loss on the evidence rows.
-    pub gap_se: f64,
-    /// The bar the guard actually used, in deviance units above `dev_full`.
-    pub bar: f64,
-}
-
-impl MulticlassGuardReport {
-    /// A guard report for a fit the guard could not measure: `enabled` as asked, nothing fired,
-    /// and `why` recorded so the skip is visible in `pruning_report_["guard"]` rather than
-    /// silently indistinguishable from a silent guard.
-    #[must_use]
-    pub fn skipped(enabled: bool, why: &str) -> Self {
-        Self {
-            enabled,
-            fired: false,
-            evidence: None,
-            skipped: Some(why.to_string()),
-            oob_rows: 0,
-            oob_rows_uncovered: 0,
-            oob_mean_jury: 0.0,
-            n_bags: 0,
-            tol: 0.0,
-            dev_full: f64::NAN,
-            dev_bank: f64::NAN,
-            dev_selected_initial: f64::NAN,
-            dev_selected_final: f64::NAN,
-            kept_initial: 0,
-            kept_final: 0,
-            steps: 0,
-            rungs_available: 0,
-            level_shift_selected: Vec::new(),
-            level_shift_full: Vec::new(),
-            spread_selected: f64::NAN,
-            spread_full: f64::NAN,
-            slope_b: f64::NAN,
-            slope_b_full: f64::NAN,
-            slope_gain: f64::NAN,
-            evidence_seconds: 0.0,
-            dev_null: f64::NAN,
-            gap_se: f64::NAN,
-            bar: f64::NAN,
-        }
-    }
-}
-
 /// Weighted mean multinomial deviance (`-Σ w·ln p_y / Σ w`) over `raw` (`[class][row]`).
 ///
 /// NOTE the divisor: [`crate::engine::boost::multiclass_deviance_for_rows`] ALREADY returns the
@@ -3755,60 +3471,12 @@ fn multiclass_mean_deviance(raw: &[Vec<f64>], labels: &[u32], w: &[f32]) -> Resu
     crate::engine::boost::multiclass_deviance_for_rows(&cols, labels, w, &rows)
 }
 
-/// Weighted mean over rows of the per-row standard deviation of the K class logits — the scale
-/// statistic the slope/temperature question turns on (see [`MulticlassGuardReport::spread_selected`]).
-fn multiclass_mean_spread(raw: &[Vec<f64>], w: &[f32]) -> f64 {
-    let n_classes = raw.len();
-    if n_classes == 0 {
-        return f64::NAN;
-    }
-    let n = raw[0].len();
-    let mut acc = 0.0_f64;
-    let mut mass = 0.0_f64;
-    for i in 0..n {
-        let mut m = 0.0_f64;
-        for k in 0..n_classes {
-            m += raw[k][i];
-        }
-        m /= n_classes as f64;
-        let mut v = 0.0_f64;
-        for k in 0..n_classes {
-            let d = raw[k][i] - m;
-            v += d * d;
-        }
-        let sd = (v / n_classes as f64).sqrt();
-        let wi = f64::from(w[i]);
-        acc += wi * sd;
-        mass += wi;
-    }
-    if mass > 0.0 {
-        acc / mass
-    } else {
-        f64::NAN
-    }
-}
-
-/// Which honest rows the multiclass guard measures on.
-#[derive(Debug, Clone, Copy)]
-pub enum MulticlassGuardEvidence<'a> {
-    /// Out-of-bag jury means over the deploy soup's per-class bag banks. Honest exactly when no
-    /// group can straddle the in-bag/out-of-bag boundary — bags are drawn at ROW granularity,
-    /// so this is for UNGROUPED fits (and degenerate all-singleton groupings). Costs the fit
-    /// nothing: no carve, and at the shipped `n_bags=8` most rows get a jury.
-    OutOfBag,
-    /// The shared group-honest ES holdout the deploy fit already keeps out of every bag (mask
-    /// over fit rows). The panel analogue: an out-of-bag row's panel-mates are almost surely in
-    /// bag, which is the memorization the group carve exists to stop, so OOB is NOT honest
-    /// there and the carve stays the evidence.
-    Carve(&'a [bool]),
-}
-
-/// The evidence arms, materialized over the chosen rows: the full-bank arm and one arm per
-/// ladder rung group, all on the link scale, `[class][evidence row]`.
-pub struct GuardArms {
-    /// Fit-row indices that carry evidence (a jury, or the carve).
+/// The K>=3 out-of-bag evidence, materialized over the rows that have a jury: the full-bank arm
+/// and one arm per table group, all on the link scale, `[class][evidence row]`.
+pub struct OobArms {
+    /// Fit-row indices that carry evidence (at least one out-of-bag bag).
     pub rows: Vec<usize>,
-    /// Jury size per evidence row (all `1` on the carve path).
+    /// Jury size per evidence row.
     pub counts: Vec<f64>,
     /// Full-model logits `[class][row]` (intercept + every table).
     pub full: Vec<Vec<f64>>,
@@ -3999,7 +3667,7 @@ pub fn multiclass_ranked_path(
     }
     let mass = measure_mass(&w_measure, w, None);
     // The path reads the intercept and group arms only, so the full-bank arm is not scored.
-    let arms = guard_arms_oob_with(mc, serve, w_measure, mass.as_deref(), &groups, false)?;
+    let arms = oob_arms_with(mc, serve, w_measure, mass.as_deref(), &groups, false)?;
     if arms.rows.len() < min_rows {
         return Ok(None);
     }
@@ -4055,27 +3723,17 @@ pub fn multiclass_ranked_path(
     )))
 }
 
-/// Out-of-bag arms: the jury mean of each class's per-bag banks (see the module note above).
-pub fn guard_arms_oob(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    w_measure: RefMeasure,
-    mass: Option<&[f32]>,
-    groups: &[Vec<FeatureSet>],
-) -> Result<GuardArms, PbError> {
-    guard_arms_oob_with(mc, serve, w_measure, mass, groups, true)
-}
-
-/// [`guard_arms_oob`] with the full-bank arm optional: `with_full = false` leaves `full` at
-/// zero (see [`bag_oob_group_sums_with`]) for a caller that never reads it.
-fn guard_arms_oob_with(
+/// The jury-mean [`OobArms`] of a bagged multiclass soup for the table `groups`. With
+/// `with_full = false` the full-bank arm stays at zero (see [`bag_oob_group_sums_with`]) for a
+/// caller that never reads it.
+fn oob_arms_with(
     mc: &MultiClassModel,
     serve: &ServeBinnedMatrix,
     w_measure: RefMeasure,
     mass: Option<&[f32]>,
     groups: &[Vec<FeatureSet>],
     with_full: bool,
-) -> Result<GuardArms, PbError> {
+) -> Result<OobArms, PbError> {
     let ev = multiclass_bag_oob_group_sums_with(mc, serve, w_measure, mass, groups, with_full)?;
     let rows: Vec<usize> = ev
         .counts
@@ -4100,436 +3758,13 @@ fn guard_arms_oob_with(
     let group: Vec<Vec<Vec<f64>>> = (0..groups.len())
         .map(|g| mean_of(ev.per_class.iter().map(|p| &p.group_sums[g]).collect()))
         .collect();
-    Ok(GuardArms {
+    Ok(OobArms {
         rows,
         counts,
         full,
         group,
         f0,
     })
-}
-
-/// Carve arms: one purified bank per class (the deploy fit's own), scored on the held-out rows
-/// whole and per ladder group. `retain_tables` is a cheap filter, so every rung is priced from
-/// the SAME K banks — no rung needs its own bank build, exactly as the out-of-bag path's
-/// additivity buys there.
-pub fn guard_arms_carve(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    w_measure: RefMeasure,
-    mass: Option<&[f32]>,
-    groups: &[Vec<FeatureSet>],
-    mask: &[bool],
-) -> Result<GuardArms, PbError> {
-    let n = serve.0.n_rows as usize;
-    if mask.len() != n {
-        return Err(PbError::ShapeMismatch {
-            what: format!(
-                "guard carve mask covers {} rows but the deploy serve has {n}",
-                mask.len()
-            ),
-        });
-    }
-    let rows: Vec<usize> = (0..n).filter(|&r| mask[r]).collect();
-    let row_u32: Vec<u32> = rows.iter().map(|&r| r as u32).collect();
-    let n_classes = mc.classes.len();
-    // One bank per class, scored on the carve rows — classes in parallel, collected in class
-    // order (deterministic; each class's numbers are its own).
-    type ClassArm = (Vec<f64>, f64, Vec<Vec<f64>>);
-    let per_class: Vec<ClassArm> = mc
-        .classes
-        .par_iter()
-        .map(|model| -> Result<ClassArm, PbError> {
-            let bank = model.explain_bank_with_mass(
-                serve,
-                w_measure.clone(),
-                crate::explain::TableBudget::default(),
-                false,
-                mass,
-            )?;
-            let group_banks: Vec<TableBank> = groups
-                .iter()
-                .map(|g| {
-                    let mut b = retain_tables(&bank, g);
-                    b.f0 = 0.0;
-                    b
-                })
-                .collect();
-            let mut banks: Vec<&TableBank> = Vec::with_capacity(groups.len() + 1);
-            banks.push(&bank);
-            banks.extend(group_banks.iter());
-            let width = banks.len();
-            let mut flat = vec![0.0_f64; row_u32.len() * width];
-            crate::scoring::score_banks_rows(
-                &banks,
-                &model.schema.cat_encoders,
-                &serve.0,
-                &row_u32,
-                &mut flat,
-            )?;
-            let full_c: Vec<f64> = (0..rows.len()).map(|i| flat[i * width]).collect();
-            let groups_c: Vec<Vec<f64>> = (0..groups.len())
-                .map(|g| (0..rows.len()).map(|i| flat[i * width + g + 1]).collect())
-                .collect();
-            Ok((full_c, bank.f0, groups_c))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut full: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
-    let mut f0: Vec<Vec<f64>> = Vec::with_capacity(n_classes);
-    let mut group: Vec<Vec<Vec<f64>>> = (0..groups.len()).map(|_| Vec::new()).collect();
-    for (full_c, f0_c, groups_c) in per_class {
-        full.push(full_c);
-        f0.push(vec![f0_c; rows.len()]);
-        for (g, slot) in group.iter_mut().enumerate() {
-            slot.push(groups_c[g].clone());
-        }
-    }
-    Ok(GuardArms {
-        counts: vec![1.0; rows.len()],
-        rows,
-        full,
-        group,
-        f0,
-    })
-}
-
-/// The shared-temperature profile likelihood: scan `b`, re-solving the per-class intercepts at
-/// each candidate (so `b` is the only free scale, the intercepts being the re-anchor the shipped
-/// artifact already carries), and return `(b*, dev(b*) - dev_at_one)`.
-///
-/// A coarse geometric bracket followed by a fixed golden-section refinement — deterministic, no
-/// convergence test, no derivative of a function whose intercepts are themselves an inner solve.
-/// `raw` is the UN-anchored `[class][row]` score of the bank in question.
-///
-/// # Errors
-/// Propagated deviance/re-anchor failures.
-fn multiclass_profile_temperature(
-    raw: &[Vec<f64>],
-    labels: &[u32],
-    w: &[f32],
-    dev_at_one: f64,
-) -> Result<(f64, f64), PbError> {
-    let dev_at = |b: f64| -> Result<f64, PbError> {
-        let mut scaled: Vec<Vec<f64>> = raw
-            .iter()
-            .map(|c| c.iter().map(|&v| v * b).collect())
-            .collect();
-        let shift = multiclass_intercept_shifts(&scaled, labels, w, "slope probe")?;
-        for (k, s) in shift.iter().enumerate() {
-            for v in &mut scaled[k] {
-                *v += s;
-            }
-        }
-        multiclass_mean_deviance(&scaled, labels, w)
-    };
-    // Coarse bracket over a geometric grid spanning half to double the shipped scale.
-    const GRID: [f64; 11] = [0.5, 0.65, 0.8, 0.9, 0.95, 1.0, 1.05, 1.1, 1.25, 1.5, 2.0];
-    let mut best = (1.0_f64, dev_at_one);
-    for &b in &GRID {
-        let d = dev_at(b)?;
-        if d < best.1 {
-            best = (b, d);
-        }
-    }
-    // Golden-section refinement inside the bracketing grid cell (fixed 24 iterations: the
-    // interval shrinks by 0.618 each time, so this pins b to ~1e-5 of the cell width).
-    let idx = GRID.iter().position(|&g| g == best.0);
-    let (mut lo, mut hi) = match idx {
-        Some(i) => (
-            GRID.get(i.saturating_sub(1)).copied().unwrap_or(GRID[0]),
-            GRID.get(i + 1).copied().unwrap_or(2.0),
-        ),
-        None => (0.9, 1.1),
-    };
-    const INV_PHI: f64 = 0.618_033_988_749_894_9;
-    let mut c = hi - (hi - lo) * INV_PHI;
-    let mut d = lo + (hi - lo) * INV_PHI;
-    let (mut fc, mut fd) = (dev_at(c)?, dev_at(d)?);
-    for _ in 0..24 {
-        if fc < fd {
-            hi = d;
-            d = c;
-            fd = fc;
-            c = hi - (hi - lo) * INV_PHI;
-            fc = dev_at(c)?;
-        } else {
-            lo = c;
-            c = d;
-            fc = fd;
-            d = lo + (hi - lo) * INV_PHI;
-            fd = dev_at(d)?;
-        }
-    }
-    let b = 0.5 * (lo + hi);
-    let dev_b = dev_at(b)?;
-    if dev_b < best.1 {
-        best = (b, dev_b);
-    }
-    Ok((best.0, best.1 - dev_at_one))
-}
-
-/// Run the multiclass set-level no-harm guard and return the keep-set to ship.
-///
-/// `keep` is the honestly-selected keep-set; `table_scores` is the selection report's per-table
-/// diagnostics (the re-admission ranking). The returned keep-set is either `keep` unchanged
-/// (the silent case — the shipped artifact is then byte-identical to a guard-off fit) or `keep`
-/// grown by whole ranked chunks until the selected bank's multinomial deviance on the honest
-/// rows is within `tol` of the full bank's. Only the keep-set ever grows; binary table dropping
-/// is preserved.
-///
-/// # Errors
-/// Propagated evidence/bank/scoring failures. A model that cannot supply evidence is NOT an
-/// error — it returns `keep` with a `skipped` report.
-pub fn multiclass_prune_guard(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    labels: &[u32],
-    w: &[f32],
-    w_measure: RefMeasure,
-    keep: &[FeatureSet],
-    table_scores: &[PruneTableScore],
-    evidence: MulticlassGuardEvidence<'_>,
-    tol: f64,
-    min_rows: usize,
-    guard_z: f64,
-    guard_floor: f64,
-) -> Result<(Vec<FeatureSet>, MulticlassGuardReport), PbError> {
-    // ASK, don't catch (see the single-output guard's note): a model with no bag partition or
-    // membership is a legitimate "no evidence" outcome, but anything the evidence pass itself
-    // raises is a real bug and must surface.
-    if matches!(evidence, MulticlassGuardEvidence::OutOfBag)
-        && !multiclass_bag_oob_evidence_available(mc)
-    {
-        return Ok((
-            keep.to_vec(),
-            MulticlassGuardReport::skipped(true, "no out-of-bag evidence (single-bag fit)"),
-        ));
-    }
-    let chunks =
-        guard_readmission_chunks_by_variance(keep, table_scores, MULTICLASS_GUARD_LADDER_GROWTH);
-    // Group 0 is the FULL arm: every table id the selector had on the table (the keep-set plus
-    // everything it dropped). It is NOT the deploy bag's whole realized bank — the deploy fit is
-    // a second, full-data fit and can realize supports the selection fit never saw, which no
-    // keep-set can ever name. Comparing against those would make the ladder structurally unable
-    // to clear its own threshold. `dev_bank` below reports the whole-bank deviance anyway so
-    // that structural gap stays visible instead of being quietly defined away.
-    let mut all_ids: Vec<FeatureSet> = keep.to_vec();
-    for chunk in &chunks {
-        all_ids.extend(chunk.iter().cloned());
-    }
-    let mut groups: Vec<Vec<FeatureSet>> = Vec::with_capacity(chunks.len() + 2);
-    groups.push(all_ids);
-    groups.push(keep.to_vec());
-    groups.extend(chunks.iter().cloned());
-
-    let t_ev = std::time::Instant::now();
-    let mass = measure_mass(&w_measure, w, None);
-    let (arms, tag) = match evidence {
-        MulticlassGuardEvidence::OutOfBag => (
-            guard_arms_oob(mc, serve, w_measure, mass.as_deref(), &groups)?,
-            "oob",
-        ),
-        MulticlassGuardEvidence::Carve(mask) => (
-            guard_arms_carve(mc, serve, w_measure, mass.as_deref(), &groups, mask)?,
-            "carve",
-        ),
-    };
-    let evidence_seconds = t_ev.elapsed().as_secs_f64();
-
-    let n_classes = mc.classes.len();
-    let n_bags = mc
-        .classes
-        .first()
-        .and_then(|m| m.bag_spans.as_ref())
-        .map_or(0, Vec::len);
-    let n_val = arms.rows.len();
-    let mut report = MulticlassGuardReport::skipped(true, "");
-    report.n_bags = n_bags as u64;
-    report.tol = tol;
-    report.oob_rows = n_val as u64;
-    report.oob_rows_uncovered = ((serve.0.n_rows as usize) - n_val) as u64;
-    report.kept_initial = keep.len() as u64;
-    report.kept_final = keep.len() as u64;
-    report.rungs_available = chunks.len() as u64;
-    report.evidence_seconds = evidence_seconds;
-    if n_val < min_rows {
-        report.skipped = Some(format!("evidence rows {n_val} < {min_rows} [{tag}]"));
-        return Ok((keep.to_vec(), report));
-    }
-    report.skipped = None;
-    report.evidence = Some(tag.into());
-
-    let ev_labels: Vec<u32> = arms.rows.iter().map(|&r| labels[r]).collect();
-    let ev_w: Vec<f32> = arms.rows.iter().map(|&r| w[r]).collect();
-    report.oob_mean_jury = arms.counts.iter().sum::<f64>() / (n_val as f64);
-
-    // Full arm: the intercept plus group 0 (every candidate id). Rung 0 is the deployed
-    // keep-set; each further rung adds one chunk. Every rung is the running PREFIX union from
-    // group 1 on, so the intercept enters once and each group accumulates on top.
-    let mut raw_full = arms.f0.clone();
-    for k in 0..n_classes {
-        for i in 0..n_val {
-            raw_full[k][i] += arms.group[0][k][i];
-        }
-    }
-    let mut rungs: Vec<Vec<Vec<f64>>> = Vec::with_capacity(groups.len() - 1);
-    let mut acc = arms.f0.clone();
-    for g in 1..groups.len() {
-        for k in 0..n_classes {
-            for i in 0..n_val {
-                acc[k][i] += arms.group[g][k][i];
-            }
-        }
-        rungs.push(acc.clone());
-    }
-    // Diagnostic only: the deploy soup's WHOLE realized bank, which includes supports the
-    // selection fit never grew and no keep-set can name. Never the breach threshold.
-    let mut raw_bank = arms.full.clone();
-    let shift_bank = multiclass_intercept_shifts(&raw_bank, &ev_labels, &ev_w, "guard bank arm")?;
-    for (k, s) in shift_bank.iter().enumerate() {
-        for v in &mut raw_bank[k] {
-            *v += s;
-        }
-    }
-    report.dev_bank = multiclass_mean_deviance(&raw_bank, &ev_labels, &ev_w)?;
-
-    // Both arms carry the deploy re-anchor before they are measured: dropping most of the
-    // tables moves the empirical class balance a lot (purification centres under the REFERENCE
-    // measure, not the empirical one) and the shipped artifact carries that correction, so an
-    // un-anchored comparison would test a level artifact the shipped model does not have.
-    let shift_full = multiclass_intercept_shifts(&raw_full, &ev_labels, &ev_w, "guard full arm")?;
-    for (k, s) in shift_full.iter().enumerate() {
-        for v in &mut raw_full[k] {
-            *v += s;
-        }
-    }
-    report.level_shift_full = shift_full;
-    report.dev_full = multiclass_mean_deviance(&raw_full, &ev_labels, &ev_w)?;
-    report.spread_full = multiclass_mean_spread(&raw_full, &ev_w);
-
-    // (deviance, per-class intercept shift, anchored raw logits) for rung `k`.
-    type AnchoredRung = (f64, Vec<f64>, Vec<Vec<f64>>);
-    let anchored_rung = |k: usize| -> Result<AnchoredRung, PbError> {
-        let mut raw = rungs[k].clone();
-        let shift = multiclass_intercept_shifts(&raw, &ev_labels, &ev_w, "guard selected arm")?;
-        for (c, s) in shift.iter().enumerate() {
-            for v in &mut raw[c] {
-                *v += s;
-            }
-        }
-        let dev = multiclass_mean_deviance(&raw, &ev_labels, &ev_w)?;
-        Ok((dev, shift, raw))
-    };
-
-    let (mut dev_sel, mut shift_sel, mut raw_sel) = anchored_rung(0)?;
-    report.dev_selected_initial = dev_sel;
-    // THE BAR. The raw relative tolerance `tol` alone can never fire on a multiclass log-loss:
-    // the loss is dominated by irreducible class entropy, so a prune that costs a quarter of the
-    // model's whole skill over the GLM moves the raw deviance by ~0.2% (measured 2026-09-07:
-    // pg16 0.16%, fremotor 0.26%, prudential 0.15% — against a 5% bar). So the bar is
-    // SE-aware, the K>=3 reading of the single-output guard's downward tightening
-    // (`_guard_tol_effective`): `bar = min(tol * dev_full, max(guard_z * SE(gap), guard_floor *
-    // (dev_null - dev_full)))`, where `SE(gap)` is the paired per-row standard error of the
-    // selected-minus-full loss on the evidence rows and `dev_null` the intercept-only loss there.
-    // `guard_z = 0` restores the raw bar exactly.
-    let raw_bar = report.dev_full * tol;
-    let sw: f64 = ev_w
-        .iter()
-        .map(|&x| f64::from(x))
-        .sum::<f64>()
-        .max(f64::MIN_POSITIVE);
-    let mut prior = vec![0.0_f64; n_classes];
-    for (l, &wi) in ev_labels.iter().zip(&ev_w) {
-        prior[*l as usize] += f64::from(wi);
-    }
-    let dev_null: f64 = ev_labels
-        .iter()
-        .zip(&ev_w)
-        .map(|(l, &wi)| -f64::from(wi) * (prior[*l as usize] / sw).max(f64::MIN_POSITIVE).ln())
-        .sum::<f64>()
-        / sw;
-    let floor_bar = guard_floor * (dev_null - report.dev_full).max(0.0);
-    let row_loss = |raw: &[Vec<f64>], i: usize| -> f64 {
-        let m = (0..n_classes)
-            .map(|k| raw[k][i])
-            .fold(f64::NEG_INFINITY, f64::max);
-        let lse = (0..n_classes)
-            .map(|k| (raw[k][i] - m).exp())
-            .sum::<f64>()
-            .ln()
-            + m;
-        lse - raw[ev_labels[i] as usize][i]
-    };
-    // The bar is evaluated PER RUNG: the paired SE of a rung's own gap, so a rung that has
-    // nearly closed the gap is judged by its own (small) uncertainty, not by the wide SE of the
-    // initial, badly under-kept arm.
-    let gap_and_bar = |raw_arm: &[Vec<f64>]| -> (f64, f64, f64) {
-        let d: Vec<f64> = (0..n_val)
-            .map(|i| row_loss(raw_arm, i) - row_loss(&raw_full, i))
-            .collect();
-        let gap = d
-            .iter()
-            .zip(&ev_w)
-            .map(|(di, &wi)| di * f64::from(wi))
-            .sum::<f64>()
-            / sw;
-        let se = (d
-            .iter()
-            .zip(&ev_w)
-            .map(|(di, &wi)| (f64::from(wi) * (di - gap)).powi(2))
-            .sum::<f64>()
-            / (sw * sw))
-            .sqrt();
-        let bar = if guard_z > 0.0 && se.is_finite() {
-            raw_bar.min((guard_z * se).max(floor_bar))
-        } else {
-            raw_bar
-        };
-        (gap, se, bar)
-    };
-    report.dev_null = dev_null;
-    let (mut gap, mut gap_se, mut bar) = gap_and_bar(&raw_sel);
-    let mut steps = 0_usize;
-    if gap.is_finite() && gap > bar {
-        while gap > bar && steps < chunks.len() {
-            steps += 1;
-            let (d, s, r) = anchored_rung(steps)?;
-            dev_sel = d;
-            shift_sel = s;
-            raw_sel = r;
-            let (g2, se2, bar2) = gap_and_bar(&raw_sel);
-            gap = g2;
-            gap_se = se2;
-            bar = bar2;
-        }
-        report.fired = true;
-    }
-    report.gap_se = gap_se;
-    report.bar = bar;
-    report.steps = steps as u64;
-    report.dev_selected_final = dev_sel;
-    report.level_shift_selected = shift_sel;
-    report.spread_selected = multiclass_mean_spread(&raw_sel, &ev_w);
-    // MEASURE the temperature, do not apply it. `rungs[final_k]` is the un-anchored score of
-    // exactly the bank that is about to ship, which is the only array here on which the
-    // question is honest (fitting a scale on an earlier rung and applying it to a bank the
-    // ladder later grew is catastrophic, not merely wasteful — the single-output slope's own
-    // note records a split where that took +0.0926 to +0.0091).
-    let (b, gain) = multiclass_profile_temperature(&rungs[steps], &ev_labels, &ev_w, dev_sel)?;
-    report.slope_b = b;
-    report.slope_gain = gain;
-    // The reference arm, fitted the same way on the same rows: `slope_b / slope_b_full` is the
-    // jury-bias-free relative scale (see `slope_b`'s note). `raw_full` is already re-anchored,
-    // which only shifts intercepts the profile re-solves anyway.
-    report.slope_b_full =
-        multiclass_profile_temperature(&raw_full, &ev_labels, &ev_w, report.dev_full)?.0;
-
-    let mut shipped = keep.to_vec();
-    for chunk in chunks.iter().take(steps) {
-        shipped.extend(chunk.iter().cloned());
-    }
-    report.kept_final = shipped.len() as u64;
-    Ok((shipped, report))
 }
 
 /// PROBE (2026-09-07): union of the realized supports across the K class banks, with the
@@ -4565,39 +3800,6 @@ pub fn multiclass_realized_supports(
         }
     }
     Ok(var.into_iter().collect())
-}
-
-/// PROBE (2026-09-07): the deploy soup's out-of-bag arms for arbitrary support groups —
-/// per-row mean out-of-bag logits of the intercept, the full model, and each group, over the
-/// rows that have a jury. Wraps [`guard_arms_oob`].
-pub fn multiclass_oob_arms(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    w_measure: RefMeasure,
-    w: &[f32],
-    groups: &[Vec<FeatureSet>],
-) -> Result<GuardArms, PbError> {
-    if !multiclass_bag_oob_evidence_available(mc) {
-        return Err(PbError::InvalidInput {
-            what: "out-of-bag arms need an in-memory bagged multiclass fit (n_bags >= 2)".into(),
-        });
-    }
-    let mass = measure_mass(&w_measure, w, None);
-    guard_arms_oob(mc, serve, w_measure, mass.as_deref(), groups)
-}
-
-/// PROBE (2026-09-07): carve arms — the same shape as [`multiclass_oob_arms`] but evaluated on
-/// the rows where `mask[i]` is true (a group-honest holdout every bag excluded), using the soup.
-pub fn multiclass_carve_arms(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    w_measure: RefMeasure,
-    w: &[f32],
-    groups: &[Vec<FeatureSet>],
-    mask: &[bool],
-) -> Result<GuardArms, PbError> {
-    let mass = measure_mass(&w_measure, w, None);
-    guard_arms_carve(mc, serve, w_measure, mass.as_deref(), groups, mask)
 }
 
 #[cfg(test)]
@@ -4636,84 +3838,6 @@ mod tests {
         RefMeasure,
     };
     use crate::loss::{Link, Logistic, LossId, ObjectiveTag, Poisson, SquaredError};
-
-    fn score(u: &[u32], gain: f64) -> PruneTableScore {
-        PruneTableScore {
-            u: FeatureSet::new(u),
-            order: u.len() as u8,
-            mean_gain: gain,
-            se_gain: 0.0,
-            variance: 0.0,
-            sticky: false,
-            selected: false,
-        }
-    }
-
-    #[test]
-    fn readmission_chunks_are_gain_ranked_and_double() {
-        // The ladder is fixed before any evidence is scored: dropped tables in mean_gain order,
-        // cut into chunks capped by the GROWN keep-set size (1 kept -> 1, 2, 4, ...). This is
-        // what lets the guard price every rung from one pass over the banks.
-        let keep: Vec<FeatureSet> = vec![score(&[0], 0.0).u];
-        let scores: Vec<PruneTableScore> = vec![
-            score(&[0], 9.0), // already kept -> never a candidate
-            score(&[1], 0.1),
-            score(&[2], 0.5),
-            score(&[3], 0.3),
-            score(&[4], 0.4),
-            score(&[5], 0.2),
-            score(&[6], 0.6),
-            score(&[7], 0.05),
-        ];
-        let chunks = guard_readmission_chunks(&keep, &scores);
-        let ids: Vec<Vec<Vec<u32>>> = chunks
-            .iter()
-            .map(|c| {
-                c.iter()
-                    .map(|u| u.0.iter().map(|f| f.0).collect())
-                    .collect()
-            })
-            .collect();
-        // 7 candidates, |keep| = 1 -> chunk sizes 1, 2, 4 (the last is truncated by what is left).
-        assert_eq!(ids.len(), 3);
-        assert_eq!(ids[0].len(), 1);
-        assert_eq!(ids[1].len(), 2);
-        assert_eq!(ids[2].len(), 4);
-        // Strictly gain-descending across the flattened ladder.
-        let flat: Vec<u32> = ids.iter().flatten().map(|u| u[0]).collect();
-        assert_eq!(flat, vec![6, 2, 4, 3, 5, 1, 7]);
-    }
-
-    #[test]
-    fn readmission_chunks_are_empty_when_nothing_was_dropped() {
-        let keep: Vec<FeatureSet> = vec![score(&[0], 0.0).u, score(&[1], 0.0).u];
-        let scores = vec![score(&[0], 1.0), score(&[1], 2.0)];
-        assert!(guard_readmission_chunks(&keep, &scores).is_empty());
-    }
-
-    #[test]
-    fn readmission_ladder_puts_a_dropped_main_ahead_of_its_interactions() {
-        // Main-effect pruning can drop a main with the interactions that contain it. A rung that
-        // re-admitted (0, 3) without (3) would break hierarchy, so (3) moves up to just before
-        // the first interaction that needs it; everything else keeps its gain rank.
-        let keep: Vec<FeatureSet> = vec![FeatureSet::new(&[0]), FeatureSet::new(&[1])];
-        let scores = vec![
-            score(&[0, 3], 0.9),
-            score(&[1], 0.8), // kept: never a candidate
-            score(&[2], 0.7),
-            score(&[3], 0.1),
-            score(&[2, 3], 0.05),
-        ];
-        let flat: Vec<FeatureSet> = guard_readmission_chunks(&keep, &scores)
-            .into_iter()
-            .flatten()
-            .collect();
-        let want: Vec<FeatureSet> = [&[3][..], &[0, 3], &[2], &[2, 3]]
-            .iter()
-            .map(|u| FeatureSet::new(u))
-            .collect();
-        assert_eq!(flat, want);
-    }
 
     #[test]
     fn ranked_path_with_prunable_mains_admits_each_main_with_its_first_interaction() {

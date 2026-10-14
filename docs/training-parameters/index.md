@@ -344,7 +344,8 @@ between one table and all the candidate tables. Used only by the `ranked_path` s
 
 ### [prune_guard_min_rows](pruning.md#prune_guard_min_rows)
 
-The minimum number of objects with honest evidence needed to judge the tables on.
+The minimum number of objects that are out of bag for at least one bag, needed to score the
+prefixes of the `ranked_path` selector. With fewer, the ranked path is not used.
 
 ### [prune_rebalance](pruning.md#prune_rebalance)
 
@@ -446,48 +447,6 @@ build some of the tables the deployed model has, and those tables then get no ev
 fold. With this parameter, the missing tables are given values in each fold by a ridge fit on the
 fold's training objects, so every candidate gets a held-out gain.
 
-### [prune_guard](pruning-fold-vote.md#prune_guard)
-
-Check the selected set of tables as a whole. The selection judges tables one at a time, so it can
-drop a group of correlated tables that only matter together. The guard compares the deviance of
-the selected set with that of the full set on honest objects (the out-of-bag objects, or a
-shared holdout for grouped data). If the relative gap exceeds the tolerance, dropped tables are
-added back, best evidence first, until it does not.
-
-### [prune_guard_tol](pruning-fold-vote.md#prune_guard_tol)
-
-The tolerance of the [no-harm guard](pruning-fold-vote.md#prune_guard): the largest acceptable relative increase of
-the deviance of the selected set over the full set.
-
-### [prune_guard_z](pruning-fold-vote.md#prune_guard_z)
-
-The multiplier of the standard error that can raise the guard's tolerance above
-[`prune_guard_tol`](pruning-fold-vote.md#prune_guard_tol). 0 uses the fixed tolerance.
-
-### [prune_guard_z_dn](pruning-fold-vote.md#prune_guard_z_dn)
-
-The multiplier of the standard error that can lower the guard's tolerance below
-[`prune_guard_tol`](pruning-fold-vote.md#prune_guard_tol) when the evidence is precise. It can only make the guard
-act more often, never less. 0 turns it off.
-
-### [prune_guard_tol_floor](pruning-fold-vote.md#prune_guard_tol_floor)
-
-The lowest tolerance [`prune_guard_z_dn`](pruning-fold-vote.md#prune_guard_z_dn) can lower the guard's tolerance to,
-so that very precise evidence cannot drive it to zero. Ignored when `prune_guard_z_dn` is 0.
-
-### [prune_slope_eps](pruning-fold-vote.md#prune_slope_eps)
-
-The dead band of the post-pruning slope correction. For a `poisson`, `gamma` or `tweedie` model
-trained without an exposure, the scale $b$ of the pruned model's score is estimated on the
-out-of-bag objects after the guard. The score is rescaled only if $|b - 1|$ exceeds this value
-and $b$ differs from 1 by at least [`prune_slope_min_z`](pruning-fold-vote.md#prune_slope_min_z) standard errors.
-The outcome is recorded in `pruning_report_["slope"]`.
-
-### [prune_slope_min_z](pruning-fold-vote.md#prune_slope_min_z)
-
-The number of standard errors by which the scale $b$ must differ from 1 for the post-pruning
-slope correction to be applied (see [`prune_slope_eps`](pruning-fold-vote.md#prune_slope_eps)).
-
 ## [Banding settings](banding.md)
 
 ### [band_tolerance](banding.md#band_tolerance)
@@ -537,17 +496,6 @@ strictly positive. The value must be finite and positive. Used only with
 ### [multiclass_prune_cv](multiclassification.md#multiclass_prune_cv)
 
 The selection regime for multiclassification.
-
-### [multiclass_prune_guard](multiclassification.md#multiclass_prune_guard)
-
-Check the selected set of tables as a whole against the full set on honest objects, and add
-dropped tables back while the gap exceeds the tolerance (see
-[`multiclass_prune_guard_floor`](multiclassification.md#multiclass_prune_guard_floor)).
-
-### [multiclass_prune_guard_floor](multiclassification.md#multiclass_prune_guard_floor)
-
-The floor of the guard's tolerance, as a fraction of the improvement of the full model's
-deviance over the class prior.
 
 ### [multiclass_prune_sel_bags](multiclassification.md#multiclass_prune_sel_bags)
 

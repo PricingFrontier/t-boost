@@ -50,7 +50,7 @@ def test_ranked_path_is_the_default_selector_and_reports_its_path(banded: TBoost
     path = rep["path"]
     assert len(path["sizes"]) == len(path["oob_deviance"]) >= 2
     assert 0 <= path["best"] < len(path["sizes"])
-    assert rep["guard"]["enabled"] is False
+    assert "guard" not in rep and "slope" not in rep  # both removed on 2026-10-14
 
 
 def test_banding_is_the_default_and_shrinks_every_interaction(banded: TBoostRegressor) -> None:

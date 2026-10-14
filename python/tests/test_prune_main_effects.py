@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from t_boost import TBoostClassifier, TBoostRegressor
-from t_boost.sklearn import _heredity_sequence, _mains_before_their_interactions
+from t_boost.sklearn import _heredity_sequence
 
 Support = tuple[int, ...]
 
@@ -113,13 +113,6 @@ def test_ranked_path_admits_a_main_with_its_first_interaction() -> None:
     assert [u for u in seq if len(u) > 1] == sticky
 
 
-def test_guard_ladder_readmits_a_main_before_its_interactions() -> None:
-    ranked = [(0, 3), (1,), (3,), (2, 3), (5,)]
-    assert _mains_before_their_interactions(ranked) == [(3,), (0, 3), (1,), (2, 3), (5,)]
-    interactions_only = [(0, 1), (1, 2)]
-    assert _mains_before_their_interactions(interactions_only) == interactions_only
-
-
 def test_fold_vote_judges_main_effects() -> None:
     # A single bag has no out-of-bag rows, so the fold vote selects. The legacy keep rule
     # (`prune_drop_z=None`) refuses the noise main outright.
@@ -139,19 +132,6 @@ def test_fold_vote_keeps_a_refused_main_that_a_kept_interaction_needs() -> None:
     kept = _kept(est)
     assert _hierarchical(kept)
     assert all(any(m[0] in u for u in _interactions(kept)) for m in restored)
-
-
-def test_guard_can_readmit_a_dropped_main() -> None:
-    kw = dict(n_bags=2, prune_selector="fold_vote", band_tolerance=None, graduate=False,
-              max_interaction_order=1, prune_drop_z=None, prune_guard_z=0.0, prune_guard_z_dn=0.0,
-              prune_main_effects=True)
-    quiet = _reg(**kw)
-    assert quiet.pruning_report_["guard"]["fired"] is False
-    dropped = set(range(6)) - _mains(_kept(quiet))
-    assert dropped
-    forced = _reg(prune_guard_tol=-0.5, **kw)  # a bar no keep-set can clear: re-admit everything
-    assert forced.pruning_report_["guard"]["fired"] is True
-    assert dropped <= _mains(_kept(forced))
 
 
 @pytest.mark.parametrize(
