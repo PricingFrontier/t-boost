@@ -4,6 +4,7 @@ import json
 import warnings
 
 import numpy as np
+import polars as pl
 import pytest
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
@@ -464,7 +465,8 @@ def test_graduation_runs_on_unpruned_fits_too() -> None:
             objective="poisson", graduate=graduate, prune=False
         ).fit(x.astype(np.float32), np.abs(y))
         assert hasattr(est, "graduation_report_")
-        assert "skipped" not in est.graduation_validation_
+        assert est.graduation_validation_.get("skipped") != "disabled"
+        assert "candidate_count" in est.graduation_validation_
     # Explicit False never graduates, prune or not.
     for prune in (False, True):
         est = small_regressor(graduate=False, prune=prune).fit(x, y)
@@ -480,7 +482,8 @@ def test_graduation_runs_on_unpruned_fits_too() -> None:
     xm, ym = multiclass_fixture()
     for prune in (False, True):
         est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=prune).fit(xm, ym)
-        assert "skipped" not in est.graduation_validation_
+        assert est.graduation_validation_.get("skipped") != "disabled"
+        assert "candidate_count" in est.graduation_validation_
         assert all("class" in entry for entry in est.graduation_report_)
 
 
@@ -807,6 +810,20 @@ def test_reanchor_defaults_on_for_log_link_only() -> None:
         objective="squared_error", reanchor=False, **common
     ).fit(x, y).predict(x)
     np.testing.assert_array_equal(s_def, s_off)
+
+
+def test_graduation_says_why_when_nothing_is_smoothed() -> None:
+    # Only categorical features: no ordinal axis to smooth along, so no table is eligible. The
+    # early return used to leave `graduation_validation_` with `adopted: False` and no reason.
+    rng = np.random.default_rng(0)
+    n = 2000
+    a, b = rng.choice(list("pqrst"), n), rng.choice(list("uvw"), n)
+    y = rng.poisson(np.exp(0.3 * (a == "p") - 0.2 * (b == "u"))).astype(np.float32)
+    X = pl.DataFrame({"a": a, "b": b})
+    est = TBoostRegressor(objective="poisson", n_trees=40, seed=0, n_jobs=2).fit(X, y)
+    gv = est.graduation_validation_
+    assert gv["adopted"] is False and gv["candidate_count"] == 0
+    assert gv["skipped"] == "no eligible smoothing updates"
 
 
 def test_graduation_keeps_the_intercept_as_fitted_under_reanchor_false() -> None:

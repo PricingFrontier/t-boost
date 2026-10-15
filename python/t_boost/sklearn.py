@@ -5054,6 +5054,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             report.append(entry)
         if not updates and self.graduation_high_order_alpha == 0:
             self.graduation_report_ = report
+            self.graduation_validation_.update(
+                adopted=False, candidate_count=0, skipped="no eligible smoothing updates",
+            )
             return table_model
 
         # Candidate construction and portfolio re-anchoring use the fit rows -- which are now

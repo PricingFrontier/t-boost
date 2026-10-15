@@ -80,7 +80,8 @@ def test_every_stage_runs_and_the_deployed_tables_are_monotone(fitted) -> None:
     assert rep["selector"] == "ranked_path"
     assert len(rep["kept"]) < rep["n_candidates"], "selection must actually drop tables"
     assert "banding" in rep
-    assert "skipped" not in fitted.graduation_validation_
+    assert fitted.graduation_validation_.get("skipped") != "disabled"
+    assert "candidate_count" in fitted.graduation_validation_
     mono = rep["monotone"]
     assert {f["feature"] for f in mono["features"]} == {0, 1}
     for f in mono["features"]:
@@ -132,7 +133,8 @@ def test_an_unpruned_fit_is_banded_graduated_and_repaired(data) -> None:
     rep = est.pruning_report_
     assert rep["selector"] == "none"
     assert rep["banding"].get("skipped") is None
-    assert "skipped" not in est.graduation_validation_
+    assert est.graduation_validation_.get("skipped") != "disabled"
+    assert "candidate_count" in est.graduation_validation_
     assert "monotone" in rep
     _assert_monotone(est)
 
