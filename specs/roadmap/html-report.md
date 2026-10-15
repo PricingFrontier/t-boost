@@ -492,3 +492,8 @@ incumbent model (rustystats' `base_predictions`), split/date provenance — see 
   gate. A fixed `graduation_alpha` it declines now warns at fit, is INERT in `binding_report_`
   (so `check_bindings()` raises and the report shows a warning), `graduation_validation_` keeps
   the reason under `rejected`, and the report notes a declined GCV graduation.
+- Fit-time `eval_set` removed (2026-10-15, `post-fit-stages.md` PF-18): the report's `eval_set`
+  stays (it is how test data arrives), the "early-stopped on an eval_set" note and
+  `fit.early_stopping.eval_set` are gone, every live single-output fit has a training curve, and
+  the Training chart draws one line per bag with the round it kept (per-bag holdouts sit at
+  different levels, so a mean over the running bags jumped as they finished).

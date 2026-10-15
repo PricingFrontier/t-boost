@@ -32,6 +32,9 @@ t-boost 0.7.0 (4 October 2026) answers most of this specification. Haute require
 | R12 | Envelope `schema_version` 5, refusing newer headers. | A model saved before 0.7.0 loads with a retrain message. |
 | R13 | In 0.8.0: `unknown_category="rare"` (the new default), `unseen_cell`/`rare_pooled` on every exported categorical axis, and `unseen_values(X)`. | Sets `"rare"` (or relies on the default) and reports `unseen_values`. |
 
+R1 was withdrawn on 2026-10-15 (t-boost 0.9.1; `post-fit-stages.md`, PF-18): `fit` no longer takes
+`eval_set`, and Haute changes to match.
+
 The requirements below are kept as written, as the record of what was asked. R4 was
 withdrawn, and R13 was added on 4 October 2026 after 0.7.0 and implemented in 0.8.0 (see
 its implementation notes).
@@ -88,6 +91,12 @@ Haute's adapter also works around several smaller behaviours, listed as R4 to R1
 ## Requirements
 
 ### R1. External validation set with ensemble-level early stopping
+
+**Withdrawn on 2026-10-15 (t-boost 0.9.1).** The fit-time `eval_set` shipped in 0.7.0 was removed
+on the maintainer's decision: each bag early-stops on rows it sets aside and prunes on its
+out-of-bag rows, so a shared external holdout bypassed that, with special cases of its own. Haute
+changes to match; test data reaches the model report through `pricing_report`/`html_report`. See
+`post-fit-stages.md`, PF-18. The text below is the original request.
 
 **Observed in 0.6.2.** `TBoostRegressor.fit` and `TBoostClassifier.fit` take `X, y,
 sample_weight, exposure, groups`. Early stopping always uses an internal carve of the

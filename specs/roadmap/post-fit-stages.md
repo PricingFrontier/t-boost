@@ -1,7 +1,7 @@
 # Post-fit stages: open issues after the switch-off work
 
 Status: written 2026-10-15 on branch `report-0.9.1` at `85f40f1`; updated the same day as items
-were fixed (see "Fixed" below).
+were fixed (see "Fixed" below). PF-18 (fit-time `eval_set` removed) was added the same day.
 
 **Scope (maintainer, 2026-10-15).** The goal of this work is to simplify the library, remove logic
 that switches features off depending on settings, make the library easier to use, and fix bugs.
@@ -24,6 +24,7 @@ and was reverted.
 | PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
 | PF-17 | `07db2af` | A multiclass fit now records its boosting report (`n_trees_per_bag_`, `stopping_reason_per_bag_`, `n_trees_`, `stopping_reason_`; counts are rounds), so the model report's existing "reached n_trees" warning fires for multiclass too. The cap itself stays the user's: they raise `n_trees` when the report says bags hit it (maintainer's decision). |
 | PF-03 | `3365ecf`, reverted | The rebalance was judged per bag on out-of-bag rows: −0.109% over 17 datasets against no rebalance, −0.079% against the slice check, for about 500 lines, +0–22% fit time single-output and +17–45% multiclass. Reverted the same day under the scope above (an accuracy-only change); the rebalance is judged on the slice again. The evidence stays in PF-03. |
+| PF-18 | `02201f8` | Fit-time `eval_set` removed on the maintainer's decision: the bags early-stop and prune on rows they hold back, and the shared external holdout bypassed that with its own special cases. Every live single-output fit now records its per-bag early-stopping curve, so the report's Training card always has one (one line per bag). Byte-identical for fits without `eval_set`. See PF-18. |
 
 Looked at and left as they are:
 
@@ -119,6 +120,7 @@ rejected, so they are not tried again.
 | PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is; validation pass done (no bugs) |
 | PF-16 | The per-bag rebalance check is optimistic on very small data | — | — | moot: PF-03 reverted |
 | PF-17 | Multiclass fits stop at the 4,000-tree cap without saying so | Report it; the user raises `n_trees` | none | fixed (reporting) |
+| PF-18 | Fit-time `eval_set` bypasses the bags' own early stopping, with its own special cases | Remove it; record the bags' own stopping curves on every fit | none; byte-identical without `eval_set` | fixed `02201f8` |
 
 ## PF-01. `band_deviance_cap` bounds an estimate, not the training rise
 
@@ -863,12 +865,62 @@ The original analysis:
    time or size budget), or raise the learning rate when the cap binds (not measured). The
    fit-time cost is the price.
 
+## PF-18. Fit-time `eval_set` (removed, decision)
+
+Raised by the maintainer on 2026-10-15 while reviewing the 0.9.1 report, which shows train and
+test by default: "no point using validation if it doesnt make sense to because of the bags", and
+Haute changes to match. Fixed in `02201f8`.
+
+**What it was.** `fit(eval_set=(X_val, y_val), eval_sample_weight=..., eval_exposure=...,
+eval_offset=...)` (R1 of `t-boost-improvements.md`, 0.7.0) replaced every bag's own
+early-stopping rows with one shared set. It was the only setting that did, and it carried its own
+special cases: the slope recalibration was switched off under it (`reanchor_slope=True` was
+refused), the intercept re-anchored on the training rows only (`FitControl::external_holdout`),
+`validation_fraction` became inert (reported INERT by `binding_report_`), the group-aware carve was
+skipped, unseen categorical levels of the evaluation rows needed their own routing to the rare
+level, multiclass refused it, and the model report carried an info note for fits that
+early-stopped on it. About 640 lines across the core, the binding and Python.
+
+**Why remove it.** The bags early-stop on rows each sets aside (`validation_fraction`) and prune on
+their out-of-bag rows, so a model needs no separate validation data; on freMTPL2, fitting on 80%
+with the bags' own early stopping beat 60% plus a 20% `eval_set` by 0.12% of test deviance
+(`html-report.md`, "Train and test by default"). Test data reaches the model report through
+`pricing_report`/`html_report`, which keep their `eval_set`.
+
+**What changed.**
+
+- `fit` no longer takes `eval_set`, `eval_sample_weight`, `eval_exposure` or `eval_offset`
+  (`TypeError`). The binding and the core lose the evaluation-rows path.
+- Every live single-output fit records each bag's per-round deviance on its early-stopping rows
+  (`evals_result_["eval"]`). Early stopping computes it anyway, so it costs nothing; before, the
+  curve existed only with `eval_set` or callbacks. The training-rows curve stays callbacks-only
+  (an extra pass per round).
+- The report's Training chart draws one line per bag with the round it kept. Per-bag holdouts sit
+  at different levels (freMTPL2: 0.299 to 0.310), so the old mean over the bags still running
+  jumped each time a bag finished, and its "minimum" fell after every bag had stopped.
+- Found on the way: an empty staged fit-extras dict was swapped for a fresh one (`or {}`), so a
+  deploy setting staged without callbacks never reached the pruned fit.
+
+**Accepted cost.** No early stopping on a chosen non-random holdout (the latest period, say). An
+out-of-time check is made in the report, on test data the fit never saw.
+
+**Evidence.** Fits without `eval_set` give byte-identical models: swmc, lapse, ausbi, pg15,
+prudential_bin, surrender and belgian16 (split 0) match the PF-03 references, at the same fit
+times, and all 84 other cells of the settings matrix (6 objectives × 14 settings, including
+unpruned, groups, one bag, monotone and callbacks) match `results/validation_matrix.jsonl` in
+status and model bytes. All gates pass, including the slow suite and bit-repro.
+
+**Left open.** A multiclass fit records no per-round history, so its Training card shows no curve
+(the report says why). The softmax loop computes the stopping deviance every round, so recording
+it is a small core change; not done without the maintainer's go-ahead.
+
 ## Remaining work (in scope)
 
 1. PF-13, if readability of the banded tables matters enough to look into it.
+2. Optionally, the multiclass training curve (PF-18, "Left open").
 
 The validation pass (PF-15) is done. Settings a multiclass fit refuses (exposure, offset,
-`eval_set`, callbacks, monotone constraints, `reanchor`) fail loudly with the conflict named; they
-are feature gaps, not switch-offs, and are not part of this work.
+callbacks, monotone constraints, `reanchor`) fail loudly with the conflict named; they are
+feature gaps, not switch-offs, and are not part of this work.
 
 Parked (accuracy only): PF-03 (reverted), PF-06, PF-07, PF-08, PF-11, PF-12. PF-16 is moot.
