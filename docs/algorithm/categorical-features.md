@@ -54,6 +54,15 @@ The method of transforming categorical features to numerical includes the follow
     At prediction time, levels are encoded with the statistics calculated on the whole
     training dataset, which are stored with the model.
 
+    After the training, the stages that compare the tables' predictions with the targets of
+    the training objects (the out-of-bag evidence that [selects the tables](readable-tables.md)
+    and [`prune_rebalance`](../training-parameters/pruning.md#prune_rebalance)) place each
+    training object where the trees saw it, at its cross-fitted statistic, when a feature has
+    more levels than bins (254). The levels then share bins, and the whole-dataset statistic of
+    a small level is mostly its own objects' targets, so it would let a training object's own
+    target choose its bin. A feature whose levels each have a bin of their own places the
+    training objects by the whole-dataset statistic, which then reads only their level.
+
 ## Low-cardinality features {#low-cardinality}
 
 A feature with between 3 and `cat_direct_max_levels` levels (16 by default) after rare-level

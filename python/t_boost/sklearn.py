@@ -6414,10 +6414,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
         Held-out no-harm guarded: adopted only if it does not raise the held-out deviance.
-        Tables on a categorical encoded by several channels (``cat_channels``), or on one with
-        more levels than ``cat_direct_max_levels`` (levels share cells by target statistics,
-        which on the training rows contain the rows' own targets), are left as fitted; the
-        outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
+        Tables on a categorical encoded by several channels (``cat_channels``) are left as
+        fitted; the outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
         pruned model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
@@ -7758,13 +7756,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
         Held-out no-harm guarded: adopted only if it does not raise the held-out deviance. On a
-        multiclass
-        (K>=3) fit each class's tables are re-solved from the softmax residual, and one joint
-        step, chosen on the held-out multinomial deviance, decides how much of it is kept.
-        Tables on a categorical encoded by several channels, or on one with more levels than
-        ``cat_direct_max_levels`` (levels share cells by target statistics, which on the
-        training rows contain the rows' own targets), are left as fitted; the outcome is in
-        ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
+        multiclass (K>=3) fit each class's tables are re-solved from the softmax residual, and
+        one joint step, chosen on the held-out multinomial deviance, decides how much of it is
+        kept. Tables on a categorical encoded by several channels are left as fitted; the
+        outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
         model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of

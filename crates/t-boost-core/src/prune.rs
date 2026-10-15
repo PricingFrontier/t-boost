@@ -437,7 +437,7 @@ pub struct BoxBudgetReport {
 /// the sklearn estimator's `pruning_report_["rebalance"]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RebalanceReport {
-    /// Whether the re-solved cell values were deployed: they lowered the deviance of the
+    /// Whether the re-solved cell values were deployed: they did not raise the deviance of the
     /// held-out slice (or there was none).
     pub adopted: bool,
     /// The fraction of the re-solve deployed: 1 when adopted on a single-output fit; on a
@@ -446,16 +446,14 @@ pub struct RebalanceReport {
     /// The kept main and pair tables the re-solve spans.
     pub supports: u64,
     /// Kept main and pair tables left as fitted: each touches a categorical encoded by more
-    /// than one channel, which the cell correction cannot address as a single axis, or one
-    /// whose levels share cells by a cross-fit target statistic, which places each training
-    /// row by its own target (see `cell_reads_own_target`).
+    /// than one channel, which the cell correction cannot address as a single axis.
     pub excluded: Vec<FeatureSet>,
     /// Rows held out of the re-solve to judge it.
     pub holdout_rows: u64,
     /// The held-out slice's deviance before the re-solve, on the loss's own scale (a total for a
     /// single-output loss, the mean cross-entropy for a multiclass one).
     pub holdout_deviance_before: Option<f64>,
-    /// The held-out slice's deviance after it.
+    /// The held-out deviance after it.
     pub holdout_deviance_after: Option<f64>,
 }
 
@@ -2017,6 +2015,7 @@ fn bag_member_model(
         bag_spans: None,
         bag_intercepts: None,
         bag_in_bag: None,
+        fit_cat_bins: None,
         delta_step_gate: None,
         fit_report: None,
     })
@@ -2263,6 +2262,9 @@ pub fn bag_oob_group_sums_with(
         counts: vec![0_u32; n],
     };
     let soup_grids = crate::explain::MergedGrids::from_model(model)?;
+    // The banks are built on `serve`; the out-of-bag rows are scored as the trees saw them.
+    let fit_rows = fit_rows_matrix(model, serve)?;
+    let score_on = fit_rows.as_ref().unwrap_or(serve);
     for (bag, in_bag) in membership.iter().enumerate() {
         let oob_rows: Vec<u32> = (0..n as u32).filter(|&r| !in_bag[r as usize]).collect();
         if oob_rows.is_empty() {
@@ -2296,7 +2298,7 @@ pub fn bag_oob_group_sums_with(
         crate::scoring::score_banks_rows(
             &banks,
             &model.schema.cat_encoders,
-            &serve.0,
+            &score_on.0,
             &oob_rows,
             &mut flat,
         )?;
@@ -2319,6 +2321,66 @@ pub fn bag_oob_group_sums_with(
         }
     }
     Ok(acc)
+}
+
+/// The fit rows as the trees saw them: `serve` (the FIT design binned through the serve map)
+/// with every axis in [`Model::fit_cat_bins`] replaced by its training-time bins, or `None`
+/// when no axis differs (then `serve` already is that design).
+///
+/// A categorical with more levels than its direct bypass is fitted on out-of-fold target
+/// statistics, but the serve map bins a level by a full-data statistic that contains its own
+/// rows' targets, and levels share cells: a training row's serve cell is partly chosen by its
+/// own target. Scoring training rows there flatters the tables on that feature, so every stage
+/// that judges or refits the tables against the fit rows' targets scores them here instead. The
+/// table bank itself is still built and purified on `serve` (spec §03.2a).
+///
+/// # Errors
+/// [`PbError::InvalidInput`] if the model has a categorical axis but carries no training-time
+/// bins (a loaded model or a construction that is not a fit); [`PbError::ShapeMismatch`] if
+/// `serve` is not the fit design.
+pub fn fit_rows_matrix(
+    model: &Model,
+    serve: &ServeBinnedMatrix,
+) -> Result<Option<ServeBinnedMatrix>, PbError> {
+    let Some(bins) = model.fit_cat_bins.as_ref() else {
+        if model
+            .provenance
+            .iter()
+            .any(|p| matches!(p.kind, crate::data::AxisKind::CategoricalTS { .. }))
+        {
+            return Err(PbError::InvalidInput {
+                what: "scoring the fit rows needs their training-time categorical bins, which \
+                       only a fresh fit carries (a loaded model has none)"
+                    .into(),
+            });
+        }
+        return Ok(None);
+    };
+    if bins.is_empty() {
+        return Ok(None);
+    }
+    let n = serve.0.n_rows as usize;
+    let mut out = serve.clone();
+    for (axis, col) in bins {
+        if col.len() != n {
+            return Err(PbError::ShapeMismatch {
+                what: format!(
+                    "the fit rows' training-time bins cover {} rows but the design has {n}: \
+                     score the fit design itself",
+                    col.len()
+                ),
+            });
+        }
+        let slot = out
+            .0
+            .data
+            .get_mut(*axis as usize)
+            .ok_or_else(|| PbError::Internal {
+                what: format!("training-time bins name axis {axis}, outside the design"),
+            })?;
+        slot.clone_from(col);
+    }
+    Ok(Some(out))
 }
 
 /// Whether [`bag_oob_group_raw_sums`] can run on `model`: it needs the outer-bag soup's
@@ -2358,11 +2420,13 @@ pub struct BagOobGroupSums {
 /// `purify(trees + δ) = base + purify(δ)`: it purifies the tiny correction `δ` alone
 /// ([`crate::explain::purify_correction`]) — re-purified, so the 1-/2-/3-way order separation
 /// is preserved — and adds it to the already-built deploy bank, instead of paying a second
-/// (expensive, 8-bag) `explain_bank`. The base bank's raw score is passed in (`base_raw`,
-/// already computed for the deploy re-anchor), and the corrected raw is reconstructed as
-/// `base_raw + score(purify(δ))`, so no full-bank score is repeated. A deterministic ~15%
-/// held-out slice never enters the fit and gates the result: the rebalance is adopted only if
-/// it lowers held-out deviance, so it can only help or be neutralised — never regress.
+/// (expensive, 8-bag) `explain_bank`. A deterministic ~15% held-out slice never enters the fit
+/// and gates the result: the rebalance is adopted only if it does not raise the slice's
+/// deviance.
+///
+/// The re-solve reads the fit rows' targets, so it places them as the trees saw them
+/// ([`fit_rows_matrix`]): `base_raw` (the serve-map score, computed for the deploy re-anchor) is
+/// rescored there when a categorical needs it.
 ///
 /// A fit-time cell correction (`model.correction`) is already folded into `base`, purified
 /// under the same row mass as `δ`, so the re-solve composes with it. A kept table that touches
@@ -2384,8 +2448,7 @@ fn rebalance_kept_cells(
 ) -> Result<(TableBank, RebalanceReport), PbError> {
     // (0) The correctable survivors: kept main + pair supports (order ≤ 2), as model axes.
     //     The §G1 cell-basis correction spans mains + pairs; kept triples ride along unchanged.
-    let (supports, excluded) =
-        rebalance_supports(&model.provenance, &model.schema.cat_encoders, keep);
+    let (supports, excluded) = rebalance_supports(&model.provenance, keep);
     let mut report = RebalanceReport {
         supports: supports.len() as u64,
         excluded,
@@ -2396,130 +2459,64 @@ fn rebalance_kept_cells(
     }
     let prof = std::env::var_os("TBOOST_PROFILE").is_some();
     let n = serve.0.n_rows as usize;
-
-    // (1) Newton working residual z = -g/h, IRLS weight h, at the pruned model's raw
-    //     prediction (reused base_raw — no score). A deterministic ~15% slice is held out.
-    let t = std::time::Instant::now();
-    let raw_f32: Vec<f32> = (0..n)
-        .map(|r| {
-            let o = offset.map_or(0.0_f32, |off| off.get(r).copied().unwrap_or(0.0));
-            base_raw[r] as f32 + o
-        })
-        .collect();
-    let mut gh = crate::loss::GradHess {
-        g: vec![0.0_f32; n],
-        h: vec![0.0_f32; n],
-    };
-    loss.grad_hess(y, &raw_f32, w, &mut gh)?;
-    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
-    let mut residual = vec![0.0_f64; n];
-    let mut weight = vec![0.0_f64; n];
-    for r in 0..n {
-        if !is_holdout(r) {
-            let h = f64::from(gh.h[r]).max(1e-12);
-            residual[r] = -f64::from(gh.g[r]) / h;
-            weight[r] = h;
-        }
-    }
-
-    if prof {
-        eprintln!(
-            "[rebalance]  (1) residual grad_hess {:.2}s (base_raw reused, {n} rows)",
-            t.elapsed().as_secs_f64()
-        );
-    }
-
-    // (3) Fit the ridge cell correction to the residual (held-out rows carry weight 0).
-    let t = std::time::Instant::now();
-    let spec = crate::cell_refit::CellRefitSpec::default();
-    let corr = crate::cell_refit::fit_cell_correction(
-        model,
-        &serve.0.data,
-        &residual,
-        &weight,
-        &supports,
-        &spec,
-    )?;
-    if prof {
-        eprintln!(
-            "[rebalance]  (3) fit_cell_correction (ridge) {:.2}s ({} supports)",
-            t.elapsed().as_secs_f64(),
-            supports.len()
-        );
-    }
-
-    // (4) Direct re-solve: purify δ ALONE (linear ⇒ no 8-bag re-explain), score the tiny δ
-    //     bank, and reconstruct the corrected raw as base_raw + score(purify(δ)).
-    let t = std::time::Instant::now();
     let mass = measure_mass(&w_measure, w, offset);
-    let delta_bank =
-        crate::explain::purify_correction(model, serve, w_measure, mass.as_deref(), &corr)?;
-    let mut delta_raw = vec![0.0_f64; n];
-    crate::scoring::score_bank_binned(
-        &delta_bank,
-        &model.schema.cat_encoders,
-        &serve.0,
-        &mut delta_raw,
+    let fit_rows = fit_rows_matrix(model, serve)?;
+    let rows = fit_rows.as_ref().unwrap_or(serve);
+    let rescored;
+    let base_raw: &[f64] = if fit_rows.is_some() {
+        let mut out = vec![0.0_f64; n];
+        crate::scoring::score_bank_binned(&base, &model.schema.cat_encoders, &rows.0, &mut out)?;
+        rescored = out;
+        &rescored
+    } else {
+        base_raw
+    };
+
+    // (1) The correction fitted outside the slice, (2) judged on the slice.
+    let t = std::time::Instant::now();
+    let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
+    let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
+    let (delta_bank, delta_raw) = purified_correction(
+        model,
+        serve,
+        rows,
+        base_raw,
+        &fit,
+        &supports,
+        y,
+        w,
+        offset,
+        loss,
+        &w_measure,
+        mass.as_deref(),
     )?;
-    let mut corr_raw: Vec<f64> = (0..n).map(|r| base_raw[r] + delta_raw[r]).collect();
+    let mut corr_raw: Vec<f64> = base_raw
+        .iter()
+        .zip(&delta_raw)
+        .map(|(b, d)| b + d)
+        .collect();
     let shift = if do_reanchor {
-        match loss.link() {
-            Link::Log => reanchor_shift(&corr_raw, y, w, offset, loss)?,
-            Link::Logit => {
-                let raw32: Vec<f32> = corr_raw.iter().map(|&v| v as f32).collect();
-                crate::engine::boost::reanchor_delta(Link::Logit, y, w, &raw32, offset)?
-            }
-            Link::Identity => 0.0,
-        }
+        anchor_shift(&corr_raw, None, y, w, offset, loss)?
     } else {
         0.0
     };
-    if shift != 0.0 {
-        for v in corr_raw.iter_mut() {
-            *v += shift;
-        }
-    }
-    if prof {
-        eprintln!(
-            "[rebalance]  (4) purify(δ)+score+reanchor {:.2}s ({} δ-tables)  <-- no re-explain",
-            t.elapsed().as_secs_f64(),
-            delta_bank.tables.len()
-        );
-    }
-
-    // (5) No-harm guard: adopt the rebalance only if it lowers deviance on the held-out slice
-    //     it never saw. `corr_raw` == score(base ⊕ δ) exactly (scoring is linear), so no
-    //     second full-bank score is needed to evaluate it.
-    let t = std::time::Instant::now();
-    let (mut hy, mut hb, mut hc, mut hw) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-    for r in 0..n {
-        if is_holdout(r) {
-            let o = offset.map_or(0.0_f32, |off| off.get(r).copied().unwrap_or(0.0));
-            hy.push(y[r]);
-            hb.push(base_raw[r] as f32 + o);
-            hc.push(corr_raw[r] as f32 + o);
-            hw.push(w[r]);
-        }
-    }
-    report.holdout_rows = hy.len() as u64;
-    let adopt = if hy.is_empty() {
-        true // no held-out coverage → keep the rebalance
-    } else {
-        let base_dev = loss.deviance(&hy, &hb, &hw)?;
-        let corr_dev = loss.deviance(&hy, &hc, &hw)?;
-        report.holdout_deviance_before = Some(f64::from(base_dev));
-        report.holdout_deviance_after = Some(f64::from(corr_dev));
+    corr_raw.iter_mut().for_each(|v| *v += shift);
+    report.holdout_rows = slice.len() as u64;
+    // No held-out coverage (a handful of rows) → cannot evaluate → keep the re-solve.
+    if !slice.is_empty() {
+        let before = rows_deviance(base_raw, &slice, y, w, offset, loss)?;
+        let after = rows_deviance(&corr_raw, &slice, y, w, offset, loss)?;
+        report.holdout_deviance_before = Some(before);
+        report.holdout_deviance_after = Some(after);
         if prof {
             eprintln!(
-                "[rebalance]  (5) guard {:.2}s (base_dev={base_dev:.5} corr_dev={corr_dev:.5} -> {})",
-                t.elapsed().as_secs_f64(),
-                if corr_dev <= base_dev { "ADOPT" } else { "fall back" }
+                "[rebalance]  slice check {:.2}s (before={before:.5} after={after:.5})",
+                t.elapsed().as_secs_f64()
             );
         }
-        corr_dev <= base_dev
-    };
-    if !adopt {
-        return Ok((base, report));
+        if after > before {
+            return Ok((base, report));
+        }
     }
     // Materialise base ⊕ purify(δ) in place + apply the re-anchor shift.
     let mut corrected = base;
@@ -2530,28 +2527,124 @@ fn rebalance_kept_cells(
     Ok((corrected, report))
 }
 
+/// The deterministic ~15% slice of the training rows that judges a rebalance without bags.
+fn in_rebalance_slice(r: usize) -> bool {
+    ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38
+}
+
+/// The rebalance's re-solve of `raw` (scores of the fit rows placed as in `rows`): the ridge cell
+/// correction fitted to the working residual at `raw` on `fit` (every other row carries weight
+/// 0), purified alone on `serve`, and its score on every row of `rows`.
+#[allow(clippy::too_many_arguments)]
+fn purified_correction(
+    model: &Model,
+    serve: &ServeBinnedMatrix,
+    rows: &ServeBinnedMatrix,
+    raw: &[f64],
+    fit: &[usize],
+    supports: &[Vec<u32>],
+    y: &[f32],
+    w: &[f32],
+    offset: Option<&[f32]>,
+    loss: &dyn Loss,
+    w_measure: &RefMeasure,
+    mass: Option<&[f32]>,
+) -> Result<(TableBank, Vec<f64>), PbError> {
+    let n = rows.0.n_rows as usize;
+    // Newton working residual z = -g/h with IRLS weight h.
+    let raw_f32: Vec<f32> = (0..n)
+        .map(|r| raw[r] as f32 + offset.map_or(0.0_f32, |o| o.get(r).copied().unwrap_or(0.0)))
+        .collect();
+    let mut gh = crate::loss::GradHess {
+        g: vec![0.0_f32; n],
+        h: vec![0.0_f32; n],
+    };
+    loss.grad_hess(y, &raw_f32, w, &mut gh)?;
+    let mut residual = vec![0.0_f64; n];
+    let mut weight = vec![0.0_f64; n];
+    for &r in fit {
+        let h = f64::from(gh.h[r]).max(1e-12);
+        residual[r] = -f64::from(gh.g[r]) / h;
+        weight[r] = h;
+    }
+    let corr = crate::cell_refit::fit_cell_correction(
+        model,
+        &rows.0.data,
+        &residual,
+        &weight,
+        supports,
+        &crate::cell_refit::CellRefitSpec::default(),
+    )?;
+    let bank = crate::explain::purify_correction(model, serve, w_measure.clone(), mass, &corr)?;
+    let mut score = vec![0.0_f64; n];
+    crate::scoring::score_bank_binned(&bank, &model.schema.cat_encoders, &rows.0, &mut score)?;
+    Ok((bank, score))
+}
+
+/// The intercept shift that re-anchors `raw` on `rows` (every row when `None`), as the deploy
+/// re-anchors the pruned bank: closed form for the log link, the shared bisection for the logit.
+fn anchor_shift(
+    raw: &[f64],
+    rows: Option<&[usize]>,
+    y: &[f32],
+    w: &[f32],
+    offset: Option<&[f32]>,
+    loss: &dyn Loss,
+) -> Result<f64, PbError> {
+    let shift_of = |raw: &[f64], y: &[f32], w: &[f32], offset: Option<&[f32]>| match loss.link() {
+        Link::Log => reanchor_shift(raw, y, w, offset, loss),
+        Link::Logit => {
+            let raw32: Vec<f32> = raw.iter().map(|&v| v as f32).collect();
+            crate::engine::boost::reanchor_delta(Link::Logit, y, w, &raw32, offset)
+        }
+        Link::Identity => Ok(0.0),
+    };
+    let Some(rows) = rows else {
+        return shift_of(raw, y, w, offset);
+    };
+    let ry: Vec<f32> = rows.iter().map(|&r| y[r]).collect();
+    let rw: Vec<f32> = rows.iter().map(|&r| w[r]).collect();
+    let rr: Vec<f64> = rows.iter().map(|&r| raw[r]).collect();
+    let ro: Option<Vec<f32>> = offset.map(|o| {
+        rows.iter()
+            .map(|&r| o.get(r).copied().unwrap_or(0.0))
+            .collect()
+    });
+    shift_of(&rr, &ry, &rw, ro.as_deref())
+}
+
+/// The loss's total deviance of `raw` (plus the offset) on `rows`.
+fn rows_deviance(
+    raw: &[f64],
+    rows: &[usize],
+    y: &[f32],
+    w: &[f32],
+    offset: Option<&[f32]>,
+    loss: &dyn Loss,
+) -> Result<f64, PbError> {
+    let off = |r: usize| offset.map_or(0.0_f32, |o| o.get(r).copied().unwrap_or(0.0));
+    let ry: Vec<f32> = rows.iter().map(|&r| y[r]).collect();
+    let rw: Vec<f32> = rows.iter().map(|&r| w[r]).collect();
+    let rr: Vec<f32> = rows.iter().map(|&r| raw[r] as f32 + off(r)).collect();
+    Ok(f64::from(loss.deviance(&ry, &rr, &rw)?))
+}
+
 /// The kept main and pair tables the rebalance re-solves, as sorted MODEL AXIS ids (what
-/// `correction_scaffold` reads), and the ones it leaves as fitted. A table is left as fitted
-/// when it touches a categorical the re-solve cannot address, or cannot fit honestly:
-///   * one encoded by several channels, since no single axis carries it. Axis ids differ from
-///     raw ids once any earlier feature owns several axes (bug #5: reading raw ids as axis ids
-///     re-solved the wrong column);
-///   * one whose training rows sit in cells chosen by their own targets (see
-///     [`cell_reads_own_target`]).
+/// `correction_scaffold` reads), and the ones it leaves as fitted. A raw feature owns one axis
+/// unless it is a categorical encoded by several channels; a table touching such a feature is
+/// excluded, since no single axis carries it. Axis ids differ from raw ids once any earlier
+/// feature owns several axes (bug #5: reading raw ids as axis ids re-solved the wrong column).
 fn rebalance_supports(
     provenance: &[crate::data::AxisProvenance],
-    encoders: &crate::cat::CatEncoderStore,
     keep: &[FeatureSet],
 ) -> (Vec<Vec<u32>>, Vec<FeatureSet>) {
-    // raw id -> its axis, or None once a second axis claims the same raw feature or its one
-    // axis cannot be re-solved honestly
+    // raw id -> its axis, or None once a second axis claims the same raw feature
     let mut axis_of: BTreeMap<u32, Option<u32>> = BTreeMap::new();
     for (axis, p) in (0_u32..).zip(provenance) {
-        let honest = !cell_reads_own_target(encoders, p);
         axis_of
             .entry(p.raw.0)
             .and_modify(|a| *a = None)
-            .or_insert(honest.then_some(axis));
+            .or_insert(Some(axis));
     }
     let mut supports = Vec::new();
     let mut excluded = Vec::new();
@@ -2571,47 +2664,23 @@ fn rebalance_supports(
     (supports, excluded)
 }
 
-/// Whether a training row's serve-time cell on axis `p` depends on the row's own target.
-///
-/// A categorical with more levels than the direct bypass takes (`cat_direct_max_levels`) is fitted
-/// on cross-fit target statistics, but the post-fit stages bin the training rows through the
-/// frozen full-data map, whose statistic for a level contains its rows' own targets: a level
-/// whose rows happen to sit high is binned high. A re-solve fitted to the training residual on
-/// such cells learns that leak, and no slice of the training rows can catch it, out of bag or
-/// not, because every row's own target placed it. On the pg17 instalment set (979 and 16,303
-/// levels) re-solving these tables cut the training deviance 1.1% and raised the test deviance
-/// 0.2-0.4%. A direct-bypass or binary categorical gives each level its own cell, and a count
-/// channel reads no target, so their cells are honest.
-fn cell_reads_own_target(
-    encoders: &crate::cat::CatEncoderStore,
-    p: &crate::data::AxisProvenance,
-) -> bool {
-    let crate::data::AxisKind::CategoricalTS { encoding } = p.kind else {
-        return false;
-    };
-    // An axis without its encoder cannot be judged; leave its tables as fitted.
-    let Some(enc) = encoders
-        .encoders()
-        .iter()
-        .find(|e| e.raw == p.raw && e.id == encoding)
-    else {
-        return true;
-    };
-    let levels = enc.levels.len();
-    let own_cell_per_level = levels <= 2 || levels <= enc.config.direct_max_levels as usize;
-    enc.config.target != crate::cat::CatTarget::Count && !own_cell_per_level
-}
-
-/// Per-class corrections a multiclass rebalance deploys: each class's purified correction bank
-/// and its score on the training rows, both already scaled by the chosen step.
-type ClassCorrections = (Vec<TableBank>, Vec<Vec<f64>>);
+/// Per-class corrections a multiclass rebalance deploys: each class's purified correction bank,
+/// already scaled by the chosen step, and the intercept shift that re-anchors the corrected
+/// classes (added to each class's `f0` on deploy).
+type ClassCorrections = (Vec<TableBank>, Vec<f64>);
 
 /// The post-prune rebalance of a multiclass keep-set: [`rebalance_kept_cells`] for each class's
 /// logit, from the softmax working residual at the re-anchored deploy logits `raw`
 /// (`[class][row]`). The K classes are solved apart (diagonal Hessian) and accepted or shrunk
 /// by ONE joint step on the held-out multinomial deviance, the design of the K-class §G1 cell
 /// refit (`attach_multiclass_cell_correction`), whose doc records why: the decoupled step keeps
-/// the joint Newton direction but overshoots it, most at small K. Step 0 declines it.
+/// the joint Newton direction but overshoots it, most at small K. Step 0 declines it. Every
+/// trial step is re-anchored as the deploy re-anchors the chosen one, so the check scores the
+/// model the deploy would ship.
+///
+/// Like the single-output re-solve it places the fit rows as the trees saw them
+/// ([`fit_rows_matrix`]): `raw` (serve-map logits) is rescored there when a categorical needs
+/// it, and the corrections are purified on `serve`.
 ///
 /// Each class is re-solved over the kept tables its own bank carries (`banks_kept`, the retained
 /// per-class banks): the keep-set is shared, but a class that never split on a feature has a
@@ -2639,8 +2708,7 @@ fn rebalance_multiclass_cells(
     let mut excluded: std::collections::BTreeSet<FeatureSet> = std::collections::BTreeSet::new();
     for bank in banks_kept {
         let carried: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
-        let (axes, left) =
-            rebalance_supports(&first.provenance, &first.schema.cat_encoders, &carried);
+        let (axes, left) = rebalance_supports(&first.provenance, &carried);
         resolved.extend(
             carried
                 .iter()
@@ -2659,95 +2727,54 @@ fn rebalance_multiclass_cells(
         return Ok((None, report));
     }
     let n = labels.len();
-    let n_classes = mc.classes.len();
-    let raw32: Vec<Vec<f32>> = raw
-        .iter()
-        .map(|col| col.iter().map(|&v| v as f32).collect())
-        .collect();
-    let mut probs = Vec::new();
-    crate::engine::boost::multiclass_softmax(&raw32, n_classes, n, &mut probs)?;
-    // The single-output rebalance's deterministic ~15% slice.
-    let is_holdout = |r: usize| ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38;
-
-    // (1) Per class: the Newton working residual z = -g/h, IRLS weight h (held-out rows carry
-    //     weight 0), the ridge cell correction, purified alone and scored (see the scalar twin).
-    //     The class solves are independent and mostly sequential inside, so they fan out over
-    //     the pool a wave at a time, as the cell refit's do; results keep class order.
-    let spec = crate::cell_refit::CellRefitSpec::default();
-    let solve = |k: usize| -> Result<(TableBank, Vec<f64>), PbError> {
-        let model = mc.classes.get(k).ok_or_else(|| PbError::Internal {
-            what: format!("multiclass rebalance: no class {k}"),
-        })?;
-        let supports = class_supports.get(k).ok_or_else(|| PbError::Internal {
-            what: format!("multiclass rebalance: no supports for class {k}"),
-        })?;
-        let mut gh = crate::loss::GradHess {
-            g: vec![0.0_f32; n],
-            h: vec![0.0_f32; n],
-        };
-        crate::engine::boost::fill_grad_hess_from_probs(&probs, labels, w, k, n_classes, &mut gh)?;
-        let mut residual = vec![0.0_f64; n];
-        let mut weight = vec![0.0_f64; n];
-        for r in 0..n {
-            if !is_holdout(r) {
-                let h = f64::from(gh.h[r]).max(1e-12);
-                residual[r] = -f64::from(gh.g[r]) / h;
-                weight[r] = h;
-            }
-        }
-        let corr = crate::cell_refit::fit_cell_correction(
-            model,
-            &serve.0.data,
-            &residual,
-            &weight,
-            supports,
-            &spec,
-        )?;
-        let bank = crate::explain::purify_correction(model, serve, w_measure.clone(), mass, &corr)?;
-        let mut score = vec![0.0_f64; n];
-        crate::scoring::score_bank_binned(&bank, &model.schema.cat_encoders, &serve.0, &mut score)?;
-        Ok((bank, score))
-    };
-    let class_ids: Vec<usize> = (0..n_classes).collect();
-    let mut banks = Vec::with_capacity(n_classes);
-    let mut scores = Vec::with_capacity(n_classes);
-    for wave in class_ids.chunks(crate::engine::boost::MC_REFIT_CLASS_WAVE) {
-        let solved: Vec<(TableBank, Vec<f64>)> = wave
+    let fit_rows = fit_rows_matrix(first, serve)?;
+    let rows = fit_rows.as_ref().unwrap_or(serve);
+    let rescored: Vec<Vec<f64>>;
+    let raw: &[Vec<f64>] = if fit_rows.is_some() {
+        rescored = banks_kept
             .par_iter()
-            .map(|&k| solve(k))
+            .zip(mc.classes.par_iter())
+            .map(|(bank, model)| -> Result<Vec<f64>, PbError> {
+                let mut out = vec![0.0_f64; n];
+                crate::scoring::score_bank_binned(
+                    bank,
+                    &model.schema.cat_encoders,
+                    &rows.0,
+                    &mut out,
+                )?;
+                Ok(out)
+            })
             .collect::<Result<_, _>>()?;
-        for (bank, score) in solved {
-            banks.push(bank);
-            scores.push(score);
-        }
-    }
+        &rescored
+    } else {
+        raw
+    };
 
-    // (2) One joint step: the held-out multinomial deviance of `raw + step·δ`, all K classes
-    //     together, over the cell refit's grid, each trial re-anchored on every row as the
-    //     deploy re-anchors the chosen one (the scalar twin scores its re-anchored candidate
-    //     too). Without held-out rows the Newton step stands.
-    let hrows: Vec<usize> = (0..n).filter(|&r| is_holdout(r)).collect();
-    report.holdout_rows = hrows.len() as u64;
+    // (1) The corrections, fitted outside the deterministic ~15% slice; (2) one joint step on
+    //     the slice's multinomial deviance, all K classes together, over the cell refit's grid.
+    //     Without held-out rows (a handful of rows) the Newton step stands.
+    let all: Vec<usize> = (0..n).collect();
+    let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
+    let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
+    let (mut banks, scores) = class_corrections(
+        mc,
+        &class_supports,
+        raw,
+        &fit,
+        serve,
+        rows,
+        labels,
+        w,
+        w_measure,
+        mass,
+    )?;
+    report.holdout_rows = slice.len() as u64;
     let mut step = 1.0_f64;
-    if !hrows.is_empty() {
-        let mut moved: Vec<Vec<f64>> = vec![vec![0.0_f64; n]; n_classes];
-        let mut candidate: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; n_classes];
+    if !slice.is_empty() {
+        let devs = joint_step_devs(raw, &scores, labels, w, &all, &slice)?;
         let (mut best_dev, mut best_step) = (f64::INFINITY, 0.0_f64);
-        for &trial in &crate::engine::boost::MC_CORRECTION_STEPS {
+        for (&trial, &dev) in crate::engine::boost::MC_CORRECTION_STEPS.iter().zip(&devs) {
             let trial = f64::from(trial);
-            for ((m, base), delta) in moved.iter_mut().zip(raw).zip(&scores) {
-                for ((v, &b), &d) in m.iter_mut().zip(base).zip(delta) {
-                    *v = b + trial * d;
-                }
-            }
-            let shift = multiclass_intercept_shifts(&moved, labels, w, "rebalance step")?;
-            for ((cand, m), d) in candidate.iter_mut().zip(&moved).zip(&shift) {
-                for &r in &hrows {
-                    cand[r] = (m[r] + d) as f32;
-                }
-            }
-            let dev =
-                crate::engine::boost::multiclass_deviance_for_rows(&candidate, labels, w, &hrows)?;
             if trial == 0.0 {
                 report.holdout_deviance_before = Some(dev);
             }
@@ -2767,13 +2794,131 @@ fn rebalance_multiclass_cells(
         for bank in &mut banks {
             scale_bank(bank, step)?;
         }
-        for score in &mut scores {
-            for v in score.iter_mut() {
-                *v *= step;
-            }
+    }
+    // The corrections move each class's logit mass: re-anchor the intercepts on the same rows
+    // and at the same step the check scored.
+    let corrected: Vec<Vec<f64>> = raw
+        .iter()
+        .zip(&scores)
+        .map(|(base, delta)| base.iter().zip(delta).map(|(b, d)| b + step * d).collect())
+        .collect();
+    let shift = multiclass_intercept_shifts(&corrected, labels, w, "rebalance reanchor")?;
+    Ok((Some((banks, shift)), report))
+}
+
+/// The per-class re-solve of the logits `raw` (`[class][row]`, the fit rows placed as in
+/// `rows`): from the softmax working residual at `raw`, each class's ridge cell correction
+/// fitted on `fit` (every other row carries weight 0) over its own supports, purified alone on
+/// `serve`, and its score on every row of `rows`.
+///
+/// The class solves are independent and mostly sequential inside, so they fan out over the pool
+/// a wave at a time, as the cell refit's do; results keep class order.
+#[allow(clippy::too_many_arguments)]
+fn class_corrections(
+    mc: &MultiClassModel,
+    class_supports: &[Vec<Vec<u32>>],
+    raw: &[Vec<f64>],
+    fit: &[usize],
+    serve: &ServeBinnedMatrix,
+    rows: &ServeBinnedMatrix,
+    labels: &[u32],
+    w: &[f32],
+    w_measure: &RefMeasure,
+    mass: Option<&[f32]>,
+) -> Result<(Vec<TableBank>, Vec<Vec<f64>>), PbError> {
+    let n = labels.len();
+    let n_classes = mc.classes.len();
+    let raw32: Vec<Vec<f32>> = raw
+        .iter()
+        .map(|col| col.iter().map(|&v| v as f32).collect())
+        .collect();
+    let mut probs = Vec::new();
+    crate::engine::boost::multiclass_softmax(&raw32, n_classes, n, &mut probs)?;
+    let spec = crate::cell_refit::CellRefitSpec::default();
+    let solve = |k: usize| -> Result<(TableBank, Vec<f64>), PbError> {
+        let model = mc.classes.get(k).ok_or_else(|| PbError::Internal {
+            what: format!("multiclass rebalance: no class {k}"),
+        })?;
+        let supports = class_supports.get(k).ok_or_else(|| PbError::Internal {
+            what: format!("multiclass rebalance: no supports for class {k}"),
+        })?;
+        // The Newton working residual z = -g/h, IRLS weight h (see the scalar twin).
+        let mut gh = crate::loss::GradHess {
+            g: vec![0.0_f32; n],
+            h: vec![0.0_f32; n],
+        };
+        crate::engine::boost::fill_grad_hess_from_probs(&probs, labels, w, k, n_classes, &mut gh)?;
+        let mut residual = vec![0.0_f64; n];
+        let mut weight = vec![0.0_f64; n];
+        for &r in fit {
+            let h = f64::from(gh.h[r]).max(1e-12);
+            residual[r] = -f64::from(gh.g[r]) / h;
+            weight[r] = h;
+        }
+        let corr = crate::cell_refit::fit_cell_correction(
+            model,
+            &rows.0.data,
+            &residual,
+            &weight,
+            supports,
+            &spec,
+        )?;
+        let bank = crate::explain::purify_correction(model, serve, w_measure.clone(), mass, &corr)?;
+        let mut score = vec![0.0_f64; n];
+        crate::scoring::score_bank_binned(&bank, &model.schema.cat_encoders, &rows.0, &mut score)?;
+        Ok((bank, score))
+    };
+    let class_ids: Vec<usize> = (0..n_classes).collect();
+    let mut banks = Vec::with_capacity(n_classes);
+    let mut scores = Vec::with_capacity(n_classes);
+    for wave in class_ids.chunks(crate::engine::boost::MC_REFIT_CLASS_WAVE) {
+        let solved: Vec<(TableBank, Vec<f64>)> = wave
+            .par_iter()
+            .map(|&k| solve(k))
+            .collect::<Result<_, _>>()?;
+        for (bank, score) in solved {
+            banks.push(bank);
+            scores.push(score);
         }
     }
-    Ok((Some((banks, scores)), report))
+    Ok((banks, scores))
+}
+
+/// The mean multinomial deviance on `judge` of `raw + step·scores`, all classes together, at
+/// each step of the cell refit's grid (`MC_CORRECTION_STEPS`), every trial re-anchored on
+/// `anchor` as the deploy re-anchors the chosen step.
+fn joint_step_devs(
+    raw: &[Vec<f64>],
+    scores: &[Vec<f64>],
+    labels: &[u32],
+    w: &[f32],
+    anchor: &[usize],
+    judge: &[usize],
+) -> Result<Vec<f64>, PbError> {
+    let anchor_labels: Vec<u32> = anchor.iter().map(|&r| labels[r]).collect();
+    let anchor_w: Vec<f32> = anchor.iter().map(|&r| w[r]).collect();
+    let mut moved: Vec<Vec<f64>> = vec![vec![0.0_f64; anchor.len()]; raw.len()];
+    let mut candidate: Vec<Vec<f32>> = vec![vec![0.0_f32; labels.len()]; raw.len()];
+    let mut devs = Vec::with_capacity(crate::engine::boost::MC_CORRECTION_STEPS.len());
+    for &trial in &crate::engine::boost::MC_CORRECTION_STEPS {
+        let trial = f64::from(trial);
+        for ((m, base), delta) in moved.iter_mut().zip(raw).zip(scores) {
+            for (v, &r) in m.iter_mut().zip(anchor) {
+                *v = base[r] + trial * delta[r];
+            }
+        }
+        let shift =
+            multiclass_intercept_shifts(&moved, &anchor_labels, &anchor_w, "rebalance step")?;
+        for (((cand, base), delta), d) in candidate.iter_mut().zip(raw).zip(scores).zip(&shift) {
+            for &r in judge {
+                cand[r] = (base[r] + trial * delta[r] + d) as f32;
+            }
+        }
+        devs.push(crate::engine::boost::multiclass_deviance_for_rows(
+            &candidate, labels, w, judge,
+        )?);
+    }
+    Ok(devs)
 }
 
 /// `bank` times `s`: purification is linear, so this is the bank purified from the scaled
@@ -3147,18 +3292,9 @@ pub fn prune_multiclass_to_keepset_budgeted(
             &w_measure,
             mass.as_deref(),
         )?;
-        if let Some((banks, scores)) = corrections {
-            for (bank, correction) in pruned_banks.iter_mut().zip(&banks) {
+        if let Some((banks, shift)) = corrections {
+            for ((bank, correction), d) in pruned_banks.iter_mut().zip(&banks).zip(&shift) {
                 crate::explain::add_bank_assign(bank, correction)?;
-            }
-            // The corrections move each class's logit mass: re-anchor the intercepts again.
-            let corrected: Vec<Vec<f64>> = anchored
-                .iter()
-                .zip(&scores)
-                .map(|(col, d)| col.iter().zip(d).map(|(a, b)| a + b).collect())
-                .collect();
-            let shift = multiclass_intercept_shifts(&corrected, labels, w, "rebalance reanchor")?;
-            for (bank, d) in pruned_banks.iter_mut().zip(&shift) {
                 bank.f0 += d;
             }
         }
@@ -4337,6 +4473,7 @@ mod tests {
             bag_spans: Some(vec![(0, 1), (1, 2)]),
             bag_intercepts: None,
             bag_in_bag: None,
+            fit_cat_bins: None,
             delta_step_gate: None,
             fit_report: None,
         };
@@ -4347,6 +4484,75 @@ mod tests {
             provenance: model.provenance.clone(),
         });
         (model, serve)
+    }
+
+    /// The fit rows as the trees saw them: the recorded training-time bins replace their axes,
+    /// a model with nothing recorded scores on `serve`, and the helper refuses what it cannot
+    /// honour rather than falling back to the serve map.
+    #[test]
+    fn fit_rows_matrix_swaps_in_the_training_time_bins() {
+        let (mut model, serve) = differing_borders_bagged_fixture();
+        // Numeric only: nothing to swap, recorded or not.
+        assert!(fit_rows_matrix(&model, &serve).unwrap().is_none());
+        model.fit_cat_bins = Some(Vec::new());
+        assert!(fit_rows_matrix(&model, &serve).unwrap().is_none());
+
+        model.fit_cat_bins = Some(vec![(0, vec![3, 1, 2])]);
+        let swapped = fit_rows_matrix(&model, &serve).unwrap().unwrap();
+        assert_eq!(swapped.0.data, vec![vec![3, 1, 2]]);
+        assert_eq!(swapped.0.grids, serve.0.grids);
+
+        model.fit_cat_bins = Some(vec![(0, vec![3, 1])]);
+        assert!(matches!(
+            fit_rows_matrix(&model, &serve),
+            Err(PbError::ShapeMismatch { .. })
+        ));
+
+        // A categorical axis with nothing recorded (a loaded model) cannot be scored honestly.
+        model.fit_cat_bins = None;
+        model.provenance[0].kind = AxisKind::CategoricalTS {
+            encoding: crate::cat::TsEncodingId(0),
+        };
+        assert!(matches!(
+            fit_rows_matrix(&model, &serve),
+            Err(PbError::InvalidInput { .. })
+        ));
+    }
+
+    /// The out-of-bag evidence builds the bag banks on `serve` but scores the out-of-bag rows
+    /// where the trees placed them: with the training-time bins recorded it equals the evidence
+    /// computed on the swapped design itself (the uniform measure reads no rows).
+    #[test]
+    fn out_of_bag_evidence_scores_the_rows_as_the_trees_saw_them() {
+        let (mut model, serve) = differing_borders_bagged_fixture();
+        model.bag_in_bag = Some(vec![vec![true, true, false], vec![false, true, true]]);
+        let groups: Vec<Vec<FeatureSet>> = vec![model
+            .explain(&serve, RefMeasure::Uniform)
+            .unwrap()
+            .tables
+            .iter()
+            .map(|t| t.u.clone())
+            .collect()];
+        let swapped_bins = vec![3_u8, 2, 1];
+        model.fit_cat_bins = Some(vec![(0, swapped_bins.clone())]);
+        let honest =
+            bag_oob_group_sums_with(&model, &serve, RefMeasure::Uniform, None, &groups, true)
+                .unwrap();
+        model.fit_cat_bins = Some(Vec::new());
+        let mut swapped = serve.clone();
+        swapped.0.data[0] = swapped_bins;
+        let reference =
+            bag_oob_group_sums_with(&model, &swapped, RefMeasure::Uniform, None, &groups, true)
+                .unwrap();
+        let on_serve =
+            bag_oob_group_sums_with(&model, &serve, RefMeasure::Uniform, None, &groups, true)
+                .unwrap();
+        assert_eq!(honest.full_sum, reference.full_sum);
+        assert_eq!(honest.group_sums, reference.group_sums);
+        assert_ne!(
+            honest.full_sum, on_serve.full_sum,
+            "the swap must change the scores"
+        );
     }
 
     #[test]
@@ -5072,8 +5278,7 @@ mod tests {
     #[test]
     fn rebalance_resolves_each_raw_feature_to_its_own_axis() {
         use crate::data::{AxisKind, AxisProvenance, FeatureId};
-        let model = fixture_multichannel_model();
-        let mut provenance = model.provenance.clone();
+        let mut provenance = fixture_multichannel_model().provenance;
         for raw in [1, 2] {
             provenance.push(AxisProvenance {
                 raw: FeatureId(raw),
@@ -5089,92 +5294,9 @@ mod tests {
             fs(&[1, 2]),
             fs(&[0, 1, 2]),
         ];
-        let (supports, excluded) =
-            rebalance_supports(&provenance, &model.schema.cat_encoders, &keep);
+        let (supports, excluded) = rebalance_supports(&provenance, &keep);
         assert_eq!(supports, vec![vec![2], vec![3], vec![2, 3]]);
         assert_eq!(excluded, vec![fs(&[0]), fs(&[0, 1])]);
-    }
-
-    /// A categorical whose levels share cells by a cross-fit target statistic is left as
-    /// fitted: on the training rows its cells are chosen by the rows' own targets. A level that
-    /// owns its cell (direct bypass, binary) or a target-free count channel is re-solved, and
-    /// switching the bypass off turns a five-level feature into a cross-fit one.
-    #[test]
-    fn rebalance_leaves_tables_on_a_cross_fit_categorical_as_fitted() {
-        use crate::cat::{
-            CatEncoder, CatEncoderStore, CatLevel, CatTarget, TsConfig, TsEncodingId,
-        };
-        use crate::data::{AxisKind, AxisProvenance, FeatureId};
-        let encoder = |raw: u32, levels: usize, config: TsConfig| CatEncoder {
-            raw: FeatureId(raw),
-            id: TsEncodingId(0),
-            levels: (0..levels)
-                .map(|i| CatLevel {
-                    label: format!("L{i}"),
-                    members: vec![format!("L{i}")],
-                    encoding: i as f32,
-                    bin: u8::try_from(i % 200).unwrap() + 1,
-                    weight: 1.0,
-                })
-                .collect(),
-            base: 0.0,
-            config,
-        };
-        let axis = |raw: u32| AxisProvenance {
-            raw: FeatureId(raw),
-            kind: AxisKind::CategoricalTS {
-                encoding: TsEncodingId(0),
-            },
-        };
-        let provenance = vec![
-            AxisProvenance {
-                raw: FeatureId(0),
-                kind: AxisKind::Numeric,
-            },
-            axis(1), // 40 levels: cross-fit
-            axis(2), // 5 levels: direct bypass
-            axis(3), // binary
-            axis(4), // 40 levels, but a count channel
-        ];
-        let count = TsConfig {
-            target: CatTarget::Count,
-            ..TsConfig::default()
-        };
-        let fs = |ids: &[u32]| FeatureSet::new(ids);
-        let keep = [
-            fs(&[0]),
-            fs(&[1]),
-            fs(&[2]),
-            fs(&[3]),
-            fs(&[4]),
-            fs(&[0, 1]),
-            fs(&[0, 2]),
-            fs(&[2, 3]),
-        ];
-        let store = |direct_max_levels: u32| {
-            let config = TsConfig {
-                direct_max_levels,
-                ..TsConfig::default()
-            };
-            CatEncoderStore::from_encoders(vec![
-                encoder(1, 40, config.clone()),
-                encoder(2, 5, config.clone()),
-                encoder(3, 2, config),
-                encoder(4, 40, count.clone()),
-            ])
-        };
-        let (supports, excluded) = rebalance_supports(&provenance, &store(16), &keep);
-        assert_eq!(
-            supports,
-            vec![vec![0], vec![2], vec![3], vec![4], vec![0, 2], vec![2, 3]]
-        );
-        assert_eq!(excluded, vec![fs(&[1]), fs(&[0, 1])]);
-        let (supports, excluded) = rebalance_supports(&provenance, &store(0), &keep);
-        assert_eq!(supports, vec![vec![0], vec![3], vec![4]]);
-        assert_eq!(
-            excluded,
-            vec![fs(&[1]), fs(&[2]), fs(&[0, 1]), fs(&[0, 2]), fs(&[2, 3])]
-        );
     }
 
     /// A fit-time cell correction is folded into the deployed bank, so the rebalance composes

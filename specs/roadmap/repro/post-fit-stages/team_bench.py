@@ -47,6 +47,14 @@ DATASETS: dict[str, tuple[str | None, str, bool]] = {
     "pg17_cover": ("247ea0b94fc140352d97367e", "multiclass", False),   # 100k, 4 classes
     "fr_instal": ("a1df2d5700a99a20fafdbd43", "multiclass", False),    # 52k, 4 classes
     "prudential": ("95d35ecb7cea120f24110598", "multiclass", False),   # 59k, 8 classes, 139 cols
+    "prudential_bin": ("95d35ecb7cea120f24110598", "multiclass", False),  # binary, y >= 6
+    # high-cardinality categoricals (target-encoded: more levels than cat_direct_max_levels)
+    "belgian16": ("d1eac51163b13b3ee16c0ad2", "poisson", True),   # 71k, vehicle_model 1038
+    "pg15": ("a2f5a8c738b7369d06d21db1", "poisson", True),        # 100k, SubGroup2 471, days
+    "brazil_freq": ("0feef85fa6117f0ff390303b", "poisson", True),  # 383k, VehModel 3831
+    "tic2000": ("e173d4bc9ccede4a6f8fb9b4", "binary", False),      # 9.8k, one 40-level column
+    "porto": ("342aa032b1a2ae8a21bf79f3", "binary", False),        # 595k, ps_car_11_cat 104
+    "allstate": ("7ce93bf8abadd46a35805abe", "gamma", False),      # 188k, 130 cols, 12 TS cats
 }
 FRE_FEATURES = ["Area", "VehPower", "VehAge", "DrivAge", "BonusMalus", "VehBrand", "VehGas",
                 "Density", "Region"]
@@ -78,6 +86,8 @@ def load(name: str, split: int = 0) -> dict[str, Any]:
         w = arrays["sample_weight"].astype(float) if arrays["sample_weight"].size else None
         if w is not None and (np.allclose(w, 1.0) or (e is not None and np.allclose(w, e))):
             w = None  # the exposure already carries it (or it is all ones)
+    if name == "prudential_bin":  # the wide binary task: response >= 6 of the 8 classes
+        task, y = "binary", (y >= 6).astype(float)
     if task == "multiclass":
         y = y.astype(int)
     test = np.random.default_rng(split).uniform(size=len(y)) >= 0.8

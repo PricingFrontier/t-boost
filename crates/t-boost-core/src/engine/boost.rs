@@ -1485,6 +1485,7 @@ fn fit_single(
         bag_spans: None,
         bag_intercepts: None,
         bag_in_bag: None,
+        fit_cat_bins: None,
         delta_step_gate: gate_state.report(),
         fit_report: Some(vec![BagFitReport {
             trees_kept: u32::try_from(trees_kept).unwrap_or(u32::MAX),
@@ -2557,6 +2558,7 @@ fn fit_multiclass_single(
             bag_spans: None,
             bag_intercepts: None,
             bag_in_bag: None,
+            fit_cat_bins: None,
             delta_step_gate: None,
             fit_report: None,
         };
@@ -4629,6 +4631,7 @@ fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
         bag_intercepts: Some(members.iter().map(|m| m.model.f0).collect()),
         // Filled in by `fit_outer_bag` (the only caller with a row partition to record).
         bag_in_bag: None,
+        fit_cat_bins: None,
         // Each bag ran its own independent gate (its own bootstrap/subagged rows ⇒ its own
         // collapse behavior), so the soup's report is the fold of the members': engaged if ANY
         // bag engaged, earliest engaging round, and the extreme rate ratio over all of them.

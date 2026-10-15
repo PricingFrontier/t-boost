@@ -446,22 +446,55 @@ three or more classes (stale since `85f40f1`).
 | Graduation off by default | 0 by construction | Forgoes the gain; violates "every stage runs" |
 | GCV interior-minimum (ceiling) rule | see PF-08 | Reviewer rejected |
 
-## PF-05. The serve-map leak beyond the rebalance (next investigation)
+## PF-05. The serve-map leak beyond the rebalance (fixed 2026-10-15)
 
-PF-02's leak is not specific to the rebalance. The ranked path's out-of-bag prefix deviances,
-banding's curvature-weighted cells and graduation's cell weights all score training rows through
-the full-data target-statistic map. Tables on a target-encoded categorical therefore look better
-than they are at selection time, and banding and graduation see a distorted picture of them. This
-affects **default** fits whenever a categorical has more levels than `cat_direct_max_levels`.
+PF-02's leak is not specific to the rebalance: every post-fit stage that compares the tables'
+predictions with the fit rows' targets scored those rows through the full-data
+target-statistic map. That is the ranked path's out-of-bag evidence and the rebalance.
+Banding reads no target (it distils the unbanded scores), and graduation never smooths along a
+categorical axis, so neither is exposed beyond its training-deviance scale; the fold vote's
+fold models fit their own encoders, so their held-out folds are honest.
 
-Not measured. Suggested approach:
+### Mechanism
 
-1. Measure: on pg17_instal, prudential and a single-output set with a high-cardinality categorical,
-   compare each stage's training-row evidence for tables on target-encoded categoricals between the
-   full-data map and the training-time cross-fit encodings.
-2. Root fix: bin training rows for post-fit stages with the same cross-fit encodings the trees saw,
-   keeping the full-data map for serving only. That would also let PF-02's exclusion go, and with
-   it the Region regression.
+A fit records, per row, the out-of-fold bin the trees saw (`Model::fit_cat_bins`, runtime-only),
+and `prune::fit_rows_matrix` rebuilds the fit design with those bins in place of the serve-map
+ones. Which axes need it was measured, not assumed:
+
+- **Levels that share bins (more than 254 levels after rare pooling).** A level joins the bin
+  its full-data statistic ranks it into, and a small level's statistic is mostly its own rows'
+  targets. The serve map placed a training row partly by its own target: the out-of-bag
+  deviance of the main effects was 1–2% too optimistic on the Brazilian frequency set (VehModel,
+  3,831 levels) and pg15 (SubGroup2, 471), and 0.5% on pg17 instalment.
+- **Each level in its own bin (up to 254 levels).** The serve cell is the level itself, which
+  reads no target (only the bin's rank does, a second-order effect). Out-of-fold placements there
+  only add noise: rows land in a neighbouring level's bin. Swapping these axes too cost ussev
+  +0.46% / +0.23% (CLASS, 18 levels) and TIC2000 +0.07% (40 levels).
+- Binary and multi-channel categoricals stay on the serve map (a binary feature's partition is
+  encoding-invariant; a multi-channel one scores through per-level joint cells).
+
+So the rule is: single-channel categoricals whose levels share bins score the fit rows as the
+trees saw them, in the ranked path's evidence and in the rebalance (the residual, the
+correction's design, its scores, the re-anchor and the check). Banks are still built and
+purified on the serve map (spec §03.2a). The PF-02 exclusion is gone: honest placement makes
+it unnecessary, and freMTPL2's Region tables are re-solved again.
+
+### Measurements (paired test deviance against the old behaviour, 8 datasets, 29 splits)
+
+| arm | what changes | mean of dataset means | splits better / worse (beyond 0.02%) |
+|---|---|---|---|
+| C | out-of-fold placements for every cross-fit axis, evidence and rebalance, no exclusion | +0.008% | 8 / 5 |
+| D | rebalance only (evidence unchanged), every cross-fit axis, no exclusion (27 splits) | −0.002% | 5 / 2 |
+| **E (shipped)** | **shared-bin axes only, evidence and rebalance, no exclusion** | **−0.011%** | **7 / 2** |
+
+E per dataset: freMTPL2 −0.022% (split 0 −0.066%: Region re-solved again), pg15 −0.038% (−0.048%,
+−0.066%, 0), Brazilian frequency −0.028%, pg17 coverage −0.012%, pg17 instalment −0.010% (the
+dataset the exclusion was built for; −0.013%, −0.015%, −0.002%), ussev −0.010%, TIC2000 +0.003%,
+Belgian 2016 +0.026% (its two losses, +0.045% and +0.085%). The multiclass selections did not change at all: the leak
+lifted the out-of-bag level but not its differences between path steps.
+
+Scripts and raw results: `repro/post-fit-stages/pf05_ab.py`, `pf05_summary.py`,
+`results/pf05_stage1.jsonl` (evidence only), `results/pf05_stage2.jsonl` (arms A, C, D, E).
 
 ## PF-06. Multiclass banding is too coarse on some sets (open decision)
 

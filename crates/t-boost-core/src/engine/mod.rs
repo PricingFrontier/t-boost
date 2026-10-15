@@ -885,6 +885,15 @@ pub struct Model {
     /// Never serialized: `None` on single fits (`n_bags == 1`), and on loaded models.
     #[serde(skip)]
     pub bag_in_bag: Option<Vec<Vec<bool>>>,
+    /// Runtime-only training-time bins of the FIT rows on every single-channel categorical
+    /// axis whose rows were binned by out-of-fold (cross-fit) target statistics, as
+    /// `(axis, bins)`: the cells the trees saw. The serve map bins a training row by a
+    /// full-data statistic that contains the row's own target, so the post-fit stages that
+    /// judge or refit the tables against the fit rows' targets score them here instead (see
+    /// [`crate::prune::fit_rows_matrix`]). `Some(empty)` when no axis needs it; `None` on loaded
+    /// models and constructions that are not fits. Excluded from `PartialEq`.
+    #[serde(skip)]
+    pub fit_cat_bins: Option<Vec<(u32, Vec<u8>)>>,
     /// Runtime-only report from the [`Config::max_delta_step_gated`] rate-collapse detector
     /// (`None` when the gate was not armed for this fit, or on a loaded model). Like
     /// [`Self::bag_spans`] this is a `#[serde(skip)]` introspection aid excluded from
@@ -899,9 +908,9 @@ pub struct Model {
 }
 
 impl PartialEq for Model {
-    /// Structural equality over every field EXCEPT `bag_spans`/`bag_in_bag`/`delta_step_gate`
-    /// (see the struct doc): all three are runtime-only introspection aids, never part of a
-    /// model's identity.
+    /// Structural equality over every field EXCEPT the runtime-only ones (`bag_spans`,
+    /// `bag_intercepts`, `bag_in_bag`, `fit_cat_bins`, `delta_step_gate`, `fit_report`; see the
+    /// struct doc): they are fit-time aids, never part of a model's identity.
     fn eq(&self, other: &Self) -> bool {
         self.f0 == other.f0
             && self.trees == other.trees

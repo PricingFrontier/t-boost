@@ -5,8 +5,8 @@ correction or any categorical was encoded by more than one channel. Now it re-so
 main and pair it can address, leaves the tables on a multi-channel categorical as fitted, and
 records the outcome in `pruning_report_["rebalance"]`.
 
-Tables on a categorical binned by cross-fit target statistics are left as fitted too: after the
-fit, the training rows are binned by full-data statistics that contain their own targets.
+A categorical whose levels share bins places its training rows as the trees saw them (their
+out-of-fold statistics), so its tables are re-solved like any other (2026-10-15).
 """
 
 from __future__ import annotations
@@ -40,32 +40,21 @@ def _fit(data, **kw) -> TBoostRegressor:
 
 
 def test_a_pruned_fit_reports_its_rebalance(data) -> None:
-    rep = _fit(data).pruning_report_["rebalance"]
+    est = _fit(data)
+    rep = est.pruning_report_["rebalance"]
     assert set(rep) == KEYS
-    assert rep["supports"] > 0
+    # "c" (raw 2) is target-encoded (40 levels), and its tables are re-solved with the rest.
+    kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
+    assert rep["excluded"] == [] and rep["supports"] == len(kept) > 0
+    assert any(2 in u for u in kept)
     assert rep["holdout_rows"] > 0
+    assert rep["adopted"] == (rep["holdout_deviance_after"] <= rep["holdout_deviance_before"])
     assert _fit(data, prune_rebalance=False).pruning_report_.get("rebalance") is None
 
 
-def test_tables_on_a_target_encoded_categorical_are_left_as_fitted(data) -> None:
-    # "c" (raw 2) has 40 levels: more than `cat_direct_max_levels`, so it is binned by
-    # cross-fit target statistics and its tables keep their values. Let it bin each level on
-    # its own and they are re-solved like any other.
-    est = _fit(data)
-    rep = est.pruning_report_["rebalance"]
-    kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
-    assert rep["excluded"] == [u for u in kept if 2 in u] != []
-    assert rep["supports"] == len(kept) - len(rep["excluded"]) > 0
-    direct = _fit(data, cat_direct_max_levels=64)
-    rep = direct.pruning_report_["rebalance"]
-    kept = [u for u in direct.pruning_report_["kept"] if len(u) <= 2]
-    assert rep["excluded"] == [] and rep["supports"] == len(kept)
-
-
 def test_tables_on_a_multichannel_categorical_are_left_as_fitted(data) -> None:
-    # 40 levels clears `cat_count_min_levels`, so "c" (raw 2) gets a count channel too; its
-    # mean channel bins each level on its own, so the channels are the only reason.
-    est = _fit(data, cat_channels=["mean", "count"], cat_direct_max_levels=64)
+    # 40 levels clears `cat_count_min_levels`, so "c" (raw 2) gets a count channel too.
+    est = _fit(data, cat_channels=["mean", "count"])
     rep = est.pruning_report_["rebalance"]
     kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
     assert rep["excluded"] == [u for u in kept if 2 in u] != []
@@ -128,3 +117,21 @@ def test_the_multiclass_step_is_judged_on_the_model_it_deploys(three_class) -> N
     assert int(held.sum()) == rep["holdout_rows"]
     p = est.predict_proba(X)[held, y[held]]
     np.testing.assert_allclose(-np.log(p).mean(), rep["holdout_deviance_after"], rtol=1e-5)
+
+
+def test_a_categorical_whose_levels_share_bins_is_re_solved_as_the_trees_saw_it() -> None:
+    # 400 levels outnumber the 254 bins, so levels share bins and the serve map would place a
+    # training row partly by its own target. The selection evidence and the rebalance score
+    # the fit rows at their out-of-fold placements instead, and its tables are re-solved.
+    rng = np.random.default_rng(3)
+    n = 8000
+    levels = [f"L{i}" for i in range(400)]
+    effect = dict(zip(levels, rng.normal(scale=0.5, size=len(levels))))
+    a, c = rng.normal(size=n), rng.choice(levels, n)
+    y = rng.poisson(np.exp(0.4 * a + np.array([effect[v] for v in c]) - 1.0)).astype(float)
+    X = pl.DataFrame({"a": a, "c": c})
+    est = TBoostRegressor(objective="poisson", n_trees=150, seed=0, n_jobs=2).fit(X, y)
+    rep = est.pruning_report_["rebalance"]
+    assert rep["excluded"] == []
+    assert any(1 in u for u in est.pruning_report_["kept"])
+    assert np.isfinite(est.predict(X)).all()

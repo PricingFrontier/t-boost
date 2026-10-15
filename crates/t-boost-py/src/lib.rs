@@ -1263,6 +1263,60 @@ mod cat_channels_fit_path_tests {
         }
     }
 
+    /// A fit records the training-time bins of exactly the categoricals whose levels share
+    /// bins (more levels than the 254 bins) for the post-fit stages that score the fit rows:
+    /// a 300-level feature's rows are placed by their out-of-fold statistics, while a 40-level
+    /// feature (one bin per level) and a binary one stay on the serve map.
+    #[test]
+    fn a_fit_records_the_training_bins_of_categoricals_whose_levels_share_bins() {
+        let n = 1500;
+        let numeric: Vec<f32> = (0..n).map(|i| (i % 37) as f32).collect();
+        let shared: Vec<String> = (0..n).map(|i| format!("s{}", i % 300)).collect();
+        let own: Vec<String> = (0..n).map(|i| format!("o{}", i % 40)).collect();
+        let binary: Vec<String> = (0..n).map(|i| format!("b{}", i % 2)).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                ((i % 300) as f32 * 0.01) + ((i % 40) as f32 * 0.05) + ((i * 7919) % 13) as f32
+            })
+            .collect();
+        let mut state = booster_with_count_channel_and_floor(1000, 1.0);
+        state.cat_channels = CatChannelPlan {
+            mean: true,
+            count: false,
+            class_freq: false,
+        };
+        let monotone_map = build_monotone_map(None, 4).unwrap();
+        let cat_x = vec![shared.clone(), own.clone(), binary.clone()];
+        let model = fit_model_ambient(
+            &state,
+            std::slice::from_ref(&numeric),
+            &y,
+            None,
+            None,
+            None,
+            None,
+            &monotone_map,
+            Some(&cat_x),
+            None,
+        )
+        .unwrap();
+        // Axes: numeric 0, then one mean channel per categorical (1, 2, 3).
+        let recorded = model.fit_cat_bins.as_ref().expect("a fit records its bins");
+        let axes: Vec<u32> = recorded.iter().map(|(axis, _)| *axis).collect();
+        assert_eq!(
+            axes,
+            vec![1],
+            "only the 300-level feature's levels share bins"
+        );
+        let serve = serve_binned_for_model(&model, &[numeric], Some(&cat_x)).unwrap();
+        let (_, bins) = &recorded[0];
+        assert_eq!(bins.len(), n);
+        assert_ne!(
+            bins, &serve.data[1],
+            "out-of-fold placements differ from the serve map"
+        );
+    }
+
     /// The team lead's exact regression scenario: a mix of a high-cardinality categorical
     /// (admitted for the count channel -> 2 axes) and a low-cardinality one (mean-only -> 1
     /// axis), fit with caller-supplied `feature_names` sized to the 3 INPUT columns (1
@@ -7931,6 +7985,52 @@ where
     }
 }
 
+/// The fit rows' training-time bins on every single-channel categorical axis whose levels share
+/// bins and whose rows were binned by out-of-fold (cross-fit) statistics, for
+/// [`Model::fit_cat_bins`]. With more levels than bins (254) a level joins the bin its full-data
+/// statistic ranks it into, and a small level's statistic is mostly its own rows' targets: the
+/// serve map then places a training row partly by its own target. Where every level keeps its
+/// own bin, a row's serve cell is just its level, which reads no target, and the out-of-fold
+/// placements would only add noise (measured 2026-10-15, specs/roadmap/post-fit-stages.md,
+/// PF-05). A multi-channel categorical scores through per-level joint cells and stays on the
+/// serve map too.
+fn cross_fit_cat_bins(
+    train: &BinnedMatrix,
+    serve: &BinnedMatrix,
+    encoders: &t_boost_core::cat::CatEncoderStore,
+) -> Result<Vec<(u32, Vec<u8>)>, PbError> {
+    let mut out = Vec::new();
+    for (axis, p) in train.provenance.iter().enumerate() {
+        let AxisKind::CategoricalTS { encoding } = p.kind else {
+            continue;
+        };
+        if t_boost_core::data::axes_for_raw(&train.provenance, p.raw).len() != 1 {
+            continue;
+        }
+        let mut bins = std::collections::BTreeSet::new();
+        if encoders
+            .get(encoding, p.raw)?
+            .levels
+            .iter()
+            .all(|level| bins.insert(level.bin))
+        {
+            continue;
+        }
+        let (Some(t), Some(v)) = (train.data.get(axis), serve.data.get(axis)) else {
+            return Err(PbError::Internal {
+                what: format!("categorical axis {axis} is missing from the fit design"),
+            });
+        };
+        if t != v {
+            let axis = u32::try_from(axis).map_err(|_| PbError::Internal {
+                what: "axis index exceeded u32".into(),
+            })?;
+            out.push((axis, t.clone()));
+        }
+    }
+    Ok(out)
+}
+
 /// [`fit_model_ambient_bagged`] with an external evaluation set (R1). The numeric grids and
 /// categorical encoders are fit on the fit rows alone; the evaluation rows are then binned
 /// through them exactly as serving bins unseen rows, appended, and marked as the shared
@@ -8067,7 +8167,9 @@ fn fit_with_eval_rows(
                 );
             }
             let x = append(fit_x, ev)?;
-            Booster::with_config(config).fit(&x, &all_y, &spec)?
+            let mut model = Booster::with_config(config).fit(&x, &all_y, &spec)?;
+            model.fit_cat_bins = Some(Vec::new());
+            model
         }
         Some(cats) => {
             let eval_cats = eval.cat_x.as_deref().unwrap_or(&[]);
@@ -8167,6 +8269,9 @@ fn fit_with_eval_rows(
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            // Recorded over the fit rows, before the evaluation rows are appended.
+            let fit_cat_bins =
+                cross_fit_cat_bins(&fitted.train.0, &fitted.serve.0, &fitted.cat_encoders)?;
             let train = fitted.train.0;
             let ev = bin_serve_columns(
                 &eval_numeric,
@@ -8177,7 +8282,14 @@ fn fit_with_eval_rows(
             )?;
             let x = TrainBinnedMatrix(append(train, ev.0)?);
             cat_axes_per_raw = Some(axes);
-            Booster::with_config(config).fit_train(&x, &all_y, &cat_spec, fitted.cat_encoders)?
+            let mut model = Booster::with_config(config).fit_train(
+                &x,
+                &all_y,
+                &cat_spec,
+                fitted.cat_encoders,
+            )?;
+            model.fit_cat_bins = Some(fit_cat_bins);
+            model
         }
     };
     // Bag membership is reported over the FIT rows only (the holdout rows were in every bag).
@@ -8321,7 +8433,9 @@ fn fit_model_ambient_bagged(
         None => {
             let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
             let x = bin_columns(&refs, weight, &state.bin_config, state.seed)?;
-            Booster::with_config(state.config.clone()).fit(&x, y, &spec)?
+            let mut model = Booster::with_config(state.config.clone()).fit(&x, y, &spec)?;
+            model.fit_cat_bins = Some(Vec::new());
+            model
         }
         // Native categorical path: numeric columns keep raw ids `0..n_numeric`, each
         // categorical column gets a sequential raw id after them, so the serve-time
@@ -8401,12 +8515,16 @@ fn fit_model_ambient_bagged(
                 state.seed,
                 honest_holdout.as_deref(),
             )?;
-            Booster::with_config(state.config.clone()).fit_train(
+            let fit_cat_bins =
+                cross_fit_cat_bins(&fitted.train.0, &fitted.serve.0, &fitted.cat_encoders)?;
+            let mut model = Booster::with_config(state.config.clone()).fit_train(
                 &fitted.train,
                 y,
                 &cat_spec,
                 fitted.cat_encoders,
-            )?
+            )?;
+            model.fit_cat_bins = Some(fit_cat_bins);
+            model
         }
     };
     if let Some(names) = feature_names {
@@ -8545,13 +8663,16 @@ fn fit_multiclass_owned_bagged(
             None => {
                 let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
                 let x = bin_columns(&refs, weight.as_deref(), &state.bin_config, state.seed)?;
-                let model = Booster::with_config(state.config.clone()).fit_multiclass(
+                let mut model = Booster::with_config(state.config.clone()).fit_multiclass(
                     &x,
                     &y,
                     n_classes,
                     &class_labels,
                     &spec,
                 )?;
+                for class in &mut model.classes {
+                    class.fit_cat_bins = Some(Vec::new());
+                }
                 Ok((model, None))
             }
             Some(cats) => {
@@ -8657,7 +8778,9 @@ fn fit_multiclass_owned_bagged(
                     state.seed,
                     honest_holdout.as_deref(),
                 )?;
-                let model = Booster::with_config(state.config.clone()).fit_multiclass_train(
+                let fit_cat_bins =
+                    cross_fit_cat_bins(&fitted.train.0, &fitted.serve.0, &fitted.cat_encoders)?;
+                let mut model = Booster::with_config(state.config.clone()).fit_multiclass_train(
                     &fitted.train,
                     &y,
                     n_classes,
@@ -8665,6 +8788,9 @@ fn fit_multiclass_owned_bagged(
                     &cat_spec,
                     fitted.cat_encoders,
                 )?;
+                for class in &mut model.classes {
+                    class.fit_cat_bins = Some(fit_cat_bins.clone());
+                }
                 Ok((model, Some(cat_axes_per_raw)))
             }
         }

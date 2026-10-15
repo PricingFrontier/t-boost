@@ -352,11 +352,10 @@ prefixes of the `ranked_path` selector. With fewer, the ranked path is not used.
 After tables are dropped, re-solve the values of the remaining tables for the smaller structure
 (one ridge IRLS step, followed by purification). The new values are kept only if they do not
 raise the held-out deviance. Tables on a categorical feature encoded by several channels (see
-[`cat_channels`](categorical.md#cat_channels)), or on one with more levels than
-[`cat_direct_max_levels`](categorical.md#cat_direct_max_levels), keep their values; every other
-main effect and two-way interaction is re-solved. For multiclassification each class's tables are
-re-solved, and a single step size, chosen on the held-out deviance of all classes together, decides
-how much of the change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
+[`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
+two-way interaction is re-solved. For multiclassification each class's tables are re-solved, and a
+single step size, chosen on the held-out deviance of all classes together, decides how much of the
+change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
 
 ### [prune_table_budget](pruning.md#prune_table_budget)
 
