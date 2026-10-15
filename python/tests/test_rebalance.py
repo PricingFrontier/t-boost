@@ -5,9 +5,8 @@ correction or any categorical was encoded by more than one channel. Now it re-so
 main and pair it can address, leaves the tables on a multi-channel categorical as fitted, and
 records the outcome in `pruning_report_["rebalance"]`.
 
-The bags judge the re-solve on the rows each left out; a single bag falls back to a held-out slice
-of the training rows (2026-10-15). A categorical whose levels share bins places its training rows
-as the trees saw them (their out-of-fold statistics), so its tables are re-solved like any other.
+A categorical whose levels share bins places its training rows as the trees saw them (their
+out-of-fold statistics), so its tables are re-solved like any other (2026-10-15).
 """
 
 from __future__ import annotations
@@ -18,8 +17,8 @@ import pytest
 
 from t_boost import TBoostClassifier, TBoostRegressor
 
-KEYS = {"adopted", "step", "supports", "excluded", "evidence", "holdout_rows",
-        "holdout_deviance_before", "holdout_deviance_after"}
+KEYS = {"adopted", "step", "supports", "excluded", "holdout_rows", "holdout_deviance_before",
+        "holdout_deviance_after"}
 
 
 @pytest.fixture(scope="module")
@@ -37,8 +36,7 @@ def data() -> tuple[pl.DataFrame, np.ndarray]:
 
 def _fit(data, **kw) -> TBoostRegressor:
     X, y = data
-    params = {"objective": "poisson", "n_trees": 200, "seed": 0, "n_jobs": 2, **kw}
-    return TBoostRegressor(**params).fit(X, y)
+    return TBoostRegressor(objective="poisson", n_trees=200, seed=0, n_jobs=2, **kw).fit(X, y)
 
 
 def test_a_pruned_fit_reports_its_rebalance(data) -> None:
@@ -49,17 +47,9 @@ def test_a_pruned_fit_reports_its_rebalance(data) -> None:
     kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
     assert rep["excluded"] == [] and rep["supports"] == len(kept) > 0
     assert any(2 in u for u in kept)
-    # The bags judge the re-solve: a row counts once for every bag that left it out.
-    assert rep["evidence"] == "out_of_bag" and rep["holdout_rows"] > len(data[1]) // 2
+    assert rep["holdout_rows"] > 0
     assert rep["adopted"] == (rep["holdout_deviance_after"] <= rep["holdout_deviance_before"])
     assert _fit(data, prune_rebalance=False).pruning_report_.get("rebalance") is None
-
-
-def test_a_single_bag_is_judged_on_a_held_out_slice(data) -> None:
-    rep = _fit(data, n_bags=1).pruning_report_["rebalance"]
-    assert set(rep) == KEYS
-    # Without bags no row is held out of the trees: about 15% of the rows judge it.
-    assert rep["evidence"] == "in_sample" and 0 < rep["holdout_rows"] < len(data[1]) // 4
 
 
 def test_tables_on_a_multichannel_categorical_are_left_as_fitted(data) -> None:
@@ -87,16 +77,14 @@ def three_class() -> tuple[pl.DataFrame, np.ndarray]:
 def _fit_mc(data, **kw) -> TBoostClassifier:
     X, y = data
     # Few, large trees underfit: the dropped tables then leave a residual the re-solve recovers.
-    params = {"n_trees": 8, "learning_rate": 0.3, "validation_fraction": None, "seed": 0,
-              "n_jobs": 2, **kw}
-    return TBoostClassifier(**params).fit(X, y)
+    return TBoostClassifier(n_trees=8, learning_rate=0.3, validation_fraction=None, seed=0,
+                            n_jobs=2, **kw).fit(X, y)
 
 
 def test_a_multiclass_fit_rebalances_with_one_joint_step(three_class) -> None:
     est = _fit_mc(three_class)
     rep = est.pruning_report_["rebalance"]
     assert set(rep) == KEYS
-    assert rep["evidence"] == "out_of_bag"
     assert rep["adopted"] and 0 < rep["step"] <= 1
     assert rep["holdout_deviance_after"] < rep["holdout_deviance_before"]
     off = _fit_mc(three_class, prune_rebalance=False)
@@ -117,28 +105,18 @@ def test_per_class_channels_leave_the_categorical_as_fitted(three_class) -> None
 
 def test_the_multiclass_step_is_judged_on_the_model_it_deploys(three_class) -> None:
     # The deploy re-anchors the class intercepts after the correction; each trial step is now
-    # re-anchored the same way before it is scored, so with one bag the reported held-out
-    # deviance is the deployed model's own on the held-out slice (banding and graduation off,
-    # so nothing else moves it).
+    # re-anchored the same way before it is scored, so the reported held-out deviance is the
+    # deployed model's own on the held-out slice (banding and graduation off, so nothing else
+    # moves it).
     X, y = three_class
-    est = _fit_mc(three_class, n_bags=1, band_tolerance=None, graduate=False)
+    est = _fit_mc(three_class, band_tolerance=None, graduate=False)
     rep = est.pruning_report_["rebalance"]
-    assert rep["evidence"] == "in_sample" and rep["adopted"]
+    assert rep["adopted"]
     r = np.arange(len(y), dtype=np.uint64)
     held = ((r * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(56)) < 38  # the core's slice
     assert int(held.sum()) == rep["holdout_rows"]
     p = est.predict_proba(X)[held, y[held]]
     np.testing.assert_allclose(-np.log(p).mean(), rep["holdout_deviance_after"], rtol=1e-5)
-
-
-def test_the_bags_judge_alike_at_any_thread_count(data, three_class) -> None:
-    # The bags are judged in parallel waves and summed in bag order: byte-identical models.
-    from _artifact import model_bytes
-
-    for fit, d in ((_fit, data), (_fit_mc, three_class)):
-        one, many = fit(d, n_jobs=1), fit(d, n_jobs=4)
-        assert one.pruning_report_["rebalance"] == many.pruning_report_["rebalance"]
-        assert model_bytes(one) == model_bytes(many)
 
 
 def test_a_categorical_whose_levels_share_bins_is_re_solved_as_the_trees_saw_it() -> None:
@@ -154,6 +132,6 @@ def test_a_categorical_whose_levels_share_bins_is_re_solved_as_the_trees_saw_it(
     X = pl.DataFrame({"a": a, "c": c})
     est = TBoostRegressor(objective="poisson", n_trees=150, seed=0, n_jobs=2).fit(X, y)
     rep = est.pruning_report_["rebalance"]
-    assert rep["evidence"] == "out_of_bag" and rep["excluded"] == []
+    assert rep["excluded"] == []
     assert any(1 in u for u in est.pruning_report_["kept"])
     assert np.isfinite(est.predict(X)).all()

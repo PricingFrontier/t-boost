@@ -2031,9 +2031,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # Post-prune re-solve ("rebalance on means", default on): after the keep-set is chosen,
         # recalibrate the surviving tables' cell values to the deviance-optimum of the reduced
         # structure (a single IRLS ridge cell-refit step), re-purified to preserve the 1-/2-/3-way
-        # order separation. Held-out no-harm guarded: each bag re-solves its own tables on the rows
-        # it trained on and is scored on the rows it left out; with one bag, a slice of the
-        # training rows judges it. Set False to deploy the drop-only pruned model.
+        # order separation. Held-out no-harm guarded — adopted only if it lowers held-out deviance,
+        # so it can only help or be neutral. Set False to deploy the drop-only pruned model.
         self.prune_rebalance = prune_rebalance
         self.ref_measure = ref_measure
         self.measure_floor = measure_floor
@@ -5922,8 +5921,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        pruning falls back to the fold vote and the rebalance (``prune_rebalance``) to a
-        held-out slice of the training rows, and no spread between bags, so
+        pruning falls back to the fold vote, and no spread between bags, so
         ``band_deviance_cap`` alone bounds the banding.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
@@ -6415,12 +6413,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: each bag re-solves its own tables on the rows it trained on,
-        and the re-solve is adopted only if that does not raise the deviance of the rows the
-        bags left out (this judges the procedure; the deployed values are then fitted on every
-        row). With one bag (``n_bags=1``) a held-out slice of the training rows judges it
-        instead. Tables on a categorical encoded by several channels (``cat_channels``) are
-        left as fitted; the outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
+        Held-out no-harm guarded: adopted only if it does not raise the held-out deviance.
+        Tables on a categorical encoded by several channels (``cat_channels``) are left as
+        fitted; the outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
         pruned model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
@@ -6492,8 +6487,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
 
         ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
         were adopted, how many kept tables they span, the tables left as fitted
-        (``excluded``), what judged them (``evidence``: ``"out_of_bag"``, or ``"in_sample"``
-        for the slice a single bag falls back to) and the held-out deviance before and after.
+        (``excluded``) and the held-out deviance before and after.
 
         ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
         its tables, the certificate (``"exact"`` when every combination of the other features
@@ -7238,8 +7232,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        pruning falls back to the fold vote and the rebalance (``prune_rebalance``) to a
-        held-out slice of the training rows, and no spread between bags, so
+        pruning falls back to the fold vote, and no spread between bags, so
         ``band_deviance_cap`` alone bounds the banding. The multiclass (K>=3) path bags too,
         souping the bags per class.
     bag_subsample : float, default=0.8
@@ -7762,14 +7755,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: each bag re-solves its own tables on the rows it trained on,
-        and the re-solve is adopted only if that does not raise the deviance of the rows the
-        bags left out (this judges the procedure; the deployed values are then fitted on every
-        row). With one bag (``n_bags=1``) a held-out slice of the training rows judges it
-        instead. On a multiclass (K>=3) fit each class's tables are re-solved from the softmax
-        residual, and one joint step, chosen on the held-out multinomial deviance, decides how
-        much of it is kept. Tables on a categorical encoded by several channels are left as
-        fitted; the outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
+        Held-out no-harm guarded: adopted only if it does not raise the held-out deviance. On a
+        multiclass (K>=3) fit each class's tables are re-solved from the softmax residual, and
+        one joint step, chosen on the held-out multinomial deviance, decides how much of it is
+        kept. Tables on a categorical encoded by several channels are left as fitted; the
+        outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
         model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
         Banding: each deployed interaction table is condensed into a small product grid of
@@ -7844,8 +7834,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
 
         ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
         were adopted, how many kept tables they span, the tables left as fitted
-        (``excluded``), what judged them (``evidence``: ``"out_of_bag"``, or ``"in_sample"``
-        for the slice a single bag falls back to) and the held-out deviance before and after.
+        (``excluded``) and the held-out deviance before and after.
 
         ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
         its tables, the certificate (``"exact"`` when every combination of the other features

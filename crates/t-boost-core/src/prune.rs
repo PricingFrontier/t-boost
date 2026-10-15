@@ -437,8 +437,8 @@ pub struct BoxBudgetReport {
 /// the sklearn estimator's `pruning_report_["rebalance"]`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct RebalanceReport {
-    /// Whether the re-solved cell values were deployed: the judged re-solve did not raise the
-    /// held-out deviance (or there were no held-out rows).
+    /// Whether the re-solved cell values were deployed: they did not raise the deviance of the
+    /// held-out slice (or there was none).
     pub adopted: bool,
     /// The fraction of the re-solve deployed: 1 when adopted on a single-output fit; on a
     /// multiclass fit, the joint step the held-out multinomial deviance chose. 0 when declined.
@@ -448,33 +448,13 @@ pub struct RebalanceReport {
     /// Kept main and pair tables left as fitted: each touches a categorical encoded by more
     /// than one channel, which the cell correction cannot address as a single axis.
     pub excluded: Vec<FeatureSet>,
-    /// What judged the re-solve.
-    pub evidence: RebalanceEvidence,
-    /// Rows held out of the re-solve to judge it. With out-of-bag evidence a row counts once
-    /// for every bag that left it out.
+    /// Rows held out of the re-solve to judge it.
     pub holdout_rows: u64,
-    /// The held-out deviance before the re-solve, on the loss's own scale (a total for a
-    /// single-output loss, the mean cross-entropy for a multiclass one); with out-of-bag
-    /// evidence, over every bag's out-of-bag rows.
+    /// The held-out slice's deviance before the re-solve, on the loss's own scale (a total for a
+    /// single-output loss, the mean cross-entropy for a multiclass one).
     pub holdout_deviance_before: Option<f64>,
     /// The held-out deviance after it.
     pub holdout_deviance_after: Option<f64>,
-}
-
-/// What judged a rebalance's re-solve ([`RebalanceReport::evidence`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RebalanceEvidence {
-    /// The re-solve procedure, cross-validated over the bags: each bag's own re-solve, scored on
-    /// the rows that bag never trained on. The deployed correction (fitted on every row) is
-    /// not itself scored. With a fit-time cell correction (`cell_refit_base`) every bag shares
-    /// the soup's, which saw its out-of-bag rows, so the check is then approximate.
-    OutOfBag,
-    /// A deterministic ~15% slice of the training rows, held out of the re-solve but not of the
-    /// trees: a soup without out-of-bag rows (`n_bags = 1`) has nothing better. The trees fitted
-    /// the slice, so the check is biased against the re-solve and declines more than it should.
-    #[default]
-    InSample,
 }
 
 /// Per-support deployed BOX cost across one or more banks (one bank per class for a
@@ -2440,22 +2420,13 @@ pub struct BagOobGroupSums {
 /// `purify(trees + δ) = base + purify(δ)`: it purifies the tiny correction `δ` alone
 /// ([`crate::explain::purify_correction`]) — re-purified, so the 1-/2-/3-way order separation
 /// is preserved — and adds it to the already-built deploy bank, instead of paying a second
-/// (expensive, 8-bag) `explain_bank`.
+/// (expensive, 8-bag) `explain_bank`. A deterministic ~15% held-out slice never enters the fit
+/// and gates the result: the rebalance is adopted only if it does not raise the slice's
+/// deviance.
 ///
 /// The re-solve reads the fit rows' targets, so it places them as the trees saw them
 /// ([`fit_rows_matrix`]): `base_raw` (the serve-map score, computed for the deploy re-anchor) is
 /// rescored there when a categorical needs it.
-///
-/// It is adopted only if it does not raise the held-out deviance, and what "held out" means
-/// decides whether that check can be trusted. A slice of the training rows cannot judge it
-/// well: the soup trained on every row, so a correction fitted to the other rows' residual is
-/// anti-correlated with the slice's own noise, and the check declined re-solves that lowered
-/// the test deviance (six single-output sets: adopted on 6 of 30 fits). The bags can judge it,
-/// because each bag never saw its out-of-bag rows: [`rebalance_bag_check`] gives every bag the
-/// same re-solve the deploy gives the soup and scores it on those rows (adopted on 28 of 30).
-/// The deployed correction is then fitted on every row. Without out-of-bag rows (`n_bags = 1`)
-/// the deterministic ~15% slice judges it, staying out of the fit, and
-/// [`RebalanceReport::evidence`] says which.
 ///
 /// A fit-time cell correction (`model.correction`) is already folded into `base`, purified
 /// under the same row mass as `δ`, so the re-solve composes with it. A kept table that touches
@@ -2478,22 +2449,16 @@ fn rebalance_kept_cells(
     // (0) The correctable survivors: kept main + pair supports (order ≤ 2), as model axes.
     //     The §G1 cell-basis correction spans mains + pairs; kept triples ride along unchanged.
     let (supports, excluded) = rebalance_supports(&model.provenance, keep);
-    let n = serve.0.n_rows as usize;
-    let membership = rebalance_membership(model, n)?;
     let mut report = RebalanceReport {
         supports: supports.len() as u64,
         excluded,
-        evidence: if membership.is_some() {
-            RebalanceEvidence::OutOfBag
-        } else {
-            RebalanceEvidence::InSample
-        },
         ..RebalanceReport::default()
     };
     if supports.is_empty() {
         return Ok((base, report));
     }
     let prof = std::env::var_os("TBOOST_PROFILE").is_some();
+    let n = serve.0.n_rows as usize;
     let mass = measure_mass(&w_measure, w, offset);
     let fit_rows = fit_rows_matrix(model, serve)?;
     let rows = fit_rows.as_ref().unwrap_or(serve);
@@ -2506,110 +2471,53 @@ fn rebalance_kept_cells(
     } else {
         base_raw
     };
-    let shift_of = |raw: &[f64]| -> Result<f64, PbError> {
-        if do_reanchor {
-            anchor_shift(raw, None, y, w, offset, loss)
-        } else {
-            Ok(0.0)
-        }
-    };
 
+    // (1) The correction fitted outside the slice, (2) judged on the slice.
     let t = std::time::Instant::now();
-    let (delta_bank, shift) = if let Some(membership) = membership {
-        // (1) The check: every bag's own re-solve on the rows it left out.
-        let (before, after, held) = rebalance_bag_check(
-            model,
-            serve,
-            rows,
-            membership,
-            keep,
-            &supports,
-            y,
-            w,
-            offset,
-            loss,
-            &w_measure,
-            mass.as_deref(),
-            do_reanchor,
-        )?;
-        report.holdout_rows = held;
+    let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
+    let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
+    let (delta_bank, delta_raw) = purified_correction(
+        model,
+        serve,
+        rows,
+        base_raw,
+        &fit,
+        &supports,
+        y,
+        w,
+        offset,
+        loss,
+        &w_measure,
+        mass.as_deref(),
+    )?;
+    let mut corr_raw: Vec<f64> = base_raw
+        .iter()
+        .zip(&delta_raw)
+        .map(|(b, d)| b + d)
+        .collect();
+    let shift = if do_reanchor {
+        anchor_shift(&corr_raw, None, y, w, offset, loss)?
+    } else {
+        0.0
+    };
+    corr_raw.iter_mut().for_each(|v| *v += shift);
+    report.holdout_rows = slice.len() as u64;
+    // No held-out coverage (a handful of rows) → cannot evaluate → keep the re-solve.
+    if !slice.is_empty() {
+        let before = rows_deviance(base_raw, &slice, y, w, offset, loss)?;
+        let after = rows_deviance(&corr_raw, &slice, y, w, offset, loss)?;
         report.holdout_deviance_before = Some(before);
         report.holdout_deviance_after = Some(after);
         if prof {
             eprintln!(
-                "[rebalance]  (1) out-of-bag check {:.2}s (before={before:.5} after={after:.5})",
+                "[rebalance]  slice check {:.2}s (before={before:.5} after={after:.5})",
                 t.elapsed().as_secs_f64()
             );
         }
         if after > before {
             return Ok((base, report));
         }
-        // (2) The deployed correction, fitted on every row.
-        let all: Vec<usize> = (0..n).collect();
-        let (delta_bank, delta_raw) = purified_correction(
-            model,
-            serve,
-            rows,
-            base_raw,
-            &all,
-            &supports,
-            y,
-            w,
-            offset,
-            loss,
-            &w_measure,
-            mass.as_deref(),
-        )?;
-        let corr_raw: Vec<f64> = base_raw
-            .iter()
-            .zip(&delta_raw)
-            .map(|(b, d)| b + d)
-            .collect();
-        (delta_bank, shift_of(&corr_raw)?)
-    } else {
-        // (1) The correction fitted outside the slice, (2) judged on the slice.
-        let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
-        let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
-        let (delta_bank, delta_raw) = purified_correction(
-            model,
-            serve,
-            rows,
-            base_raw,
-            &fit,
-            &supports,
-            y,
-            w,
-            offset,
-            loss,
-            &w_measure,
-            mass.as_deref(),
-        )?;
-        let mut corr_raw: Vec<f64> = base_raw
-            .iter()
-            .zip(&delta_raw)
-            .map(|(b, d)| b + d)
-            .collect();
-        let shift = shift_of(&corr_raw)?;
-        corr_raw.iter_mut().for_each(|v| *v += shift);
-        report.holdout_rows = slice.len() as u64;
-        // No held-out coverage (a handful of rows) → cannot evaluate → keep the re-solve.
-        if !slice.is_empty() {
-            let before = rows_deviance(base_raw, &slice, y, w, offset, loss)?;
-            let after = rows_deviance(&corr_raw, &slice, y, w, offset, loss)?;
-            report.holdout_deviance_before = Some(before);
-            report.holdout_deviance_after = Some(after);
-            if prof {
-                eprintln!(
-                    "[rebalance]  (1-2) slice check {:.2}s (before={before:.5} after={after:.5})",
-                    t.elapsed().as_secs_f64()
-                );
-            }
-            if after > before {
-                return Ok((base, report));
-            }
-        }
-        (delta_bank, shift)
-    };
+    }
     // Materialise base ⊕ purify(δ) in place + apply the re-anchor shift.
     let mut corrected = base;
     crate::explain::add_bank_assign(&mut corrected, &delta_bank)?;
@@ -2622,34 +2530,6 @@ fn rebalance_kept_cells(
 /// The deterministic ~15% slice of the training rows that judges a rebalance without bags.
 fn in_rebalance_slice(r: usize) -> bool {
     ((r as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) < 38
-}
-
-/// The soup's bag membership for the rebalance's out-of-bag check, when it has one: every bag's
-/// membership must cover the `n` fit rows, and at least one bag must leave a row out (a tiny or
-/// few-group fit can have none). `None` sends the check to the in-sample slice.
-///
-/// # Errors
-/// [`PbError::ShapeMismatch`] if a bag's membership does not cover the fit rows.
-fn rebalance_membership(model: &Model, n: usize) -> Result<Option<&[Vec<bool>]>, PbError> {
-    if !bag_oob_evidence_available(model) {
-        return Ok(None);
-    }
-    let Some(membership) = model.bag_in_bag.as_deref() else {
-        return Ok(None);
-    };
-    for (bag, in_bag) in membership.iter().enumerate() {
-        if in_bag.len() != n {
-            return Err(PbError::ShapeMismatch {
-                what: format!(
-                    "the rebalance must judge the FIT design: bag {bag} membership covers {} \
-                     rows but the design has {n}",
-                    in_bag.len()
-                ),
-            });
-        }
-    }
-    let any_out = membership.iter().any(|in_bag| in_bag.iter().any(|&b| !b));
-    Ok(any_out.then_some(membership))
 }
 
 /// The rebalance's re-solve of `raw` (scores of the fit rows placed as in `rows`): the ridge cell
@@ -2749,85 +2629,6 @@ fn rows_deviance(
     Ok(f64::from(loss.deviance(&ry, &rr, &rw)?))
 }
 
-/// The rebalance's check on a bagged soup: the re-solve cross-validated over the bags. Each
-/// bag's keep-set bank (built on `serve`) is scored on the fit rows as the trees saw them
-/// (`rows`), anchored on the rows the bag trained on, re-solved there exactly as the deploy
-/// re-solves the soup (the cell correction fitted to its in-bag working residual, then
-/// re-anchored), and scored on its out-of-bag rows, which neither the bag nor its correction
-/// saw. Returns the deviance before and after and the number of out-of-bag rows, summed over
-/// the bags (a row counts once for every bag that left it out).
-///
-/// The bag banks are built one at a time, so one bank is live at once (see
-/// [`bag_raw_scores_for_rows`]); only each bag's score is kept. The corrections are independent
-/// and each solve is mostly sequential inside, so they fan out over the pool a wave at a time,
-/// as the multiclass class solves do, and the sums are taken in bag order. A §G1 cell correction
-/// is shared whole by every bag, as on the out-of-bag evidence path (`bag_member_model`).
-#[allow(clippy::too_many_arguments)]
-fn rebalance_bag_check(
-    model: &Model,
-    serve: &ServeBinnedMatrix,
-    rows: &ServeBinnedMatrix,
-    membership: &[Vec<bool>],
-    keep: &[FeatureSet],
-    supports: &[Vec<u32>],
-    y: &[f32],
-    w: &[f32],
-    offset: Option<&[f32]>,
-    loss: &dyn Loss,
-    w_measure: &RefMeasure,
-    mass: Option<&[f32]>,
-    do_reanchor: bool,
-) -> Result<(f64, f64, u64), PbError> {
-    let n = rows.0.n_rows as usize;
-    let split = |in_bag: &[bool]| -> (Vec<usize>, Vec<usize>) { (0..n).partition(|&r| in_bag[r]) };
-    // Each bag's keep-set score on every row, anchored on its in-bag rows.
-    let soup_grids = crate::explain::MergedGrids::from_model(model)?;
-    let mut scored: Vec<(&[bool], Vec<f64>)> = Vec::with_capacity(membership.len());
-    for (bag, in_bag) in membership.iter().enumerate() {
-        let (inb, oob) = split(in_bag);
-        if inb.is_empty() || oob.is_empty() {
-            continue;
-        }
-        let bank = retain_tables(
-            &bag_bank(model, serve, w_measure, mass, &soup_grids, bag, true)?,
-            keep,
-        );
-        let mut raw = vec![0.0_f64; n];
-        crate::scoring::score_bank_binned(&bank, &model.schema.cat_encoders, &rows.0, &mut raw)?;
-        if do_reanchor {
-            let s = anchor_shift(&raw, Some(&inb), y, w, offset, loss)?;
-            raw.iter_mut().for_each(|v| *v += s);
-        }
-        scored.push((in_bag, raw));
-    }
-    let judge = |(in_bag, raw): &(&[bool], Vec<f64>)| -> Result<(f64, f64, u64), PbError> {
-        let (inb, oob) = split(in_bag);
-        let (_, delta) = purified_correction(
-            model, serve, rows, raw, &inb, supports, y, w, offset, loss, w_measure, mass,
-        )?;
-        let mut corr: Vec<f64> = raw.iter().zip(&delta).map(|(b, d)| b + d).collect();
-        if do_reanchor {
-            let s = anchor_shift(&corr, Some(&inb), y, w, offset, loss)?;
-            corr.iter_mut().for_each(|v| *v += s);
-        }
-        Ok((
-            rows_deviance(raw, &oob, y, w, offset, loss)?,
-            rows_deviance(&corr, &oob, y, w, offset, loss)?,
-            oob.len() as u64,
-        ))
-    };
-    let (mut before, mut after, mut held) = (0.0_f64, 0.0_f64, 0_u64);
-    for wave in scored.chunks(crate::engine::boost::MC_REFIT_CLASS_WAVE) {
-        let judged: Vec<(f64, f64, u64)> = wave.par_iter().map(judge).collect::<Result<_, _>>()?;
-        for (b, a, r) in judged {
-            before += b;
-            after += a;
-            held += r;
-        }
-    }
-    Ok((before, after, held))
-}
-
 /// The kept main and pair tables the rebalance re-solves, as sorted MODEL AXIS ids (what
 /// `correction_scaffold` reads), and the ones it leaves as fitted. A raw feature owns one axis
 /// unless it is a categorical encoded by several channels; a table touching such a feature is
@@ -2873,13 +2674,9 @@ type ClassCorrections = (Vec<TableBank>, Vec<f64>);
 /// (`[class][row]`). The K classes are solved apart (diagonal Hessian) and accepted or shrunk
 /// by ONE joint step on the held-out multinomial deviance, the design of the K-class §G1 cell
 /// refit (`attach_multiclass_cell_correction`), whose doc records why: the decoupled step keeps
-/// the joint Newton direction but overshoots it, most at small K. Step 0 declines it.
-///
-/// The step is judged as the single-output re-solve is: on a bagged soup by every bag's own
-/// re-solve on its out-of-bag rows ([`multiclass_rebalance_bag_check`]), with the deployed
-/// corrections then fitted on every row; without out-of-bag rows on the deterministic ~15%
-/// slice, which stays out of the fit. Every trial step is re-anchored as the deploy re-anchors
-/// the chosen one, so the check scores the model the deploy would ship.
+/// the joint Newton direction but overshoots it, most at small K. Step 0 declines it. Every
+/// trial step is re-anchored as the deploy re-anchors the chosen one, so the check scores the
+/// model the deploy would ship.
 ///
 /// Like the single-output re-solve it places the fit rows as the trees saw them
 /// ([`fit_rows_matrix`]): `raw` (serve-map logits) is rescored there when a categorical needs
@@ -2896,7 +2693,6 @@ fn rebalance_multiclass_cells(
     mc: &MultiClassModel,
     banks_kept: &[TableBank],
     raw: &[Vec<f64>],
-    keep: &[FeatureSet],
     serve: &ServeBinnedMatrix,
     labels: &[u32],
     w: &[f32],
@@ -2922,33 +2718,15 @@ fn rebalance_multiclass_cells(
         excluded.extend(left);
         class_supports.push(axes);
     }
-    let n = labels.len();
-    // The K classes of a bag share one row draw: their membership must match.
-    if mc
-        .classes
-        .iter()
-        .any(|c| c.bag_in_bag.as_ref() != first.bag_in_bag.as_ref())
-    {
-        return Err(PbError::Internal {
-            what: "multiclass rebalance: the K classes of a bag share one row draw, so their \
-                   membership must match"
-                .into(),
-        });
-    }
-    let membership = rebalance_membership(first, n)?;
     let mut report = RebalanceReport {
         supports: resolved.len() as u64,
         excluded: excluded.into_iter().collect(),
-        evidence: if membership.is_some() {
-            RebalanceEvidence::OutOfBag
-        } else {
-            RebalanceEvidence::InSample
-        },
         ..RebalanceReport::default()
     };
     if resolved.is_empty() {
         return Ok((None, report));
     }
+    let n = labels.len();
     let fit_rows = fit_rows_matrix(first, serve)?;
     let rows = fit_rows.as_ref().unwrap_or(serve);
     let rescored: Vec<Vec<f64>>;
@@ -2971,58 +2749,29 @@ fn rebalance_multiclass_cells(
     } else {
         raw
     };
-    let all: Vec<usize> = (0..n).collect();
 
-    let t = std::time::Instant::now();
-    // (1) The step deviances: per bag on its out-of-bag rows, else on the slice from the
-    //     corrections fitted outside it (which then deploy).
-    let (devs, held, slice_fit) = if let Some(membership) = membership {
-        let (devs, held) = multiclass_rebalance_bag_check(
-            mc,
-            serve,
-            rows,
-            membership,
-            keep,
-            &class_supports,
-            labels,
-            w,
-            w_measure,
-            mass,
-        )?;
-        (devs, held, None)
-    } else {
-        let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
-        let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
-        let corrections = class_corrections(
-            mc,
-            &class_supports,
-            raw,
-            &fit,
-            serve,
-            rows,
-            labels,
-            w,
-            w_measure,
-            mass,
-        )?;
-        let devs = if slice.is_empty() {
-            Vec::new()
-        } else {
-            joint_step_devs(raw, &corrections.1, labels, w, &all, &slice)?
-        };
-        (devs, slice.len() as u64, Some(corrections))
-    };
-    if std::env::var_os("TBOOST_PROFILE").is_some() {
-        eprintln!(
-            "[rebalance]  multiclass {:?} check {:.2}s ({held} rows)",
-            report.evidence,
-            t.elapsed().as_secs_f64()
-        );
-    }
-    report.holdout_rows = held;
-    // Without held-out rows (a handful of rows) the Newton step stands.
+    // (1) The corrections, fitted outside the deterministic ~15% slice; (2) one joint step on
+    //     the slice's multinomial deviance, all K classes together, over the cell refit's grid.
+    //     Without held-out rows (a handful of rows) the Newton step stands.
+    let all: Vec<usize> = (0..n).collect();
+    let fit: Vec<usize> = (0..n).filter(|&r| !in_rebalance_slice(r)).collect();
+    let slice: Vec<usize> = (0..n).filter(|&r| in_rebalance_slice(r)).collect();
+    let (mut banks, scores) = class_corrections(
+        mc,
+        &class_supports,
+        raw,
+        &fit,
+        serve,
+        rows,
+        labels,
+        w,
+        w_measure,
+        mass,
+    )?;
+    report.holdout_rows = slice.len() as u64;
     let mut step = 1.0_f64;
-    if !devs.is_empty() {
+    if !slice.is_empty() {
+        let devs = joint_step_devs(raw, &scores, labels, w, &all, &slice)?;
         let (mut best_dev, mut best_step) = (f64::INFINITY, 0.0_f64);
         for (&trial, &dev) in crate::engine::boost::MC_CORRECTION_STEPS.iter().zip(&devs) {
             let trial = f64::from(trial);
@@ -3041,22 +2790,6 @@ fn rebalance_multiclass_cells(
     if !report.adopted {
         return Ok((None, report));
     }
-    // (2) The deployed corrections: fitted on every row when the bags judged them.
-    let (mut banks, scores) = match slice_fit {
-        Some(corrections) => corrections,
-        None => class_corrections(
-            mc,
-            &class_supports,
-            raw,
-            &all,
-            serve,
-            rows,
-            labels,
-            w,
-            w_measure,
-            mass,
-        )?,
-    };
     if step < 1.0 {
         for bank in &mut banks {
             scale_bank(bank, step)?;
@@ -3186,142 +2919,6 @@ fn joint_step_devs(
         )?);
     }
     Ok(devs)
-}
-
-/// [`rebalance_bag_check`] for a multiclass soup. The K classes of a bag share one row draw, so
-/// each bag's class banks (built on `serve`, scored on the fit rows as the trees saw them,
-/// `rows`) are anchored together on the rows it trained on, re-solved per class on its in-bag
-/// softmax residual ([`class_corrections`]), and the joint step, re-anchored on the in-bag rows
-/// at every trial, scored on its out-of-bag rows. Returns the mean multinomial deviance at each
-/// step over every bag's out-of-bag rows (empty when they carry no weight), and their count.
-///
-/// The class banks are built one bag at a time (the K-way peak the keep-set apply already has),
-/// and only each bag's anchored logits are kept. The class solves then run a few bags at a time,
-/// so that at most `MC_REFIT_CLASS_WAVE` of them are live, as in the cell refit; the sums are
-/// taken in bag order.
-#[allow(clippy::too_many_arguments)]
-fn multiclass_rebalance_bag_check(
-    mc: &MultiClassModel,
-    serve: &ServeBinnedMatrix,
-    rows: &ServeBinnedMatrix,
-    membership: &[Vec<bool>],
-    keep: &[FeatureSet],
-    class_supports: &[Vec<Vec<u32>>],
-    labels: &[u32],
-    w: &[f32],
-    w_measure: &RefMeasure,
-    mass: Option<&[f32]>,
-) -> Result<(Vec<f64>, u64), PbError> {
-    let n = labels.len();
-    let split = |in_bag: &[bool]| -> (Vec<usize>, Vec<usize>) { (0..n).partition(|&r| in_bag[r]) };
-    // Each bag's keep-set logits on every row, anchored together on its in-bag rows.
-    let grids: Vec<crate::explain::MergedGrids> = mc
-        .classes
-        .iter()
-        .map(crate::explain::MergedGrids::from_model)
-        .collect::<Result<_, _>>()?;
-    let t_banks = std::time::Instant::now();
-    let mut scored: Vec<(&[bool], Vec<Vec<f64>>)> = Vec::with_capacity(membership.len());
-    for (bag, in_bag) in membership.iter().enumerate() {
-        let (inb, oob) = split(in_bag);
-        if inb.is_empty() || oob.is_empty() {
-            continue;
-        }
-        let mut bag_raw: Vec<Vec<f64>> = mc
-            .classes
-            .par_iter()
-            .zip(grids.par_iter())
-            .map(|(model, grid)| -> Result<Vec<f64>, PbError> {
-                let bank = retain_tables(
-                    &bag_bank(model, serve, w_measure, mass, grid, bag, true)?,
-                    keep,
-                );
-                let mut out = vec![0.0_f64; n];
-                crate::scoring::score_bank_binned(
-                    &bank,
-                    &model.schema.cat_encoders,
-                    &rows.0,
-                    &mut out,
-                )?;
-                Ok(out)
-            })
-            .collect::<Result<_, _>>()?;
-        let in_raw: Vec<Vec<f64>> = bag_raw
-            .iter()
-            .map(|col| inb.iter().map(|&r| col[r]).collect())
-            .collect();
-        let in_labels: Vec<u32> = inb.iter().map(|&r| labels[r]).collect();
-        let in_w: Vec<f32> = inb.iter().map(|&r| w[r]).collect();
-        let shifts =
-            multiclass_intercept_shifts(&in_raw, &in_labels, &in_w, "rebalance bag anchor")?;
-        for (col, s) in bag_raw.iter_mut().zip(&shifts) {
-            col.iter_mut().for_each(|v| *v += s);
-        }
-        scored.push((in_bag, bag_raw));
-    }
-    let prof = std::env::var_os("TBOOST_PROFILE").is_some();
-    if prof {
-        eprintln!(
-            "[rebalance]    bag banks {:.2}s",
-            t_banks.elapsed().as_secs_f64()
-        );
-    }
-    let solve_ns = std::sync::atomic::AtomicU64::new(0);
-    let steps_ns = std::sync::atomic::AtomicU64::new(0);
-    // One bag's step deviances on its out-of-bag rows, their weight and count.
-    let judge = |(in_bag, bag_raw): &(&[bool], Vec<Vec<f64>>)| {
-        let (inb, oob) = split(in_bag);
-        let t_solve = std::time::Instant::now();
-        let (_, bag_scores) = class_corrections(
-            mc,
-            class_supports,
-            bag_raw,
-            &inb,
-            serve,
-            rows,
-            labels,
-            w,
-            w_measure,
-            mass,
-        )?;
-        let t_steps = std::time::Instant::now();
-        solve_ns.fetch_add(
-            u64::try_from(t_solve.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let devs = joint_step_devs(bag_raw, &bag_scores, labels, w, &inb, &oob)?;
-        steps_ns.fetch_add(
-            u64::try_from(t_steps.elapsed().as_nanos()).unwrap_or(u64::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        let bag_mass: f64 = oob.iter().map(|&r| f64::from(w[r])).sum();
-        Ok::<_, PbError>((devs, bag_mass, oob.len() as u64))
-    };
-    let per_wave = (crate::engine::boost::MC_REFIT_CLASS_WAVE / mc.classes.len().max(1)).max(1);
-    let mut totals = vec![0.0_f64; crate::engine::boost::MC_CORRECTION_STEPS.len()];
-    let (mut oob_mass, mut held) = (0.0_f64, 0_u64);
-    for wave in scored.chunks(per_wave) {
-        let judged: Vec<(Vec<f64>, f64, u64)> =
-            wave.par_iter().map(judge).collect::<Result<_, _>>()?;
-        for (devs, bag_mass, bag_rows) in judged {
-            for (total, dev) in totals.iter_mut().zip(&devs) {
-                *total += dev * bag_mass;
-            }
-            oob_mass += bag_mass;
-            held += bag_rows;
-        }
-    }
-    if prof {
-        eprintln!(
-            "[rebalance]    class solves {:.2}s, step deviances {:.2}s (summed over bags)",
-            solve_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9,
-            steps_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 * 1e-9
-        );
-    }
-    if oob_mass <= 0.0 {
-        return Ok((Vec::new(), held));
-    }
-    Ok((totals.iter().map(|t| t / oob_mass).collect(), held))
 }
 
 /// `bank` times `s`: purification is linear, so this is the bank purified from the scaled
@@ -3689,7 +3286,6 @@ pub fn prune_multiclass_to_keepset_budgeted(
             mc,
             &pruned_banks,
             &anchored,
-            keep,
             serve,
             labels,
             w,
@@ -4888,71 +4484,6 @@ mod tests {
             provenance: model.provenance.clone(),
         });
         (model, serve)
-    }
-
-    /// A bagged soup's re-solve is judged by its bags: each bag is re-solved on the rows it
-    /// trained on and scored on the rows it left out (one per bag here). Without out-of-bag rows
-    /// (no membership, or every bag drew every row) the deterministic slice judges it instead
-    /// (row 0 of three), and the report says which. Either way the decision is the reported
-    /// deviances', and it is deterministic. A membership that does not cover the design is
-    /// refused rather than read as "every row out of bag".
-    #[test]
-    fn rebalance_is_judged_on_each_bags_out_of_bag_rows() {
-        let (mut model, serve) = differing_borders_bagged_fixture();
-        let keep: Vec<FeatureSet> = model
-            .explain(&serve, RefMeasure::Uniform)
-            .unwrap()
-            .tables
-            .iter()
-            .map(|t| t.u.clone())
-            .collect();
-        let y = [1.0_f32, 9.0, 18.0];
-        let w = [1.0_f32; 3];
-        let deploy = |model: &Model| {
-            prune_model_to_keepset_budgeted(
-                model,
-                &serve,
-                &y,
-                &w,
-                None,
-                &SquaredError,
-                RefMeasure::Uniform,
-                false,
-                &keep,
-                true,
-                0,
-                0,
-                DEFAULT_TABLE_MIN_ARITY,
-                &BTreeMap::new(),
-            )
-            .map(|(tm, _, _, report)| (tm, report.unwrap()))
-        };
-        let (_, in_sample) = deploy(&model).unwrap();
-        assert_eq!(in_sample.evidence, RebalanceEvidence::InSample);
-        assert_eq!(in_sample.holdout_rows, 1);
-        model.bag_in_bag = Some(vec![vec![true; 3], vec![true; 3]]);
-        let (_, every_row_in) = deploy(&model).unwrap();
-        assert_eq!(
-            every_row_in, in_sample,
-            "no out-of-bag row: the slice judges it"
-        );
-
-        model.bag_in_bag = Some(vec![vec![true, true, false], vec![false, true, true]]);
-        let (tm, report) = deploy(&model).unwrap();
-        assert_eq!(report.evidence, RebalanceEvidence::OutOfBag);
-        assert_eq!(report.holdout_rows, 2, "row 2 for bag 0, row 0 for bag 1");
-        let (before, after) = (
-            report.holdout_deviance_before.unwrap(),
-            report.holdout_deviance_after.unwrap(),
-        );
-        assert!(before.is_finite() && after.is_finite());
-        assert_eq!(report.adopted, after <= before);
-        let (again, again_report) = deploy(&model).unwrap();
-        assert_eq!(again.bank, tm.bank);
-        assert_eq!(again_report, report);
-
-        model.bag_in_bag = Some(vec![vec![true, false], vec![false, true]]);
-        assert!(matches!(deploy(&model), Err(PbError::ShapeMismatch { .. })));
     }
 
     /// The fit rows as the trees saw them: the recorded training-time bins replace their axes,

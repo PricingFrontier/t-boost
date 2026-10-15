@@ -6,8 +6,9 @@ were fixed (see "Fixed" below).
 **Scope (maintainer, 2026-10-15).** The goal of this work is to simplify the library, remove logic
 that switches features off depending on settings, make the library easier to use, and fix bugs.
 Changing behaviour or defaults only to gain accuracy is out of scope. Items whose only motive is
-accuracy (PF-06, PF-07, PF-08, PF-11, PF-12, PF-16) are **parked**: their evidence stays below for
-a future accuracy-focused effort, but they are not on this roadmap's work list.
+accuracy (PF-03, PF-06, PF-07, PF-08, PF-11, PF-12) are **parked**: their evidence stays below for
+a future accuracy-focused effort, but they are not on this roadmap's work list. PF-03 had shipped
+and was reverted.
 
 ## Fixed (2026-10-15)
 
@@ -22,7 +23,7 @@ a future accuracy-focused effort, but they are not on this roadmap's work list.
 | PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
 | PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
 | PF-17 | `07db2af` | A multiclass fit now records its boosting report (`n_trees_per_bag_`, `stopping_reason_per_bag_`, `n_trees_`, `stopping_reason_`; counts are rounds), so the model report's existing "reached n_trees" warning fires for multiclass too. The cap itself stays the user's: they raise `n_trees` when the report says bags hit it (maintainer's decision). |
-| PF-03 | `3365ecf` | The rebalance is judged per bag on out-of-bag rows (the slice only without them), with the review's defects fixed. −0.109% over 17 datasets against no rebalance, −0.079% against the slice check; +0–22% fit time single-output, +17–45% multiclass; optimistic on the two smallest sets. See PF-03. |
+| PF-03 | `3365ecf`, reverted | The rebalance was judged per bag on out-of-bag rows: −0.109% over 17 datasets against no rebalance, −0.079% against the slice check, for about 500 lines, +0–22% fit time single-output and +17–45% multiclass. Reverted the same day under the scope above (an accuracy-only change); the rebalance is judged on the slice again. The evidence stays in PF-03. |
 
 Looked at and left as they are:
 
@@ -103,7 +104,7 @@ rejected, so they are not tried again.
 |---|---|---|---|---|
 | PF-01 | `band_deviance_cap` wording; 0, inf and nan switch banding off | Reword; raise unless finite and > 0 | none; byte-identical for valid caps | fixed `ec3937e` |
 | PF-02 | Rebalance learns a target-encoding leak | Leave tables on cross-fit-encoded categoricals as fitted | none | fixed `5fd8d6b`, superseded by PF-05 |
-| PF-03 | Rebalance check is biased against the re-solve | Per-bag out-of-bag check, correction fitted on every row | +0–22% fit time single-output, +17–45% multiclass | shipped `3365ecf`; accuracy-motivated, so under the scope above it is a revert candidate |
+| PF-03 | Rebalance check is biased against the re-solve | Per-bag out-of-bag check, correction fitted on every row | +0–22% fit time single-output, +17–45% multiclass | shipped `3365ecf`, reverted (accuracy only); parked |
 | PF-04 | Graduation's 1% check | Keep it; say it is a brake, not an accuracy test | none | fixed (docs) `87c48a9` |
 | PF-05 | The serve-map leak in selection and the rebalance | Score fit rows at their out-of-fold bins where levels share bins | none | fixed `d727ca2` (removes the PF-02 switch-off) |
 | PF-06 | Multiclass banding too coarse on some sets | Centred noise budget is the lever | small | parked (accuracy) |
@@ -116,7 +117,7 @@ rejected, so they are not tried again.
 | PF-13 | Banding can raise the cell count (densifies factored tables) | Find where; band factored tables in factored form | unknown | open (readability, low priority) |
 | PF-14 | `test_callback_true_stops_and_exceptions_propagate` is flaky under load | Make the stop deterministic | small | fixed `ae23d59`, `5831d31` |
 | PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is, apart from the validation coverage gap (open) |
-| PF-16 | The per-bag rebalance check is optimistic on very small data | Investigate | unknown | parked (accuracy; moot if PF-03 is reverted) |
+| PF-16 | The per-bag rebalance check is optimistic on very small data | — | — | moot: PF-03 reverted |
 | PF-17 | Multiclass fits stop at the 4,000-tree cap without saying so | Report it; the user raises `n_trees` | none | fixed (reporting) |
 
 ## PF-01. `band_deviance_cap` bounds an estimate, not the training rise
@@ -270,7 +271,13 @@ fix that.
 
 ## PF-03. The rebalance check is biased against the re-solve
 
-### Outcome (2026-10-15): the per-bag check ships
+### Outcome (2026-10-15): shipped, then reverted
+
+The per-bag check shipped in `3365ecf` and was reverted the same day: the maintainer set the
+scope of this work to simplification, removing switch-offs, ease of use and bug fixes, and the
+check was an accuracy-only change that added about 500 lines and up to 45% fit time. The
+rebalance is judged on the in-sample slice again (biased against the re-solve, so it adopts
+rarely on single-output fits). The record of what was built and measured follows.
 
 Ported onto the PF-05 rebalance (fit rows placed as the trees saw them), with the review's four
 defects fixed: with no out-of-bag rows (no membership, or every bag drew every row) the slice
@@ -787,19 +794,20 @@ with the callback; fix the test or make the stop deterministic.
 
 - PF-01's loose ends: 1e300 accepted; the core's `mse_cap = INFINITY` = "no cap"; the core's
   near-zero-budget "left unbanded" silent skip.
-- PF-03's: the multiclass check scores without the intercept re-anchor; the wasted deployed solve
-  on a decline.
+- PF-03's: the multiclass check scores without the intercept re-anchor (fixed, `e6fb8b0`); the
+  wasted deployed solve on a decline (gone while PF-03 shipped; with the slice check there is no
+  separate deployed solve).
 - PF-08's: the wrong `w_scale` comment.
 - Coverage gap across all three investigations: no Tweedie, squared error, real weighted or
   grouped (panel) data in the accuracy evidence; B checked only that those configurations run.
   Monotone fits were checked for B on fremtpl2 (BonusMalus +1): no harm from the repair.
-  **Still open:** the changes shipped here (PF-03, PF-05) need a correctness pass over those
+  **Still open:** the changes shipped here (PF-05 above all) need a correctness pass over those
   settings (Tweedie, squared error, sample weights with exposure, panel data with `groups`,
   `eval_set`, `cell_refit_base`): they must run, report sensibly and stay deterministic.
 
 Status of the rest: PF-01's loose ends were looked at and left as they are (see "Fixed"); the
-multiclass check's re-anchor was fixed in `e6fb8b0`; the wasted deployed solve on a declined
-rebalance is gone with `3365ecf`; the `w_scale` comment was fixed in `87c48a9`.
+multiclass check's re-anchor was fixed in `e6fb8b0`; the `w_scale` comment was fixed in
+`87c48a9`.
 
 ## PF-16. The per-bag rebalance check is optimistic on very small data
 
@@ -843,10 +851,8 @@ The original analysis:
 
 ## Remaining work (in scope)
 
-1. The validation coverage pass in PF-15 (correctness of PF-03 and PF-05 under Tweedie, squared
-   error, weights with exposure, panel data, `eval_set` and `cell_refit_base`).
-2. Decide whether PF-03 stays: it is the one shipped change made for accuracy alone, and it adds
-   about 500 lines and 17–45% multiclass fit time. Reverting `3365ecf` returns to the slice check.
-3. PF-13, if readability of the banded tables matters enough to look into it.
+1. The validation coverage pass in PF-15 (correctness of the shipped changes under Tweedie,
+   squared error, weights with exposure, panel data, `eval_set` and `cell_refit_base`).
+2. PF-13, if readability of the banded tables matters enough to look into it.
 
-Parked (accuracy only): PF-06, PF-07, PF-08, PF-11, PF-12, PF-16.
+Parked (accuracy only): PF-03 (reverted), PF-06, PF-07, PF-08, PF-11, PF-12. PF-16 is moot.
