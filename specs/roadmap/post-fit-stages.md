@@ -24,7 +24,7 @@ and was reverted.
 | PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
 | PF-17 | `07db2af` | A multiclass fit now records its boosting report (`n_trees_per_bag_`, `stopping_reason_per_bag_`, `n_trees_`, `stopping_reason_`; counts are rounds), so the model report's existing "reached n_trees" warning fires for multiclass too. The cap itself stays the user's: they raise `n_trees` when the report says bags hit it (maintainer's decision). |
 | PF-03 | `3365ecf`, reverted | The rebalance was judged per bag on out-of-bag rows: −0.109% over 17 datasets against no rebalance, −0.079% against the slice check, for about 500 lines, +0–22% fit time single-output and +17–45% multiclass. Reverted the same day under the scope above (an accuracy-only change); the rebalance is judged on the slice again. The evidence stays in PF-03. |
-| PF-18 | `02201f8` | Fit-time `eval_set` removed on the maintainer's decision: the bags early-stop and prune on rows they hold back, and the shared external holdout bypassed that with its own special cases. Every live single-output fit now records its per-bag early-stopping curve, so the report's Training card always has one (one line per bag). Byte-identical for fits without `eval_set`. See PF-18. |
+| PF-18 | `02201f8`, `3ea8637` | Fit-time `eval_set` removed on the maintainer's decision: the bags early-stop and prune on rows they hold back, and the shared external holdout bypassed that with its own special cases. Every live fit, multiclass included, now records its per-bag early-stopping curve, so the report's Training card always has one (one line per bag); the training-rows curve stays callbacks-only (+5–11% fit time). Byte-identical for fits without `eval_set`. See PF-18. |
 
 Looked at and left as they are:
 
@@ -120,7 +120,7 @@ rejected, so they are not tried again.
 | PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is; validation pass done (no bugs) |
 | PF-16 | The per-bag rebalance check is optimistic on very small data | — | — | moot: PF-03 reverted |
 | PF-17 | Multiclass fits stop at the 4,000-tree cap without saying so | Report it; the user raises `n_trees` | none | fixed (reporting) |
-| PF-18 | Fit-time `eval_set` bypasses the bags' own early stopping, with its own special cases | Remove it; record the bags' own stopping curves on every fit | none; byte-identical without `eval_set` | fixed `02201f8` |
+| PF-18 | Fit-time `eval_set` bypasses the bags' own early stopping, with its own special cases | Remove it; record the bags' own stopping curves on every fit | none; byte-identical without `eval_set` | fixed `02201f8`, `3ea8637` |
 
 ## PF-01. `band_deviance_cap` bounds an estimate, not the training rise
 
@@ -910,14 +910,20 @@ times, and all 84 other cells of the settings matrix (6 objectives × 14 setting
 unpruned, groups, one bag, monotone and callbacks) match `results/validation_matrix.jsonl` in
 status and model bytes. All gates pass, including the slow suite and bit-repro.
 
-**Left open.** A multiclass fit records no per-round history, so its Training card shows no curve
-(the report says why). The softmax loop computes the stopping deviance every round, so recording
-it is a small core change; not done without the maintainer's go-ahead.
+**Follow-up: each bag's loss curves (`3ea8637`, same day).** The maintainer asked for each bag's
+loss curve by round in the report. The early-stopping curve is free, so every fit now keeps it:
+`FitControl::record_history` is gone, and a multiclass fit records it too (as the multinomial
+deviance, the report's scale), so its Training card has a curve. The training-rows curve measured
++5% to +11% of fit time (freMTPL2 46.6 s → 51.0 s, +9.4%; surrender, ausbi, pg15 and belgian16
++5% to +11% over two runs; swmc's 1-second fit gave +7% and +1%); scoring every row with zero weight off the training rows, instead of gathering them each
+round, was no cheaper, because the deviance's transcendentals dominate. The maintainer chose
+held-out curves only, on one chart with every bag: the training-rows curve stays opt-in through
+callbacks, and the chart draws it beside the held-out one when present. Models are byte-identical
+(all 84 settings-matrix cells; eight benchmark sets including pg17_instal).
 
 ## Remaining work (in scope)
 
 1. PF-13, if readability of the banded tables matters enough to look into it.
-2. Optionally, the multiclass training curve (PF-18, "Left open").
 
 The validation pass (PF-15) is done. Settings a multiclass fit refuses (exposure, offset,
 callbacks, monotone constraints, `reanchor`) fail loudly with the conflict named; they are
