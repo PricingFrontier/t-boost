@@ -67,10 +67,11 @@ no $\sigma$ to measure, and the cap alone bounds banding. Its report is in
 Finally, the tables are smoothed with Whittaker-Henderson graduation, the actuarial smoother for
 rating factors. Each table picks its own strength by generalized cross-validation, so a table
 whose roughness is real shape is left untouched. No objects are held out for it: the smoothing is
-kept only if it raises the training deviance by at most 1%.
+kept only if it raises the training deviance by at most 1%, a brake on heavy smoothing rather than
+a test of accuracy.
 
 `graduation_alpha` fixes one strength for every table. `graduation_high_order_alpha` (off by
 default) adds a light neighbour smoothing for factored 3-way and higher interactions. Details are
-in `graduation_report_`. `graduate=False` ships the unsmoothed tables. Graduation is not supported
-for models with three or more classes. See
+in `graduation_report_`. `graduate=False` ships the unsmoothed tables. With three or more classes,
+every class's tables are graduated. See
 [Graduation settings](../training-parameters/graduation.md).

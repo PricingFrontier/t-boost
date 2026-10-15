@@ -4978,12 +4978,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # `(table, values)`, or `(class, table, values)` for a multiclass fit's class banks.
         updates: list[tuple[Any, ...]] = []
         fixed = self.graduation_alpha
-        # Fidelity weights: the bank's `support` is BINNED ROW COUNTS, but the GCV noise model
-        # needs the cell's information mass. On aggregated portfolios one row can carry
-        # thousands of policy-years (swautoins: mean weight ~1200), so row-count GCV
-        # over-smooths by that factor. First-order fix: scale support by the mean training
-        # weight — exact for ~uniform weights, and a no-op (scale ~ 1) on individual-policy
-        # data. (Per-cell weight mass is not stored in the wire format; revisit if it ever is.)
+        # Fidelity weights: the bank's `support` is BINNED ROW COUNTS; scale it by the mean
+        # training weight so the cells carry their weight mass (exact for ~uniform weights, a
+        # no-op on individual-policy data; per-cell weight mass is not in the wire format).
+        # GCV itself picks the same smoother when every weight is multiplied by one constant
+        # (S(alpha; cW) = S(alpha/c; W)), so this does not change how much GCV smooths; it moves
+        # the searched alpha grid's edges, and it gives a fixed `graduation_alpha` the same
+        # meaning on aggregated rows (swautoins: mean weight ~1200) as on individual ones.
         w_scale = float(np.sum(w_full)) / float(max(len(w_full), 1))
         if self._measure_kwargs()["ref_measure"] == "exposure":
             # Under the exposure measure `support` already IS the per-cell effective mass

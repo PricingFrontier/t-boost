@@ -19,7 +19,8 @@ Smooth the deployed tables with Whittaker-Henderson graduation.
 attribute is then not set). Whether a smoothed table is what you want to deploy is a modelling
 decision: graduation is not tested on held-out data. It is kept only if it raises the training
 deviance by at most 1%; otherwise every table is kept as fitted, and `graduation_validation_`
-records `"adopted": False` and why.
+records `"adopted": False` and why. The 1% limit is a brake on heavy smoothing, not a test of
+accuracy: smoothing raises the training deviance whether it removes noise or real shape.
 
 **Type**
 
