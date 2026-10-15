@@ -165,8 +165,9 @@ first bank reaching `prune_path_fraction` of the total gain and the first within
 `prune_path_tolerance` of the minimum; the floor (`prune_min_variance_share`) then removes the
 tables below it that no kept table is built on. The pruning report is saved with the model. Then
 the smoothing strength of each table, and the deviance on each bag's early-stopping objects by
-boosting round, with each bag's best round (the curves are kept on the trained model only: they
-are not saved with the model, and multiclassification records none).
+boosting round, with the round each bag kept, and on each bag's training objects too when
+`callbacks` were passed to `fit` (the curves are kept on the trained model only: they are not
+saved with the model).
 
 ### Checks {#checks}
 

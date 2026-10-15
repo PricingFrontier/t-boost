@@ -3632,11 +3632,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._clear_fit_counts()
             return
         self._set_fit_counts([int(r[0]) for r in report], [str(r[2]) for r in report])
+        self._set_history([list(r[3]) for r in report], [list(r[4]) for r in report])
+
+    def _set_history(self, train: list[list[float]], eval_: list[list[float]]) -> None:
+        """`evals_result_` from the deployed fit's per-bag curves: the early-stopping rows'
+        deviance of every round (always recorded: the stopping rule computes it) and the
+        training rows' (recorded only with callbacks). Absent when there is neither."""
         result: dict[str, dict[str, list[list[float]]]] = {}
-        if any(r[3] for r in report):
-            result["train"] = {"deviance": [list(r[3]) for r in report]}
-        if any(r[4] for r in report):
-            result["eval"] = {"deviance": [list(r[4]) for r in report]}
+        if any(train):
+            result["train"] = {"deviance": train}
+        if any(eval_):
+            result["eval"] = {"deviance": eval_}
         if result:
             self.evals_result_ = result
         else:
@@ -3700,10 +3706,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             raise ValueError(f"X has {x32.shape[0]} rows but y has {y32.shape[0]}")
         # The staged dict itself (an empty one too): the pruned path reads `deploy` back from it.
         extras = self.__dict__.setdefault("_fit_extras_", {})
-        # Every live fit keeps each bag's per-round deviance on its early-stopping rows: the
-        # stopping rule computes it anyway, so it costs nothing, and the model report draws the
-        # training curve from it (`evals_result_`, never saved with the model).
-        deploy: dict[str, Any] = {"record_history": True}
+        deploy: dict[str, Any] = {}
         if "callbacks" in extras:
             deploy["observer"] = _round_observer(extras["callbacks"], int(self.n_bags))
         extras["deploy"] = deploy
@@ -6572,8 +6575,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         the rows it set aside for early stopping (``validation_fraction``), ``{"eval":
         {"deviance": [[...], ...]}}``, which the stopping rule computes anyway; with
         ``callbacks`` it also holds ``"train"``, the deviance on the bag's training rows (an
-        extra pass per round). It is kept on the live fit only, not saved with the model, and is
-        absent when there is neither (``validation_fraction=None`` without ``callbacks``).
+        extra pass per round, +5-11% fit time). It is kept on the live fit only, not saved with
+        the model, and is absent when there is neither (``validation_fraction=None`` without
+        ``callbacks``).
 
         Returns
         -------
@@ -8131,13 +8135,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         (K>=3) fit a boosting round grows one tree per class, so the counts are rounds, which
         ``n_trees`` caps. They describe the boosting, before pruning, and survive
         ``to_bytes``/``to_json``; they are ``None`` for a model saved before 0.7.0 (a multiclass
-        one before 0.9.1). On a binary fit ``evals_result_`` holds each bag's per-round mean
-        deviance on the rows it set aside for early stopping (``validation_fraction``),
-        ``{"eval": {"deviance": [[...], ...]}}``, which the stopping rule computes anyway; with
-        ``callbacks`` it also holds ``"train"``, the deviance on the bag's training rows (an
-        extra pass per round). It is kept on the live fit only, not saved with the model, and is
-        absent when there is neither (``validation_fraction=None`` without ``callbacks``) and on
-        a multiclass fit, which records no per-round history.
+        one before 0.9.1). ``evals_result_`` holds each bag's per-round mean deviance on the rows
+        it set aside for early stopping (``validation_fraction``), ``{"eval": {"deviance":
+        [[...], ...]}}``, which the stopping rule computes anyway (the multinomial deviance on a
+        multiclass fit, one value per round); on a binary fit with ``callbacks`` it also holds
+        ``"train"``, the deviance on the bag's training rows (an extra pass per round, +5-11%
+        fit time). It is kept on the live fit only, not saved with the model, and is absent
+        when there is neither (``validation_fraction=None`` without ``callbacks``).
 
         Returns
         -------
@@ -8443,6 +8447,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             if fit_report:
                 self._set_fit_counts([int(r["trees_kept"]) for r in fit_report],
                                      [str(r["reason"]) for r in fit_report])
+                self._set_history([], [list(r.get("eval_deviance") or []) for r in fit_report])
             # §G1 K>=3 OOB cell-refit diagnostics for the DEPLOYED fit — the multiclass analogue
             # of `delta_step_gate_`. Pruning replaces the `_MultiClassModel` with a
             # `_MultiClassTableModel`, which carries no fit-time diagnostics, so the native side
@@ -8474,6 +8479,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             fit_report = model.fit_report()
             if fit_report:
                 self._set_fit_counts([int(r[0]) for r in fit_report], [str(r[2]) for r in fit_report])
+                self._set_history([list(r[3]) for r in fit_report], [list(r[4]) for r in fit_report])
             # Every fit deploys rating tables: an unpruned fit keeps all of them and bands them
             # as a pruned fit does; only the selection is skipped.
             w_full = np.ascontiguousarray(

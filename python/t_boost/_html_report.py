@@ -1098,23 +1098,25 @@ def bank_chart(r: dict[str, Any], w: float, h: float) -> str:
 
 
 def training_chart(r: dict[str, Any], w: float, h: float) -> str:
-    """Deviance on each bag's early-stopping rows by boosting round, the round each bag kept and
-    the band of those rounds. Each bag sets aside its own rows, so the curves sit at different
-    levels: an average over the bags still running would jump whenever one finished, so every
-    bag is drawn."""
+    """Each bag's deviance by boosting round on the rows it set aside for early stopping, the
+    round it kept and the band of those rounds; with callbacks, each bag's training rows too.
+    Each bag sets aside its own rows, so the curves sit at different levels: an average over
+    the bags still running would jump whenever one finished, so every bag is drawn."""
     fit = r["fit"]
     hist = fit["evals_result"]
     if not hist["available"]:
         return f'<p class="note">Training curve: {_e(hist["reason"])}.</p>'
-    per_bag = (hist["value"].get("eval") or {}).get("deviance") or []
-    label, stops = "early-stopping rows", True
-    if not per_bag:
-        per_bag = (hist["value"].get("train") or {}).get("deviance") or []
-        label, stops = "train rows", False
-    curves = [[(i + 1, v) for i, v in enumerate(b) if v is not None] for b in per_bag]
-    if not any(curves):
+    held = (hist["value"].get("eval") or {}).get("deviance") or []
+    train = (hist["value"].get("train") or {}).get("deviance") or []
+
+    def points(curve: list[float | None]) -> list[tuple[int, float]]:
+        return [(i + 1, v) for i, v in enumerate(curve) if v is not None]
+
+    held_c, train_c = [points(b) for b in held], [points(b) for b in train]
+    curves = [c for c in held_c + train_c if c]
+    if not curves:
         return _none("No training history.")
-    rounds = max(c[-1][0] for c in curves if c)
+    rounds = max(c[-1][0] for c in curves)
     skip = max(5, rounds // 20)
     tail = [v for c in curves for i, v in c if i >= skip] or [v for c in curves for _, v in c]
     left, right, top, bottom = 58.0, w - 14, 24.0, h - 22
@@ -1137,13 +1139,26 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
         last = j == len(xs.ticks) - 1
         svg.text(xs(t), bottom + 16, f"{t:,.0f} rounds" if last else f"{t:,.0f}",
                  anchor="end" if last and xs(t) > right - 40 else "middle")
-    marked = stops and len(kept) == len(per_bag)
-    title = f"deviance on each bag's {label} by round" + (", the round it kept marked" if marked else "")
-    svg.text(left, 12, title, cls="lbl")
-    for c in curves:
-        svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in c], "dfaded")
+    marked = any(held_c) and len(kept) == len(held)
+    if any(held_c) and any(train_c):
+        _legend(svg, left, 12, [("line", "data", "each bag's early-stopping rows"),
+                                ("line", "model", "training rows"),
+                                ("dot", "ddot", "round kept")][:3 if marked else 2])
+    elif any(held_c):
+        svg.text(left, 12, "deviance on each bag's early-stopping rows by round"
+                 + (", the round it kept marked" if marked else ""), cls="lbl")
+    else:
+        svg.text(left, 12, "deviance on each bag's training rows by round", cls="lbl")
+    def entering(c: list[tuple[int, float]]) -> list[tuple[int, float]]:
+        # The axis fits the later rounds, so the first ones lie above it: start each line at its
+        # last point above, clamped to the top edge, rather than drawing a flat run along it.
+        first = next((k for k, (_, v) in enumerate(c) if v <= ys.hi), len(c))
+        return c[max(first - 1, 0):] if first < len(c) else c
+
+    for c, cls in [(c, "faded") for c in train_c] + [(c, "dfaded") for c in held_c]:
+        svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in entering(c)], cls)
     if marked:
-        for k, (b, n) in enumerate(zip(per_bag, kept)):
+        for k, (b, n) in enumerate(zip(held, kept)):
             v = b[n - 1] if 1 <= n <= len(b) else None
             if v is not None and ys.lo <= v <= ys.hi:
                 svg.add(f'<circle class="ddot" cx="{xs(n):.1f}" cy="{ys(v):.1f}" r="3.5">'

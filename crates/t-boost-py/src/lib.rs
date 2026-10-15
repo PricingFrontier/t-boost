@@ -4238,7 +4238,7 @@ impl PyBooster {
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, observer=None, record_history=false))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, observer=None))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -4263,8 +4263,6 @@ impl PyBooster {
         // boosting round, on this thread; truthy stops that bag. An exception stops the fit
         // and propagates.
         observer: Option<Py<PyAny>>,
-        // Keep each bag's per-round deviances for `fit_report`.
-        record_history: bool,
     ) -> PyResult<PyModel> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4279,8 +4277,7 @@ impl PyBooster {
         let y = array1_to_vec(y, "y")?;
         let weight = weight.map(|w| array1_to_vec(w, "weight")).transpose()?;
         let exposure = exposure.map(|e| array1_to_vec(e, "exposure")).transpose()?;
-        let mut state = self.clone();
-        state.config.fit_control.record_history = record_history;
+        let state = self.clone();
         let run = move |state: PyBooster| {
             fit_owned(
                 state,
@@ -6571,7 +6568,8 @@ impl PyMultiClassModel {
     /// Per-bag boosting report of the fit, in bag order: `(trees_kept, rounds_trained,
     /// stop_reason, train_deviance_history, eval_deviance_history)`, as [`PyModel::fit_report`].
     /// A round grows one tree per class, so the counts are rounds; the classes share them. The
-    /// histories are empty (a multiclass fit records none). `None` on a loaded model.
+    /// training history is empty (a multiclass fit takes no observer); the early-stopping one is
+    /// the multinomial deviance of every round. `None` on a loaded model.
     #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of Python tuples.
     fn fit_report(&self) -> Option<Vec<(u32, u32, String, Vec<f64>, Vec<f64>)>> {
         multiclass_fit_report(&self.model).map(|reports| {
@@ -9147,6 +9145,7 @@ fn fit_multiclass_pruned_owned(
                                     "trees_kept": r.trees_kept,
                                     "rounds_trained": r.rounds_trained,
                                     "reason": r.reason.as_str(),
+                                    "eval_deviance": r.eval_deviance,
                                 })
                             })
                             .collect(),

@@ -881,13 +881,11 @@ fn fit_single(
         .as_ref()
         .map(|(y_sub, w_sub)| (y_sub.as_slice(), w_sub.as_slice()));
 
-    // Run-time controls (R2/R3): the per-round history and observer read deviances only, so a
-    // fit without them takes none of the branches below and stays bit-identical. The stopping
-    // deviance is computed for early stopping anyway; the training deviance is an extra O(n)
-    // pass per round (~10-20% of a fit), so only an observer pays for it.
+    // Run-time controls (R2/R3): the per-round history and the observer read deviances only, so
+    // they never change the model. The stopping deviance is computed for early stopping anyway,
+    // so its history is always kept; the training deviance is an extra pass over the training
+    // rows every round (+5-11% of a fit, measured 2026-10-15), so only an observer pays for it.
     let control = &config.fit_control;
-    let track_rounds = control.record_history || control.observer.is_some();
-    let track_train = control.observer.is_some();
     let mut history_train: Vec<f64> = Vec::new();
     let mut history_eval: Vec<f64> = Vec::new();
     let (mut tr_y_sub, mut tr_raw_sub, mut tr_weight_sub) = (Vec::new(), Vec::new(), Vec::new());
@@ -901,14 +899,12 @@ fn fit_single(
             .sum::<f64>()
             .max(f64::MIN_POSITIVE)
     };
-    let (train_mass, eval_mass) = if track_rounds {
-        (
-            mass_of(&train_rows_usize),
-            validation_rows.as_deref().map_or(1.0, mass_of),
-        )
+    let train_mass = if control.observer.is_some() {
+        mass_of(&train_rows_usize)
     } else {
-        (1.0, 1.0)
+        1.0
     };
+    let eval_mass = validation_rows.as_deref().map_or(1.0, mass_of);
 
     prof::reset();
     for t in 0..config.n_trees {
@@ -1300,40 +1296,30 @@ fn fit_single(
                         patience_spent = true;
                     }
                 }
-                if track_rounds {
-                    let train_deviance = if track_train {
-                        deviance_for_rows_scratch(
-                            spec.loss,
-                            y,
-                            &raw,
-                            weight,
-                            &train_rows_usize,
-                            &mut tr_y_sub,
-                            &mut tr_raw_sub,
-                            &mut tr_weight_sub,
-                        )? / train_mass
-                    } else {
-                        f64::NAN
+                let eval_deviance = eval_deviance.map(|d| d / eval_mass);
+                history_eval.extend(eval_deviance);
+                if let Some(observer) = &control.observer {
+                    let train_deviance = deviance_for_rows_scratch(
+                        spec.loss,
+                        y,
+                        &raw,
+                        weight,
+                        &train_rows_usize,
+                        &mut tr_y_sub,
+                        &mut tr_raw_sub,
+                        &mut tr_weight_sub,
+                    )? / train_mass;
+                    history_train.push(train_deviance);
+                    let event = RoundEvent {
+                        bag: control.bag,
+                        round: rounds_trained,
+                        n_trees: config.n_trees,
+                        train_deviance,
+                        eval_deviance,
                     };
-                    let eval_deviance = eval_deviance.map(|d| d / eval_mass);
-                    if control.record_history {
-                        if track_train {
-                            history_train.push(train_deviance);
-                        }
-                        history_eval.extend(eval_deviance);
-                    }
-                    if let Some(observer) = &control.observer {
-                        let event = RoundEvent {
-                            bag: control.bag,
-                            round: rounds_trained,
-                            n_trees: config.n_trees,
-                            train_deviance,
-                            eval_deviance,
-                        };
-                        if (observer.0)(&event) {
-                            stop_reason = StopReason::Callback;
-                            break;
-                        }
+                    if (observer.0)(&event) {
+                        stop_reason = StopReason::Callback;
+                        break;
                     }
                 }
                 if patience_spent {
@@ -2337,6 +2323,9 @@ fn fit_multiclass_single(
     let mut rounds_trained = 0u32;
     let mut rounds_kept = 0u32;
     let mut stop_reason = StopReason::MaxTrees;
+    // The early-stopping deviance of every round, which the stopping rule computes anyway: as
+    // the multinomial deviance (twice the mean cross-entropy), the scale the report uses.
+    let mut history_eval: Vec<f64> = Vec::new();
 
     for t in 0..config.n_trees {
         let mut round_cfg = grow_cfg.clone();
@@ -2491,6 +2480,7 @@ fn fit_multiclass_single(
                     &mut deviance_scratch,
                 )
             })?;
+            history_eval.push(2.0 * dev);
             let improved = match best_deviance {
                 Some(b) => config.is_material_improvement(b, dev),
                 None => true,
@@ -2572,7 +2562,7 @@ fn fit_multiclass_single(
                 rounds_trained,
                 reason: stop_reason,
                 train_deviance: Vec::new(),
-                eval_deviance: Vec::new(),
+                eval_deviance: history_eval.clone(),
             }]),
         };
         model.schema_version = model.required_schema_version();

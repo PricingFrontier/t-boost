@@ -2030,18 +2030,16 @@ pub struct Config {
     /// this: a caller who named a cap gets exactly that cap for the whole fit, gate or no gate.
     /// See [`GatedDeltaStep`] for the signal, the engage semantics, and the evidence.
     pub max_delta_step_gated: GatedStepPolicy,
-    /// Run-time controls that never change what a round computes: per-round history and a
-    /// round observer. The default is inert (bit-identical).
+    /// Run-time controls that never change what a round computes: a round observer. The
+    /// default is inert (bit-identical).
     pub fit_control: FitControl,
 }
 
 /// Run-time controls of a single-output fit ([`Config::fit_control`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FitControl {
-    /// Record each round's stopping deviance in [`BagFitReport`] (and the training deviance
-    /// too when an observer is set, which computes it).
-    pub record_history: bool,
-    /// Called after every boosting round; returning `true` stops this fit's boosting.
+    /// Called after every boosting round; returning `true` stops this fit's boosting. Setting
+    /// one also records the training deviance of every round in [`BagFitReport`].
     pub observer: Option<RoundObserver>,
     /// This fit's bag index, reported in [`RoundEvent::bag`] (set by the outer bag).
     pub bag: u32,
@@ -2114,10 +2112,11 @@ pub struct BagFitReport {
     pub rounds_trained: u32,
     /// Why the loop ended.
     pub reason: StopReason,
-    /// Per-round training deviance, when [`FitControl::record_history`] and an observer are set.
+    /// Per-round mean training deviance, when an observer is set ([`FitControl::observer`]):
+    /// it costs an extra pass over the training rows every round.
     pub train_deviance: Vec<f64>,
-    /// Per-round stopping deviance, when [`FitControl::record_history`] is set and stopping
-    /// rows exist.
+    /// Per-round mean deviance on the early-stopping rows, whenever they exist: early stopping
+    /// computes it anyway. A multiclass fit records the multinomial deviance.
     pub eval_deviance: Vec<f64>,
 }
 

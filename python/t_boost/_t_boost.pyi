@@ -119,7 +119,6 @@ class _Booster:
         es_holdout: Sequence[bool] | None = None,
         bag_groups: np.ndarray | None = None,
         observer: Callable[[int, int, int, float, float | None], Any] | None = None,
-        record_history: bool = False,
     ) -> _Model: ...
 
     def fit_multiclass(

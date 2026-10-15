@@ -141,10 +141,11 @@ Output format:
 ```
 
 with one list per bag. The `"eval"` curve is recorded on every training (early stopping
-calculates it anyway). The `"train"` curve takes an extra pass per iteration, so it is
-calculated only when `callbacks` are given. The attribute is absent when there is neither
-(`validation_fraction=None` without `callbacks`), for multiclassification, and on a loaded
-model: it is not saved with the model.
+calculates it anyway); for multiclassification it is the multinomial deviance, one value per
+iteration. The `"train"` curve takes an extra pass per iteration (5–11% of the training time),
+so it is calculated only when `callbacks` are given. The attribute is absent when there is
+neither (`validation_fraction=None` without `callbacks`) and on a loaded model: it is not saved
+with the model.
 
 #### Type
 

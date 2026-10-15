@@ -231,6 +231,10 @@ def test_multiclass_report():
     assert {"train_ae_0", "train_gini_2", "test_accuracy"} <= set(report["summary_metrics"])
     html = report_html(report)
     assert 'name="cl"' in html and "logit contribution" in html
+    # A multiclass fit records each bag's early-stopping curve too, so the Training card draws it.
+    curves = report["fit"]["evals_result"]["value"]["eval"]["deviance"]
+    assert len(curves) == FAST["n_bags"]
+    assert training_chart(report, 558, 240).count('class="dfaded"') == FAST["n_bags"]
     mm = m._multi_model
     x32, kw = m._serve_kwargs(X, mm)
     per_class = mm.feature_contributions(x32, **kw)
@@ -714,7 +718,24 @@ def test_a_live_fit_draws_its_training_curve(poisson):
     m, _, _, report = poisson
     curves = report["fit"]["evals_result"]["value"]["eval"]["deviance"]
     assert len(curves) == len(m.n_trees_per_bag_)
-    assert "early-stopping rows" in training_chart(report, 600, 240)
+    svg = training_chart(report, 558, 240)
+    assert "early-stopping rows" in svg and "training rows" not in svg
+    assert svg.count('class="dfaded"') == len(curves) and 'class="faded"' not in svg
+    assert svg.count('class="ddot"') == len(curves)
+
+
+def test_callbacks_add_each_bags_training_curve():
+    # With callbacks the fit also records each bag's training-rows deviance (an extra pass per
+    # round); the chart draws both sets of curves, with a legend.
+    df = frame(n=1500)
+    X = df.select("age", "veh", "dens")
+    m = TBoostRegressor(objective="poisson", **FAST).fit(
+        X, df["y"], exposure=df["exp"], callbacks=lambda info: None)
+    assert set(m.evals_result_) == {"train", "eval"}
+    report = m.pricing_report(df, "y", exposure="exp")
+    svg = training_chart(report, 558, 240)
+    assert svg.count('class="faded"') == svg.count('class="dfaded"') == FAST["n_bags"]
+    assert "training rows" in svg and "round kept" in svg
 
 
 def alternating(n=4000, seed=11):

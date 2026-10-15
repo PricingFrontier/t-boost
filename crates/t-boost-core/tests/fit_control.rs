@@ -1,6 +1,6 @@
-//! `Config::fit_control`: the per-bag fit report, the per-round history and the observer. All of
-//! it is run-time control: with the defaults a fit is bit-identical, and history or an observer
-//! that never stops change nothing either.
+//! `Config::fit_control` and the per-bag fit report: the per-round history (the early-stopping
+//! deviance always, the training deviance with an observer) and the observer. All of it is
+//! run-time control: an observer that never stops changes nothing.
 
 #![allow(
     clippy::unwrap_used,
@@ -63,7 +63,14 @@ fn report_counts_trees_and_reason() {
     assert_eq!(report.len(), 1);
     assert_eq!(report[0].trees_kept as usize, model.trees.len());
     assert!(report[0].rounds_trained >= report[0].trees_kept);
-    assert!(report[0].train_deviance.is_empty(), "history is opt-in");
+    assert!(
+        report[0].train_deviance.is_empty(),
+        "the training curve needs an observer"
+    );
+    // The early-stopping curve is always kept (free), and the kept round is its minimum.
+    let curve = &report[0].eval_deviance;
+    assert_eq!(curve.len(), report[0].rounds_trained as usize);
+    assert_eq!(report[0].trees_kept as usize, argmin(curve) + 1);
 
     let capped = fit(Config {
         validation_fraction: None,
@@ -75,12 +82,11 @@ fn report_counts_trees_and_reason() {
 }
 
 #[test]
-fn history_and_a_silent_observer_leave_the_model_bit_identical() {
+fn a_silent_observer_leaves_the_model_bit_identical() {
     let plain = fit(base());
     let calls = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&calls);
     let mut watched = base();
-    watched.fit_control.record_history = true;
     watched.fit_control.observer = Some(RoundObserver(Arc::new(move |event| {
         counter.fetch_add(1, Ordering::Relaxed);
         assert!(event.train_deviance.is_finite());
@@ -95,15 +101,68 @@ fn history_and_a_silent_observer_leave_the_model_bit_identical() {
     let r = &traced.fit_report.as_ref().unwrap()[0];
     assert_eq!(calls.load(Ordering::Relaxed), r.rounds_trained);
     assert_eq!(r.train_deviance.len(), r.rounds_trained as usize);
-    assert_eq!(r.eval_deviance.len(), r.rounds_trained as usize);
+    assert_eq!(
+        r.eval_deviance,
+        plain.fit_report.as_ref().unwrap()[0].eval_deviance
+    );
+}
 
-    // History alone records the (free) stopping curve, not the training one.
-    let mut history_only = base();
-    history_only.fit_control.record_history = true;
-    let lean = fit(history_only);
-    let r = &lean.fit_report.as_ref().unwrap()[0];
-    assert!(r.train_deviance.is_empty());
-    assert_eq!(r.eval_deviance.len(), r.rounds_trained as usize);
+#[test]
+fn a_multiclass_fit_keeps_its_early_stopping_curve() {
+    let (x0, x1, y) = fixture(2000);
+    let x = bin_columns(&[&x0, &x1], None, &BinConfig::default(), 3).unwrap();
+    let classes: Vec<f32> = y
+        .iter()
+        .map(|&v| {
+            if v < 0.5 {
+                0.0
+            } else if v < 2.5 {
+                1.0
+            } else {
+                2.0
+            }
+        })
+        .collect();
+    let labels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+    let loss = SquaredError; // ignored: the softmax gradient is coupled across classes
+    let spec = FitSpec {
+        loss: &loss as &dyn Loss,
+        weight: None,
+        exposure: None,
+        monotone: MonotoneMap::new(),
+        interaction: InteractionPolicy::default(),
+        credibility: CredibilityFloor::default(),
+        fixed_holdout: None,
+        bag_groups: None,
+        seed: 9,
+    };
+    let model = Booster::with_config(base())
+        .fit_multiclass(&x, &classes, 3, &labels, &spec)
+        .unwrap();
+    for class in &model.classes {
+        let r = &class.fit_report.as_ref().unwrap()[0];
+        assert_eq!(r.eval_deviance.len(), r.rounds_trained as usize);
+        assert!(r.eval_deviance.iter().all(|d| d.is_finite() && *d > 0.0));
+        assert_eq!(r.trees_kept as usize, argmin(&r.eval_deviance) + 1);
+        assert!(r.train_deviance.is_empty());
+    }
+}
+
+fn argmin(curve: &[f64]) -> usize {
+    curve
+        .iter()
+        .enumerate()
+        .fold(
+            (0, f64::INFINITY),
+            |(bi, bv), (i, &v)| {
+                if v < bv {
+                    (i, v)
+                } else {
+                    (bi, bv)
+                }
+            },
+        )
+        .0
 }
 
 #[test]

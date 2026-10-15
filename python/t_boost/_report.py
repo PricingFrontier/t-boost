@@ -1219,9 +1219,7 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
     loaded_or_multi = ("not recorded with this model (a multiclass model saved before 0.9.1)"
                        if multiclass else "not recorded with this model (saved before 0.7.0)")
     history = getattr(est, "evals_result_", None)
-    if multiclass:
-        no_history = "a multiclass fit records no per-round history"
-    elif getattr(est, "validation_fraction", None) is None:
+    if getattr(est, "validation_fraction", None) is None:
         no_history = ("early stopping was off (validation_fraction=None), so no per-round "
                       "deviance was recorded")
     else:

@@ -18,7 +18,8 @@ dictionary) after the iteration, just as early stopping stops each bag at its ow
 (`stopping_reason_per_bag_` is then `"callback"`). To stop the whole training, return a true
 value for every bag. A function that decides from the dictionary alone stops the same bags at the
 same iterations on every run. An exception stops the training and is raised from `fit`. Both
-deviances of every iteration are kept in `evals_result_`.
+deviances of every iteration are kept in `evals_result_`. The deviance on the training objects
+takes an extra pass per iteration, 5–11% of the training time.
 
 **Possible types**
 
