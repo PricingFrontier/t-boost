@@ -2723,18 +2723,27 @@ fn rebalance_multiclass_cells(
     }
 
     // (2) One joint step: the held-out multinomial deviance of `raw + step·δ`, all K classes
-    //     together, over the cell refit's grid. Without held-out rows the Newton step stands.
+    //     together, over the cell refit's grid, each trial re-anchored on every row as the
+    //     deploy re-anchors the chosen one (the scalar twin scores its re-anchored candidate
+    //     too). Without held-out rows the Newton step stands.
     let hrows: Vec<usize> = (0..n).filter(|&r| is_holdout(r)).collect();
     report.holdout_rows = hrows.len() as u64;
     let mut step = 1.0_f64;
     if !hrows.is_empty() {
+        let mut moved: Vec<Vec<f64>> = vec![vec![0.0_f64; n]; n_classes];
         let mut candidate: Vec<Vec<f32>> = vec![vec![0.0_f32; n]; n_classes];
         let (mut best_dev, mut best_step) = (f64::INFINITY, 0.0_f64);
         for &trial in &crate::engine::boost::MC_CORRECTION_STEPS {
             let trial = f64::from(trial);
-            for ((cand, base), delta) in candidate.iter_mut().zip(raw).zip(&scores) {
+            for ((m, base), delta) in moved.iter_mut().zip(raw).zip(&scores) {
+                for ((v, &b), &d) in m.iter_mut().zip(base).zip(delta) {
+                    *v = b + trial * d;
+                }
+            }
+            let shift = multiclass_intercept_shifts(&moved, labels, w, "rebalance step")?;
+            for ((cand, m), d) in candidate.iter_mut().zip(&moved).zip(&shift) {
                 for &r in &hrows {
-                    cand[r] = (base[r] + trial * delta[r]) as f32;
+                    cand[r] = (m[r] + d) as f32;
                 }
             }
             let dev =

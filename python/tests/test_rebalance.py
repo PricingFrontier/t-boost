@@ -112,3 +112,19 @@ def test_per_class_channels_leave_the_categorical_as_fitted(three_class) -> None
     kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
     assert sorted(rep["excluded"]) == sorted(u for u in kept if 3 in u) != []
     assert rep["supports"] == len(kept) - len(rep["excluded"])
+
+
+def test_the_multiclass_step_is_judged_on_the_model_it_deploys(three_class) -> None:
+    # The deploy re-anchors the class intercepts after the correction; each trial step is now
+    # re-anchored the same way before it is scored, so the reported held-out deviance is the
+    # deployed model's own on the held-out slice (banding and graduation off, so nothing else
+    # moves it).
+    X, y = three_class
+    est = _fit_mc(three_class, band_tolerance=None, graduate=False)
+    rep = est.pruning_report_["rebalance"]
+    assert rep["adopted"]
+    r = np.arange(len(y), dtype=np.uint64)
+    held = ((r * np.uint64(0x9E3779B97F4A7C15)) >> np.uint64(56)) < 38  # the core's slice
+    assert int(held.sum()) == rep["holdout_rows"]
+    p = est.predict_proba(X)[held, y[held]]
+    np.testing.assert_allclose(-np.log(p).mean(), rep["holdout_deviance_after"], rtol=1e-5)
