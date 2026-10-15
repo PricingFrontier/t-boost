@@ -536,6 +536,7 @@ class _TableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         n_jobs: int | None = None,
         box_budget: int = 0,
+        reanchor: bool = True,
     ) -> tuple[_TableModel, bool, str]: ...
 
     def apply_graduation(
@@ -548,6 +549,7 @@ class _TableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         n_jobs: int | None = None,
         eval_rows: Sequence[int] | None = None,
+        reanchor: bool = True,
     ) -> tuple[_TableModel, bool]: ...
 
     @staticmethod

@@ -534,8 +534,11 @@ bool
 
 None. Depends on the objective:
 
-- `gamma`, `tweedie`: True
+- `poisson`, `gamma`, `tweedie`, `logistic`: True
 - other objectives: False
+
+An explicit value also applies to the intercept re-solve that follows an adopted
+[graduation](graduation.md).
 
 ## reanchor_slope {#reanchor_slope}
 
@@ -559,4 +562,7 @@ bool
 
 **Default value**
 
-None (the same as [`reanchor`](#reanchor))
+None. Depends on the objective:
+
+- `poisson`, `gamma`, `tweedie`: True
+- other objectives: False

@@ -2691,6 +2691,7 @@ mod cat_channels_fit_path_tests {
             cat_x,
             updates,
             None,
+            true,
         )
         .expect("apply_graduation_updates must not crash on a joint categorical axis (bug #6)");
 
@@ -5854,7 +5855,7 @@ impl PyTableModel {
     }
 
     /// Apply dense graduation and optional reference-preserving factored diffusion together.
-    #[pyo3(signature = (x, y, weight, updates, alpha, exposure=None, cat_x=None, n_jobs=None, box_budget=0))]
+    #[pyo3(signature = (x, y, weight, updates, alpha, exposure=None, cat_x=None, n_jobs=None, box_budget=0, reanchor=true))]
     #[allow(clippy::too_many_arguments)]
     fn apply_high_order_graduation(
         &self,
@@ -5868,6 +5869,7 @@ impl PyTableModel {
         cat_x: Option<Vec<Vec<String>>>,
         n_jobs: Option<usize>,
         box_budget: usize,
+        reanchor: bool,
     ) -> PyResult<(PyTableModel, bool, String)> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -5879,7 +5881,7 @@ impl PyTableModel {
                 run_on_pool(n_jobs, || {
                     apply_graduation_updates_impl(
                         &model, columns, y, weight, exposure, cat_x, updates, None, alpha,
-                        box_budget,
+                        box_budget, reanchor,
                     )
                 })
             })
@@ -5896,9 +5898,10 @@ impl PyTableModel {
         ))
     }
 
-    /// Apply LAPACK-smoothed dense table values, re-anchor a log-link model, and enforce the
-    /// weighted train-deviance no-harm guard. The design is marshalled and binned only once.
-    #[pyo3(signature = (x, y, weight, updates, exposure=None, cat_x=None, n_jobs=None, eval_rows=None))]
+    /// Apply LAPACK-smoothed dense table values, re-anchor a log-link model (unless `reanchor`
+    /// is false), and enforce the weighted train-deviance no-harm guard. The design is
+    /// marshalled and binned only once.
+    #[pyo3(signature = (x, y, weight, updates, exposure=None, cat_x=None, n_jobs=None, eval_rows=None, reanchor=true))]
     #[allow(clippy::too_many_arguments)]
     fn apply_graduation(
         &self,
@@ -5911,6 +5914,7 @@ impl PyTableModel {
         cat_x: Option<Vec<Vec<String>>>,
         n_jobs: Option<usize>,
         eval_rows: Option<Vec<u32>>,
+        reanchor: bool,
     ) -> PyResult<(PyTableModel, bool)> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -5923,7 +5927,7 @@ impl PyTableModel {
             .detach(move || {
                 run_on_pool(n_jobs, || {
                     apply_graduation_updates(
-                        &model, columns, y, weight, exposure, cat_x, updates, eval_rows,
+                        &model, columns, y, weight, exposure, cat_x, updates, eval_rows, reanchor,
                     )
                 })
             })
@@ -10643,7 +10647,8 @@ fn multinomial_deviance(logits: &[Vec<f64>], labels: &[u32], w: &[f32]) -> Resul
 /// than a training-loss brake — and tightens the slack from the legacy 1% (a training loss
 /// always rises under smoothing) to a tenth of a percent.
 /// The log-link intercept rebalance still runs on every row: it is the balance step, not the
-/// gate. `None` is the pre-2026-09-06 behaviour, byte for byte.
+/// gate. `None` is the pre-2026-09-06 behaviour, byte for byte. `reanchor` false (the
+/// estimator's `reanchor=False`) leaves the intercept as fitted.
 #[allow(clippy::too_many_arguments)] // JUSTIFIED: one binding, one core call; the tuple would only rename them.
 fn apply_graduation_updates(
     model: &TableModel,
@@ -10654,9 +10659,10 @@ fn apply_graduation_updates(
     cat_x: Option<Vec<Vec<String>>>,
     updates: Vec<(usize, Vec<f64>)>,
     eval_rows: Option<Vec<u32>>,
+    reanchor: bool,
 ) -> Result<(TableModel, bool), PbError> {
     let (model, adopted, _) = apply_graduation_updates_impl(
-        model, columns, y, weight, exposure, cat_x, updates, eval_rows, 0.0, 0,
+        model, columns, y, weight, exposure, cat_x, updates, eval_rows, 0.0, 0, reanchor,
     )?;
     Ok((model, adopted))
 }
@@ -10673,6 +10679,7 @@ fn apply_graduation_updates_impl(
     eval_rows: Option<Vec<u32>>,
     high_order_alpha: f64,
     box_budget: usize,
+    reanchor: bool,
 ) -> Result<
     (
         TableModel,
@@ -10746,7 +10753,9 @@ fn apply_graduation_updates_impl(
         });
     }
 
-    if model.link == Link::Log {
+    // Smoothing a log-link table moves the portfolio total; restore it on the intercept, as the
+    // fit's own re-anchor does, unless the caller asked for the intercept as fitted.
+    if reanchor && model.link == Link::Log {
         let pred = graduated.predict_binned(&binned, None)?;
         let mut numerator = 0.0_f64;
         let mut denominator = 0.0_f64;

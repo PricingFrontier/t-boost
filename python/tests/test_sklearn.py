@@ -809,6 +809,21 @@ def test_reanchor_defaults_on_for_log_link_only() -> None:
     np.testing.assert_array_equal(s_def, s_off)
 
 
+def test_graduation_keeps_the_intercept_as_fitted_under_reanchor_false() -> None:
+    # An adopted log-link graduation restores the portfolio total on the intercept, as the
+    # fit's own re-anchor does. It used to do so whatever `reanchor` said, so an explicit
+    # `reanchor=False` predicted exactly like the default once graduation was adopted.
+    rng = np.random.RandomState(0)
+    x = rng.rand(4000, 3).astype(np.float32)
+    y = rng.gamma(4.0, np.exp(0.3 + 0.8 * x[:, 0] - 0.4 * x[:, 1]) / 4.0).astype(np.float32)
+    common = dict(n_trees=60, max_bin=32, seed=0, prune=False, n_jobs=2)
+    on = TBoostRegressor(objective="gamma", **common).fit(x, y)
+    off = TBoostRegressor(objective="gamma", reanchor=False, **common).fit(x, y)
+    assert on.graduation_validation_["adopted"] and off.graduation_validation_["adopted"]
+    np.testing.assert_allclose(on.predict(x).mean(), y.mean(), rtol=1e-6)
+    assert abs(off.predict(x).mean() / y.mean() - 1.0) > 1e-3
+
+
 def multiclass_fixture() -> tuple[np.ndarray, np.ndarray]:
     rng = np.random.RandomState(0)
     n = 600

@@ -5063,6 +5063,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             exposure=(np.ascontiguousarray(exposure) if exposure is not None else None),
             cat_x=cat_x, n_jobs=self._resolve_n_jobs(),
         )
+        if not multiclass:
+            # A log-link candidate restores the portfolio total on its intercept, as the fit's
+            # own re-anchor does; `reanchor=False` keeps the intercept as fitted here too.
+            kwargs["reanchor"] = self._resolved_reanchor()
         if multiclass:
             # One method for both steps: the high-order diffusion runs only at alpha > 0.
             candidate, train_adopted, class_reports = table_model.apply_graduation(
@@ -5957,9 +5961,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     reanchor : bool or None, default=None
         Whether to re-solve the model's global intercept exactly against the training data
         after fitting, removing post-shrinkage aggregate bias. ``None`` uses a link-aware
-        default: on for the log-link objectives ``gamma``/``tweedie`` where shrinkage bias
-        is largest (a no-op for ``poisson``), off otherwise. An explicit ``True``/``False``
-        always overrides the default.
+        default: on for the log-link objectives ``poisson``/``gamma``/``tweedie``, off
+        otherwise. An explicit ``True``/``False`` always overrides the default, including for
+        the intercept re-solve that follows an adopted graduation.
     reanchor_slope : bool or None, default=None
         Whether to fit an honest affine link-scale recalibration (``F' = b + a * F``) on the
         fit's own internal validation holdout after early stopping, correcting the uniform
@@ -5968,9 +5972,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fit is ridge-shrunk toward the identity and only applied when its holdout deviance
         gain clears the prior penalty, so thin or uninformative holdouts stay at
         (near-)identity — this can only help or be neutral, never hurt. Inert without a
-        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` follows
-        the same link-aware default as ``reanchor``; an explicit ``True``/``False`` always
-        wins.
+        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` uses a
+        link-aware default: on for ``poisson``/``gamma``/``tweedie``, off otherwise. An
+        explicit ``True``/``False`` always wins.
     max_interaction_order : int, default=3
         Whole-tree cap on the number of distinct raw features a tree may use (1 to 8) —
         caps interaction ORDER, which is the number of axes an exported table has. It does
@@ -7283,12 +7287,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     reanchor : bool or None, default=None
         Whether to re-solve the model's global intercept exactly against the training data
         after fitting, removing post-shrinkage aggregate bias. ``None`` uses a link-aware
-        default which resolves to off for the logistic objective (the link-aware "on" case
-        only applies to the log-link regression objectives). An explicit ``True``/``False``
-        always overrides the default on the binary (K=2) path; the multiclass (K>=3) path
-        does not apply intercept re-anchoring at all regardless of this setting — an
-        explicit ``True``/``False`` there raises ``ValueError`` rather than silently
-        no-opping (see the class-level honesty note).
+        default, which resolves to on for the logistic objective. An explicit
+        ``True``/``False`` always overrides the default on the binary (K=2) path; the
+        multiclass (K>=3) path does not apply intercept re-anchoring at all regardless of
+        this setting — an explicit ``True``/``False`` there raises ``ValueError`` rather than
+        silently no-opping (see the class-level honesty note).
     reanchor_slope : bool or None, default=None
         Whether to fit an honest affine link-scale recalibration (``F' = b + a * F``) on the
         fit's own internal validation holdout after early stopping, correcting the uniform
@@ -7297,8 +7300,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         fit is ridge-shrunk toward the identity and only applied when its holdout deviance
         gain clears the prior penalty, so thin or uninformative holdouts stay at
         (near-)identity — this can only help or be neutral, never hurt. Inert without a
-        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` follows
-        the same link-aware default as ``reanchor`` (off for the logistic objective); an
+        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` resolves
+        to off for the logistic objective (validated on the log-link objectives only); an
         explicit ``True``/``False`` always wins on the binary (K=2) path. Like ``reanchor``,
         the multiclass (K>=3) path does not apply this recalibration regardless of the
         setting — an explicit ``True``/``False`` there raises ``ValueError`` rather than
