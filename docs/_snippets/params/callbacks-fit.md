@@ -13,9 +13,12 @@ dictionary:
   its validation objects (`None` without validation objects).
 
 The bags are trained in parallel, so calls for different bags interleave. Each bag's iterations
-arrive in order, all on the calling thread. A true return value stops every bag after its current
-iteration (`stopping_reason_` is then `"callback"`); an exception stops the training and is
-raised from `fit`. The deviances of every iteration are kept in `evals_result_`.
+arrive in order, all on the calling thread. A true return value stops that bag (`bag` in the
+dictionary) after the iteration, just as early stopping stops each bag at its own iteration
+(`stopping_reason_per_bag_` is then `"callback"`). To stop the whole training, return a true
+value for every bag. A function that decides from the dictionary alone stops the same bags at the
+same iterations on every run. An exception stops the training and is raised from `fit`. The
+deviances of every iteration are kept in `evals_result_`.
 
 **Possible types**
 

@@ -57,5 +57,5 @@ boosting (before pruning):
 `evals_result_`
 :   With an `eval_set` or `callbacks`, the deviance of every iteration of every bag.
 
-A function passed in `callbacks` is called after every iteration and can stop the training by
-returning a true value. See [fit](../python-reference/tboostregressor/fit.md).
+A function passed in `callbacks` is called after every iteration of every bag and can stop that
+bag by returning a true value. See [fit](../python-reference/tboostregressor/fit.md).

@@ -36,7 +36,7 @@ The following parameters can be set for the `fit` method:
     dataset.
 
 `callbacks`
-:   Functions called after every iteration, which can stop the training.
+:   Functions called after every iteration of every bag, which can stop that bag.
 
 ## Usage examples {#usage-examples}
 

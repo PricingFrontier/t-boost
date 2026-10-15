@@ -6690,9 +6690,12 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
             rows and its early-stopping rows; ``None`` without the latter). Bags run in
             parallel, so calls for different bags interleave; each bag's rounds arrive in
-            order, all on the calling thread. A truthy return stops every bag after its
-            current round (``stopping_reason_ == "callback"``); an exception stops the fit
-            and propagates. The per-round history is kept in ``evals_result_``.
+            order, all on the calling thread. A truthy return stops that bag (``info["bag"]``)
+            after the round, as early stopping stops each bag at its own round
+            (``stopping_reason_per_bag_`` is then ``"callback"``); to stop the whole fit,
+            return truthy for every bag. A callback that decides from its dict alone stops the
+            same bags at the same rounds on every run. An exception stops the fit and
+            propagates. The per-round history is kept in ``evals_result_``.
 
         Notes
         -----
@@ -8268,9 +8271,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
             rows and its early-stopping rows; ``None`` without the latter). Bags run in
             parallel, so calls for different bags interleave; each bag's rounds arrive in
-            order, all on the calling thread. A truthy return stops every bag after its
-            current round (``stopping_reason_ == "callback"``); an exception stops the fit
-            and propagates. The per-round history is kept in ``evals_result_``.
+            order, all on the calling thread. A truthy return stops that bag (``info["bag"]``)
+            after the round, as early stopping stops each bag at its own round
+            (``stopping_reason_per_bag_`` is then ``"callback"``); to stop the whole fit,
+            return truthy for every bag. A callback that decides from its dict alone stops the
+            same bags at the same rounds on every run. An exception stops the fit and
+            propagates. The per-round history is kept in ``evals_result_``.
 
         Notes
         -----

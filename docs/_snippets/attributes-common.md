@@ -84,7 +84,7 @@ the `n_trees` training parameter in the following cases:
 
 - The training is stopped by [early stopping](../../algorithm/early-stopping.md).
 - No split clears `min_split_gain`.
-- A callback stops the training.
+- A callback stops the bag.
 
 `None` for a multiclassification model.
 
@@ -106,7 +106,7 @@ list of ints
 
 #### Purpose
 
-Why the training stopped, summarized over the bags: `"callback"` if a callback stopped it, else
+Why the training stopped, summarized over the bags: `"callback"` if a callback stopped a bag, else
 `"early_stopping"` if a bag was stopped by early stopping, else `"no_split"` if a bag
 ran out of splits, else `"max_trees"`. `None` for a multiclassification model.
 

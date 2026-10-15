@@ -369,16 +369,13 @@ def test_callbacks_see_rounds_in_order_and_match_history(split) -> None:
     assert {e["phase"] for e in seen} == {"fit"} and {e["n_bags"] for e in seen} == {2}
 
 
-def test_callback_true_stops_and_exceptions_propagate(split) -> None:
+def test_callback_true_stops_its_own_bag_and_exceptions_propagate(split) -> None:
     x, y, _, _ = split
     model = TBoostRegressor(n_trees=200, n_bags=2, prune=False).fit(
         x, y, callbacks=lambda info: info["round"] >= 5
     )
-    # A truthy return stops EVERY bag after its current round. The bags run in parallel, so
-    # the first bag to reach round 5 stops the other wherever it has got to (it used to assert
-    # [5, 5], which failed under load when one bag ran ahead).
-    assert max(model.n_trees_per_bag_) == 5
-    assert all(1 <= n <= 5 for n in model.n_trees_per_bag_)
+    assert model.n_trees_per_bag_ == [5, 5]
+    assert model.stopping_reason_per_bag_ == ["callback", "callback"]
     assert model.stopping_reason_ == "callback"
 
     class Cancelled(Exception):
@@ -389,6 +386,37 @@ def test_callback_true_stops_and_exceptions_propagate(split) -> None:
 
     with pytest.raises(Cancelled):
         TBoostRegressor(n_trees=200, n_bags=2).fit(x, y, callbacks=cancel)
+
+
+def test_a_callback_stop_leaves_the_other_bags_running(split) -> None:
+    # A truthy return stops the bag it was called for, as early stopping stops each bag at its
+    # own round. It used to stop every bag after whatever round each had reached, so the trees
+    # the other bag kept depended on thread timing (2 of 5 runs differed under load).
+    x, y, _, _ = split
+    model = TBoostRegressor(n_trees=200, n_bags=2, prune=False).fit(
+        x, y, callbacks=lambda info: info["bag"] == 0 and info["round"] >= 3
+    )
+    assert model.n_trees_per_bag_[0] == 3
+    assert model.stopping_reason_per_bag_[0] == "callback"
+    assert model.stopping_reason_per_bag_[1] != "callback"
+    assert model.n_trees_per_bag_[1] > 3
+    assert model.stopping_reason_ == "callback"
+
+
+def test_a_callback_stopped_fit_is_the_same_on_every_run(split) -> None:
+    from _artifact import model_bytes
+
+    x, y, _, _ = split
+
+    def fit(n_jobs: int) -> TBoostRegressor:
+        return TBoostRegressor(n_trees=200, n_bags=4, prune=False, n_jobs=n_jobs).fit(
+            x, y, callbacks=lambda info: info["round"] >= 3 + info["bag"]
+        )
+
+    first = fit(4)
+    assert first.n_trees_per_bag_ == [3, 4, 5, 6]
+    for n_jobs in (4, 1, 2):
+        assert model_bytes(fit(n_jobs)) == model_bytes(first)
 
 
 # --- R6 ------------------------------------------------------------------------------------

@@ -4213,7 +4213,7 @@ impl PyBooster {
         eval_weight: Option<PyReadonlyArray1<'_, f32>>,
         eval_exposure: Option<PyReadonlyArray1<'_, f32>>,
         // `observer(bag, round, n_trees, train_deviance, eval_deviance) -> bool` after every
-        // boosting round, on this thread; truthy stops every bag. An exception stops the fit
+        // boosting round, on this thread; truthy stops that bag. An exception stops the fit
         // and propagates.
         observer: Option<Py<PyAny>>,
         // Keep each bag's per-round deviances for `fit_report`.
@@ -7866,9 +7866,11 @@ fn route_unseen_to_rare(
 
 /// Run `fit` on a worker thread while this (the calling) thread serves `observer`: each round
 /// event is handed over a channel, the Python callable runs here with the GIL, and its verdict
-/// goes back to the waiting bag. Once it returns truthy or raises, every later event is told
-/// to stop, so all bags wind down; an exception is re-raised unchanged after the fit thread
-/// finishes (its model is discarded).
+/// goes back to the waiting bag. A truthy verdict stops that bag only: the bags run in
+/// parallel, so stopping the others "now" would leave them wherever the scheduler had got
+/// them, and the fitted model would depend on timing; a bag's own rounds and deviances do not.
+/// Once it raises, every later event is told to stop, so all bags wind down, and the exception
+/// is re-raised unchanged after the fit thread finishes (its model is discarded).
 fn fit_with_observer<F>(
     py: Python<'_>,
     mut state: PyBooster,
@@ -7894,9 +7896,9 @@ where
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || fit(state));
             let mut raised: Option<PyErr> = None;
-            let mut stop = false;
             for (event, reply) in rx.iter() {
-                if !stop {
+                // After an exception the fit is discarded: stop every bag without calling again.
+                let stop = raised.is_some() || {
                     let verdict = Python::attach(|py| -> PyResult<bool> {
                         observer
                             .bind(py)
@@ -7909,14 +7911,11 @@ where
                             ))?
                             .is_truthy()
                     });
-                    match verdict {
-                        Ok(v) => stop = v,
-                        Err(err) => {
-                            raised = Some(err);
-                            stop = true;
-                        }
-                    }
-                }
+                    verdict.unwrap_or_else(|err| {
+                        raised = Some(err);
+                        true
+                    })
+                };
                 // A bag that already finished no longer listens; nothing to do then.
                 let _ = reply.send(stop);
             }
