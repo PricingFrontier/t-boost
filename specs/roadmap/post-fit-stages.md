@@ -1,7 +1,7 @@
 # Post-fit stages: open issues after the switch-off work
 
 Status: written 2026-10-15 on branch `report-0.9.1` at `85f40f1`. The bugs were fixed the same
-day (see "Fixed" below); PF-03, PF-05 to PF-08 and PF-11 to PF-13 remain open.
+day, then PF-05 and PF-03 (see "Fixed" below); PF-06 to PF-08 and PF-11 to PF-13 remain open.
 
 ## Fixed (2026-10-15)
 
@@ -14,6 +14,8 @@ day (see "Fixed" below); PF-03, PF-05 to PF-08 and PF-11 to PF-13 remain open.
 | PF-10 | `b7e7717` | Every graduation path records `skipped` and `candidate_count`. |
 | PF-14 | `ae23d59`, `5831d31` | A truthy callback used to stop every bag after whatever round each had reached, so the fitted model depended on thread timing (the flaky test was this). On the maintainer's decision the contract changed: a truthy return stops the bag it was called for, as early stopping stops each bag at its own round, and a callback that decides from its dict alone gives a byte-identical model on every run and at any `n_jobs`. Return truthy for every bag to stop the whole fit; an exception still stops it. Haute does not pass t-boost callbacks. |
 | PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
+| PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
+| PF-03 | the commit after `d727ca2` | The rebalance is judged per bag on out-of-bag rows (the slice only without them), with the review's defects fixed. −0.109% over 17 datasets against no rebalance, −0.079% against the slice check; +0–22% fit time single-output, +17–45% multiclass; optimistic on the two smallest sets. See PF-03. |
 
 Looked at and left as they are:
 
@@ -258,6 +260,61 @@ re-solve's −0.066% on split 0. A data-derived criterion, or training-time binn
 fix that.
 
 ## PF-03. The rebalance check is biased against the re-solve
+
+### Outcome (2026-10-15): the per-bag check ships
+
+Ported onto the PF-05 rebalance (fit rows placed as the trees saw them), with the review's four
+defects fixed: with no out-of-bag rows (no membership, or every bag drew every row) the slice
+judges it and `evidence` says `"in_sample"`; a membership that does not cover the design is
+refused; the docs say the check judges the re-solve procedure, not the deployed values; and
+under `cell_refit_base` it is documented as approximate. The deployed correction is now solved
+only once the check passes, and the multiclass bag check re-anchors every trial step on the
+bag's in-bag rows, as the deploy re-anchors the chosen one.
+
+Paired test deviance, 17 datasets, 58 splits (`repro/post-fit-stages/pf03_ab.py`,
+`results/pf03.jsonl`):
+
+| comparison | mean of dataset means | single-output (12) | multiclass (5) | splits better / worse |
+|---|---|---|---|---|
+| slice check vs no rebalance | −0.030% | +0.002% | −0.109% | 14 / 5 |
+| **per-bag check vs no rebalance** | **−0.109%** | **−0.062%** | **−0.222%** | **39 / 10** |
+| per-bag check vs slice check | −0.079% | −0.064% | −0.113% | 38 / 6 |
+
+Per dataset (per-bag vs no rebalance): ausbi −0.36%, pg16_fleet −0.41%, prudential −0.27%,
+fr_instal −0.26%, Prudential as binary −0.15%, lapse −0.12%, swmc −0.10%, pg15 −0.10%,
+pg17 instalment −0.09%, pg17 coverage −0.09%, lifesurr −0.08%, freMTPL2 −0.08%, Belgian 2016
+−0.06%, surrender −0.03%, Norway −0.01%; **TIC2000 +0.22% and ussev +0.12%**.
+
+**Open: the check is optimistic on very small data.** Its prediction matches the test change
+closely on every mid-size and large set (ausbi, swmc, lapse, pg15, Norway, Belgian, freMTPL2,
+pg16), but on the two smallest it approves re-solves that hurt: TIC2000 (9.8k rows, 6%
+positive) predicted −0.14% for +0.25% realised, paired SEs 0.20–0.28% per split (mean
++0.27 ± 0.12% over its four adopted splits); ussev (6.8k rows) +0.15 ± 0.10%. The likely
+reason is that a single bag is much weaker than the soup on tiny data, so a re-solve helps a
+bag more than it helps the soup. Measured and rejected as remedies: deploying the mean of the
+bags' own corrections (TIC2000 +0.18%, ussev +0.09%, but ausbi gives back a fifth of its gain),
+and requiring the bags to agree (per-bag improvement counts do not separate the harmful splits;
+the bias is not noise, so a standard-error rule cannot fix it). The slice check also loses on
+ussev (+0.08%).
+
+Cost, median of two default fits per build, interleaved, against the PF-05 build (slice check),
+machine load about 10 (`results/pf03_timing.jsonl`):
+
+| dataset | slice check | per-bag check | change |
+|---|---|---|---|
+| lapse | 2.7 s | 2.7 s | −2% |
+| Prudential as binary (139 columns) | 38 s | 42 s | +10% |
+| freMTPL2 | 69 s | 79 s | +14% |
+| pg16_fleet | 71 s | 83 s | +17% |
+| surrender | 6.8 s | 8.3 s | +22% |
+| pg17 coverage | 56 s | 80 s | +43% |
+| pg17 instalment | 39 s | 57 s | +45% |
+
+On pg17 coverage the check takes 23 s of a 75 s fit: the K × n_bags class solves are 41 s summed
+(a few bags run at a time), the bag banks 1.8 s and the per-trial re-anchors 1.0 s. Each solve is
+the deploy's own ridge backfit on a bag's in-bag rows, so the cost is inherent to judging every bag;
+loosening the bag solves' sweeps or running more of them at once are the levers left (memory caps the
+waves).
 
 ### Finding
 

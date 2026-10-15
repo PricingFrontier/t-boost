@@ -15,8 +15,9 @@ stopping, and the bags are averaged into one model. Training costs about `n_bags
 times as much as training a single model.
 
 1 turns bagging off. Without bagging there are no out-of-bag objects, so pruning falls back to
-the cross-validated selector (see [Pruning settings](pruning.md)), and no spread between bags,
-so the deviance cap alone bounds [banding](banding.md).
+the cross-validated selector (see [Pruning settings](pruning.md)) and
+[`prune_rebalance`](pruning.md#prune_rebalance) to a held-out slice of the training objects,
+and no spread between bags, so the deviance cap alone bounds [banding](banding.md).
 
 **Type**
 

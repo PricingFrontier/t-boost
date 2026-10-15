@@ -189,15 +189,22 @@ int
 #### Description
 
 After tables are dropped, re-solve the values of the remaining tables for the smaller structure
-(one ridge IRLS step, followed by purification). The new values are kept only if they do not
-raise the held-out deviance. Tables on a categorical feature encoded by several channels (see
-[`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
-two-way interaction is re-solved. For multiclassification each class's tables are re-solved, and a
-single step size, chosen on the held-out deviance of all classes together, decides how much of the
-change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
+(one ridge IRLS step, followed by purification). Tables on a categorical feature encoded by
+several channels (see [`cat_channels`](categorical.md#cat_channels)) keep their values; every
+other main effect and two-way interaction is re-solved. For multiclassification each class's
+tables are re-solved, and a single step size, chosen on the held-out deviance of all classes
+together, decides how much of the change is kept. The outcome is recorded in
+`pruning_report_["rebalance"]`.
 
-The re-solve places the training objects of a categorical feature with more levels than bins as
-the trees saw them (see [Categorical features](../algorithm/categorical-features.md)).
+The re-solve is kept only if it does not raise the held-out deviance. Each bag re-solves its own
+tables on the objects it was trained on, in the same way, and is scored on the objects it left
+out: this judges the re-solving procedure, not the deployed values, which are then fitted on all
+the objects. A held-out part of the training objects could not judge it fairly, because the bags
+trained on those objects. With a single bag ([`n_bags`](bagging.md#n_bags) is 1) there are no
+such objects, so a held-out slice of the training objects judges it instead, and declines more
+often than it should. The re-solve places the training objects of a categorical feature with more
+levels than bins as the trees saw them (see
+[Categorical features](../algorithm/categorical-features.md)).
 
 `False` deploys the remaining tables with their values unchanged.
 
