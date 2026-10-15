@@ -374,7 +374,11 @@ def test_callback_true_stops_and_exceptions_propagate(split) -> None:
     model = TBoostRegressor(n_trees=200, n_bags=2, prune=False).fit(
         x, y, callbacks=lambda info: info["round"] >= 5
     )
-    assert model.n_trees_per_bag_ == [5, 5]
+    # A truthy return stops EVERY bag after its current round. The bags run in parallel, so
+    # the first bag to reach round 5 stops the other wherever it has got to (it used to assert
+    # [5, 5], which failed under load when one bag ran ahead).
+    assert max(model.n_trees_per_bag_) == 5
+    assert all(1 <= n <= 5 for n in model.n_trees_per_bag_)
     assert model.stopping_reason_ == "callback"
 
     class Cancelled(Exception):
