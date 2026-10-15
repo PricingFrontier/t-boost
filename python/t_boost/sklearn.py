@@ -769,9 +769,21 @@ _PRUNE_MAIN_EFFECTS_DEFAULT = False
 # noise (see `t_boost_core::banding`). 0.75 measured (arena, 31 datasets): 3-way cells 274M -> 84k,
 # largest 3-way 10.8k cells, pooled test deviance +0.015%. None = no banding.
 _BAND_TOLERANCE_DEFAULT: float | None = 0.75
-# ...and never more than this fraction of the model's own training deviance (the curvature-weighted
-# squared move is the second-order estimate of the deviance it costs). The noise tolerance alone
-# lets a very noisy model move a long way systematically; this caps what that can cost. 0.001 = 0.1%.
+# ...and never more than this fraction of the model's own training deviance, as an estimated
+# EXPECTED cost: the curvature-weighted squared move Σ h δ² / Σ w is the deviance the move would add
+# if the unbanded tables were exactly right, and banding holds its cross-fitted estimate (bands fitted
+# on one half of the rows, the move measured on the other) within the cap. The noise tolerance alone
+# lets a very noisy model move a long way systematically; this caps the move, and alone bounds a
+# one-bag fit. 0.001 = 0.1%. New rows can exceed the estimate at tight caps (1.35x on fresh rows at
+# 0.00025; within it at the default). It does not cap the realized TRAINING rise (2026-10-14): that
+# adds the first-order term 2 Σ g δ / Σ w, positive on the training rows because the bagged, shrunk
+# tables sit short of each cell's training optimum and banding moves them further, and of either
+# sign on test rows. Where the cap binds alone the rise was 0-5.9x the cap (single-output, one bag)
+# and up to 6.6x (multiclass). Single-output: calibrating the budget to the realized rise, dropping
+# the cap and a 16x range of cap levels all measured within split noise. Multiclass: the cap is
+# shared between classes and binds at 8 bags on fr_instal, where dropping it cost +0.10% test
+# deviance and a 4x tighter cap gained 0.25-0.31%; the multiclass strength is an open decision
+# (specs/roadmap/post-fit-stages.md, PF-06).
 _BAND_DEVIANCE_CAP_DEFAULT = 0.001
 
 
@@ -2848,6 +2860,21 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         if high_alpha > 0 and self.graduate is False:
             raise ValueError("graduation_high_order_alpha requires graduation enabled")
 
+    def _validate_band_deviance_cap(self) -> None:
+        """`band_deviance_cap` bounds every banding, and is the only bound with one bag, so it
+        must be finite and above 0 on every path. (0 used to mean "no cap" on the single-output
+        path, where a one-bag fit then skipped banding, and a zero budget on the multiclass path,
+        which left every class bank unbanded at any bag count.)"""
+        cap = getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)
+        if (isinstance(cap, (bool, np.bool_))
+                or not isinstance(cap, (int, float, np.integer, np.floating))
+                or not np.isfinite(cap) or cap <= 0):
+            raise ValueError(
+                f"band_deviance_cap must be finite and > 0, got {cap!r}: it bounds how far "
+                "banding may move the predictions, and is the only bound when n_bags=1 leaves "
+                "no spread between bags; band_tolerance=None turns banding off"
+            )
+
     def _validate_multiclass_inert_params(self) -> None:
         """No silent parameter no-ops: the native multiclass (K>=3) path never applies the
         fully-corrective ridge leaf refit, DART, intercept/slope re-anchoring, or the
@@ -3754,6 +3781,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
     ) -> _Model | _TableModel:
         self._clear_stale_fit_state()
         self._validate_high_order_alpha()
+        self._validate_band_deviance_cap()
         if BUILD_PROFILE == "debug":
             warnings.warn(
                 "the t_boost extension is a DEBUG build — fit timings are unrepresentative"
@@ -4244,17 +4272,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             s2 = np.asarray(var, dtype=np.float64) / max(int(n_bags), 1)
             sigma = float(np.sqrt(np.sum(h * s2) / max(np.sum(h), 1e-300)))
         seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
-        # expected deviance increase of a move δ is Σ h δ² / Σ w (deviance = 2·NLL, h = NLL
-        # curvature), so capping it at `band_deviance_cap` of the mean deviance caps the MSE at:
-        dev_mean = _mean_deviance(obj, y32, target + offset, w, self.tweedie_rho)
+        # The cap is on the move's expected cost (banding holds its cross-fitted estimate), the
+        # deviance it would add if these tables were exactly right: Σ h δ² / Σ w (deviance = 2·NLL, h = NLL curvature), so capping it at
+        # `band_deviance_cap` of the mean deviance caps the MSE at `mse_cap`. The training
+        # deviance rises by more (see `_BAND_DEVIANCE_CAP_DEFAULT`).
+        # A (near-)perfect fit can round its deviance just below 0: a zero budget, not a negative one.
+        dev_mean = max(_mean_deviance(obj, y32, target + offset, w, self.tweedie_rho), 0.0)
         cap_frac = float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT))
-        mse_cap = (cap_frac * dev_mean * float(np.sum(w)) / max(float(np.sum(h)), 1e-300)
-                   if np.isfinite(dev_mean) and cap_frac > 0 else float("inf"))
-        if not (np.isfinite(sigma) or np.isfinite(mse_cap)):
-            if isinstance(getattr(self, "pruning_report_", None), dict):
-                self.pruning_report_["banding"] = {
-                    "skipped": "one bag and band_deviance_cap=0: nothing bounds the banding"}
-            return table_model
+        mse_cap = cap_frac * dev_mean * float(np.sum(w)) / max(float(np.sum(h)), 1e-300)
         banded, report_json = table_model.band(
             x32, np.ascontiguousarray(h), np.ascontiguousarray(mass), np.ascontiguousarray(target),
             sigma, tolerance=tolerance, cat_x=cat_x, seed=seed, n_jobs=n_jobs, mse_cap=mse_cap,
@@ -6395,9 +6420,15 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
         ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
-        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
-        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
-        that can cost.
+        How far banding may move the predictions, as a fraction of the model's training
+        deviance (``0.001`` = 0.1%): a budget on banding's cross-fitted estimate of the move's
+        expected cost, the deviance it would add if the unbanded tables were exactly right. New
+        data can exceed the estimate at tight caps. The noise tolerance alone could let a very
+        noisy model move far; this caps the move, and is the only bound with one bag
+        (``n_bags=1``). The training deviance rises by more, because the cap
+        leaves out the first-order term (the banded tables move away from the training rows' own
+        optimum); on new data that term can go either way. Must be finite and greater than 0;
+        ``band_tolerance=None`` turns banding off.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -7731,9 +7762,15 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
         ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
-        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
-        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
-        that can cost.
+        How far banding may move the predictions, as a fraction of the model's training
+        deviance (``0.001`` = 0.1%): a budget on banding's cross-fitted estimate of the move's
+        expected cost, the deviance it would add if the unbanded tables were exactly right. New
+        data can exceed the estimate at tight caps. The noise tolerance alone could let a very
+        noisy model move far; this caps the move, and is the only bound with one bag
+        (``n_bags=1``). A model with three or more classes shares it between the classes. The training deviance rises by more, because the cap
+        leaves out the first-order term (the banded tables move away from the training rows' own
+        optimum); on new data that term can go either way. Must be finite and greater than 0;
+        ``band_tolerance=None`` turns banding off.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -8340,6 +8377,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         self._clear_stale_fit_state()
         self._clear_fit_counts()  # the boosting report covers regression and binary fits
         self._validate_high_order_alpha()
+        self._validate_band_deviance_cap()
         self._validate_multiclass_inert_params()
         self._validate_cat_channels(multiclass=True)
         _reject_sparse(X)

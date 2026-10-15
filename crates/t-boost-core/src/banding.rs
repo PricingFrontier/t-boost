@@ -108,7 +108,8 @@ pub struct BandingRows<'a> {
     /// Cap on the curvature-weighted mean squared move (`Σ h δ² / Σ h`) from the deviance side:
     /// `deviance_cap · D̄ · Σ w / Σ h`, since the expected deviance increase of a move δ is
     /// `Σ h δ² / Σ w` when `h` is the NLL curvature and the deviance is twice the NLL.
-    /// `f64::INFINITY` = no cap.
+    /// `f64::INFINITY` = no cap, which needs a finite `sigma`: [`band_bank`] refuses a
+    /// budget that nothing bounds.
     pub mse_cap: f64,
 }
 
@@ -1917,12 +1918,24 @@ fn emit_table(
 /// no factored effects) and the report.
 ///
 /// # Errors
-/// [`PbError::ShapeMismatch`] if the row inputs disagree with each other or with the bank.
+/// [`PbError::ShapeMismatch`] if the row inputs disagree with each other or with the bank;
+/// [`PbError::InvalidInput`] if the budget `min((tolerance · σ)², mse_cap)` is not finite and
+/// non-negative (nothing would bound the banding).
 pub fn band_bank(
     bank: &TableBank,
     rows: &BandingRows<'_>,
     cfg: &BandingConfig,
 ) -> Result<(TableBank, BandingReport), PbError> {
+    let budget = (cfg.tolerance * rows.sigma).powi(2).min(rows.mse_cap);
+    if rows.sigma.is_nan() || rows.mse_cap.is_nan() || !budget.is_finite() || budget < 0.0 {
+        return Err(PbError::InvalidInput {
+            what: format!(
+                "banding needs a finite, non-negative budget (sigma {}, mse_cap {}): with no \
+                 noise scale and no deviance cap nothing bounds the move",
+                rows.sigma, rows.mse_cap
+            ),
+        });
+    }
     let n = rows.h.len();
     if rows.mass.len() != n || rows.target.len() != n || rows.cells.iter().any(|c| c.len() != n) {
         return Err(PbError::ShapeMismatch {
@@ -1968,7 +1981,7 @@ pub fn band_bank(
     }
     let mut report = BandingReport {
         tolerance: cfg.tolerance,
-        budget: (cfg.tolerance * rows.sigma).powi(2).min(rows.mse_cap),
+        budget,
         noise_budget: (cfg.tolerance * rows.sigma).powi(2),
         deviance_budget: rows.mse_cap,
         selected_mse: 0.0,
@@ -2634,6 +2647,40 @@ mod tests {
     use rand::Rng;
 
     type RefGroups = HashMap<u64, (f64, f64)>;
+
+    /// No noise scale and no deviance cap leave nothing to bound the move: refused, never a
+    /// silent unbounded (coarsest) banding.
+    #[test]
+    fn band_bank_refuses_an_unbounded_budget() {
+        let bank = TableBank {
+            f0: 0.0,
+            tables: Vec::new(),
+            merged_grids: Vec::new(),
+            w: crate::explain::RefMeasure::Uniform,
+            factored: Vec::new(),
+            joint_variance: None,
+        };
+        let cfg = BandingConfig::default();
+        for (sigma, mse_cap) in [
+            (f64::INFINITY, f64::INFINITY),
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+            (f64::INFINITY, -1.0),
+        ] {
+            let rows = BandingRows {
+                cells: &[],
+                h: &[],
+                mass: &[],
+                target: &[],
+                sigma,
+                mse_cap,
+            };
+            assert!(matches!(
+                band_bank(&bank, &rows, &cfg),
+                Err(PbError::InvalidInput { .. })
+            ));
+        }
+    }
 
     /// The hash-map master cuts this module replaced (2026-09-27), verbatim: the group build.
     #[allow(clippy::too_many_arguments)]

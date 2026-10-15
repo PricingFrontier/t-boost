@@ -460,8 +460,10 @@ within [`band_deviance_cap`](banding.md#band_deviance_cap). Larger values give c
 
 ### [band_deviance_cap](banding.md#band_deviance_cap)
 
-The maximum cost of banding, as a fraction of the model's training deviance. The noise
-tolerance alone could let a very noisy model move far; this cap bounds what that can cost.
+How far banding may move the predictions, as a fraction of the model's training deviance. The
+cap is a budget on banding's cross-fitted estimate of the move's expected cost: the deviance it
+would add if the unbanded tables were exactly right, estimated with bands fitted on one half of the
+rows and the move measured on the other. New data can exceed the estimate when the cap is tight.
 
 ## [Graduation settings](graduation.md)
 

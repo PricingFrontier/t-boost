@@ -40,9 +40,29 @@ def test_a_single_bag_fit_is_banded_within_the_deviance_cap(poisson) -> None:
     assert _cells(est._model) < _cells(_fit(poisson, band_tolerance=None)._model)
 
 
-def test_one_bag_and_no_deviance_cap_leave_nothing_to_bound_the_banding(poisson) -> None:
-    est = _fit(poisson, band_deviance_cap=0.0)
-    assert "nothing bounds the banding" in est.pruning_report_["banding"]["skipped"]
+@pytest.mark.parametrize("cap", [0.00025, 0.001, 0.004])
+def test_one_bag_banding_holds_its_estimated_cost_within_the_deviance_cap(poisson, cap) -> None:
+    """With one bag the cap alone sets the budget, and banding holds its cross-fitted estimate of
+    the move's expected cost (`combined_mse`) within it. That estimate is all the cap promises:
+    the realized training rise also counts a first-order term the cap leaves out, and new rows can
+    exceed the estimate at tight caps (see `_BAND_DEVIANCE_CAP_DEFAULT`)."""
+    band = _fit(poisson, band_deviance_cap=cap, graduate=False).pruning_report_["banding"]
+    assert band["skipped"] is None
+    assert band["budget"] == band["deviance_budget"] > 0
+    assert 0.0 < band["combined_mse"] <= band["budget"]
+
+
+@pytest.mark.parametrize("cap", [0.0, -0.001, float("inf"), float("nan")])
+def test_band_deviance_cap_must_be_finite_and_positive_on_every_path(poisson, cap) -> None:
+    """The cap bounds every banding and is the only bound with one bag. 0 used to mean "no cap"
+    on the single-output path (a one-bag fit then skipped banding) and a zero budget on the
+    multiclass path (every class bank shipped unbanded, at any bag count)."""
+    x, _ = poisson
+    with pytest.raises(ValueError, match="band_deviance_cap must be finite and > 0"):
+        _fit(poisson, band_deviance_cap=cap)
+    y3 = (x[:, 0] > 0).astype(int) + (x[:, 1] > 0).astype(int)
+    with pytest.raises(ValueError, match="band_deviance_cap must be finite and > 0"):
+        TBoostClassifier(n_trees=10, seed=0, n_jobs=2, band_deviance_cap=cap).fit(x, y3)
 
 
 def test_a_single_bag_multiclass_fit_falls_back_to_the_fold_vote_and_is_banded() -> None:

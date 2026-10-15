@@ -9872,7 +9872,7 @@ fn band_multiclass_table_model(
             .max(1e-15);
         dev -= 2.0 * mi * p.ln();
     }
-    let dev_mean = dev / ws.max(f64::MIN_POSITIVE);
+    let dev_mean = (dev / ws.max(f64::MIN_POSITIVE)).max(0.0); // rounding never makes it negative
     let all_rows: Vec<u32> = (0..u32::try_from(n).unwrap_or(u32::MAX)).collect();
     // The bag banks behind the noise estimate are purified under the same row mass as the
     // multiclass prune's and keep-set's banks (`measure_mass`: the weights, under a measure that

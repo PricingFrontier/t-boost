@@ -55,10 +55,12 @@ contains a feature cuts it at the same nested places, so bands line up across ta
 values always keep their own band.
 
 How coarse the bands get is set by the model's own noise. The prediction change from banding is
-held within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between bags. It is
-also capped at `band_deviance_cap` (0.1%) of the training deviance. Banding needs bagging to
-measure $\sigma$. Its report is in `pruning_report_["banding"]`, and `band_tolerance=None` turns
-it off. See [Banding settings](../training-parameters/banding.md).
+held within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between bags. Its
+expected cost, the deviance it would add if the unbanded tables were exactly right (estimated
+on rows the bands were not fitted to), is also capped at `band_deviance_cap` (0.1%) of the training deviance. With one bag (`n_bags=1`) there is
+no $\sigma$ to measure, and the cap alone bounds banding. Its report is in
+`pruning_report_["banding"]`, and `band_tolerance=None` turns it off. See
+[Banding settings](../training-parameters/banding.md).
 
 ## Graduation {#graduation}
 
