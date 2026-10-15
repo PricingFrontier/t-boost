@@ -116,7 +116,7 @@ rejected, so they are not tried again.
 | PF-12 | `band_tolerance` 0.375 beats 0.75 on small single-output sets | — | none | parked (accuracy; not a default change this work makes) |
 | PF-13 | Banding can raise the cell count (densifies factored tables) | Find where; band factored tables in factored form | unknown | open (readability, low priority) |
 | PF-14 | `test_callback_true_stops_and_exceptions_propagate` is flaky under load | Make the stop deterministic | small | fixed `ae23d59`, `5831d31` |
-| PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is, apart from the validation coverage gap (open) |
+| PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is; validation pass done (no bugs) |
 | PF-16 | The per-bag rebalance check is optimistic on very small data | — | — | moot: PF-03 reverted |
 | PF-17 | Multiclass fits stop at the 4,000-tree cap without saying so | Report it; the user raises `n_trees` | none | fixed (reporting) |
 
@@ -801,9 +801,23 @@ with the callback; fix the test or make the stop deterministic.
 - Coverage gap across all three investigations: no Tweedie, squared error, real weighted or
   grouped (panel) data in the accuracy evidence; B checked only that those configurations run.
   Monotone fits were checked for B on fremtpl2 (BonusMalus +1): no harm from the repair.
-  **Still open:** the changes shipped here (PF-05 above all) need a correctness pass over those
-  settings (Tweedie, squared error, sample weights with exposure, panel data with `groups`,
-  `eval_set`, `cell_refit_base`): they must run, report sensibly and stay deterministic.
+  **Done 2026-10-15 (after PF-03 was reverted):** a correctness pass over every objective
+  (Poisson with exposure, Gamma, Tweedie, squared error, binary, multiclass) × 15 settings
+  (default, weights, exposure with weights, offset, panel `groups`, `eval_set`,
+  `cell_refit_base`, one bag, `prune=False`, monotone, `cat_channels` count and class_freq,
+  callbacks, fixed graduation, `reanchor=False`), on data with a 300-level categorical (levels
+  share bins), a 40-level one and a binary one (`repro/post-fit-stages/validation_matrix.py`,
+  `validation_report.py`; `results/validation_matrix.jsonl`, `validation_report.jsonl`).
+  79 of 90 combinations ran clean: finite predictions, well-formed pruning, banding, rebalance,
+  graduation and boosting reports, byte-identical models at `n_jobs` 1 and 4, identical
+  predictions after `to_bytes`/`to_json` round trips, and the JSON and HTML model reports build.
+  The other 11 are refused on purpose with a message that names the conflict: multiclass with
+  exposure, offset, `eval_set`, callbacks, monotone constraints or `reanchor`; `class_freq` on
+  regression; exposure under squared error. No bugs found. Unpruned fits' HTML reports reach
+  2.5–9 MB on these 4,000 rows (the full bank, including 3-way tables on the 300-level feature),
+  the accepted cost of always deploying tables. `python/tests/test_settings_matrix.py` keeps the
+  cases that exercise the out-of-fold placements (eval_set, groups, exposure with weights,
+  `cell_refit_base`, offset, binary and multiclass) as regression tests.
 
 Status of the rest: PF-01's loose ends were looked at and left as they are (see "Fixed"); the
 multiclass check's re-anchor was fixed in `e6fb8b0`; the `w_scale` comment was fixed in
@@ -851,8 +865,10 @@ The original analysis:
 
 ## Remaining work (in scope)
 
-1. The validation coverage pass in PF-15 (correctness of the shipped changes under Tweedie,
-   squared error, weights with exposure, panel data, `eval_set` and `cell_refit_base`).
-2. PF-13, if readability of the banded tables matters enough to look into it.
+1. PF-13, if readability of the banded tables matters enough to look into it.
+
+The validation pass (PF-15) is done. Settings a multiclass fit refuses (exposure, offset,
+`eval_set`, callbacks, monotone constraints, `reanchor`) fail loudly with the conflict named; they
+are feature gaps, not switch-offs, and are not part of this work.
 
 Parked (accuracy only): PF-03 (reverted), PF-06, PF-07, PF-08, PF-11, PF-12. PF-16 is moot.

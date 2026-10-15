@@ -1,0 +1,90 @@
+{"task": "poisson", "setting": "default", "status": "ok", "html_kb": 668, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "default", "status": "ok", "html_kb": 972, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "default", "status": "ok", "html_kb": 474, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "poisson", "setting": "weights", "status": "ok", "html_kb": 679, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "weights", "status": "ok", "html_kb": 1280, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "weights", "status": "ok", "html_kb": 659, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "poisson", "setting": "exposure+weights", "status": "ok", "html_kb": 679, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "exposure+weights", "status": "ok", "html_kb": 1068, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "offset", "status": "ok", "html_kb": 620, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "exposure+weights", "status": "ok", "html_kb": 659, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "binary", "setting": "offset", "status": "ok", "html_kb": 557, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "groups", "status": "ok", "html_kb": 912, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "tweedie", "setting": "offset", "status": "ok", "html_kb": 474, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "poisson", "setting": "eval_set", "status": "ok", "html_kb": 631, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "groups", "status": "ok", "html_kb": 1360, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "cell_refit", "status": "ok", "html_kb": 668, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "groups", "status": "ok", "html_kb": 865, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "binary", "setting": "eval_set", "status": "ok", "html_kb": 1317, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "eval_set", "status": "ok", "html_kb": 732, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "one_bag", "status": "ok", "html_kb": 1093, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "cell_refit", "status": "ok", "html_kb": 971, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "cell_refit", "status": "ok", "html_kb": 474, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "poisson", "setting": "unpruned", "status": "ok", "html_kb": 2500, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "one_bag", "status": "ok", "html_kb": 554, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "binary", "setting": "one_bag", "status": "ok", "html_kb": 1568, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "monotone", "status": "ok", "html_kb": 645, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "multichannel", "status": "ok", "html_kb": 1076, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "class_freq", "status": "refused", "error": "ValueError: cat_channels='class_freq' has no effect on a regression fit and cannot be honored: the per-class frequency channels replace the ORDINAL label-mean categorical encoding, which only exists o"}
+{"task": "binary", "setting": "unpruned", "status": "ok", "html_kb": 2685, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "unpruned", "status": "ok", "html_kb": 3273, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "poisson", "setting": "callback", "status": "ok", "html_kb": 490, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (callback)"]}
+{"task": "binary", "setting": "monotone", "status": "ok", "html_kb": 1038, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "fixed_graduation", "status": "ok", "html_kb": 669, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "monotone", "status": "ok", "html_kb": 936, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "binary", "setting": "multichannel", "status": "ok", "html_kb": 552, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "poisson", "setting": "no_reanchor", "status": "ok", "html_kb": 668, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "multichannel", "status": "ok", "html_kb": 1470, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "tweedie", "setting": "class_freq", "status": "refused", "error": "ValueError: cat_channels='class_freq' has no effect on a regression fit and cannot be honored: the per-class frequency channels replace the ORDINAL label-mean categorical encoding, which only exists o"}
+{"task": "binary", "setting": "class_freq", "status": "ok", "html_kb": 972, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "gamma", "setting": "default", "status": "ok", "html_kb": 936, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "tweedie", "setting": "callback", "status": "ok", "html_kb": 645, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (callback)"]}
+{"task": "binary", "setting": "callback", "status": "ok", "html_kb": 451, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (callback)"]}
+{"task": "tweedie", "setting": "fixed_graduation", "status": "ok", "html_kb": 474, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "weights", "status": "ok", "html_kb": 1356, "critical": [], "early_stopping": ["warning", "5 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "binary", "setting": "fixed_graduation", "status": "ok", "html_kb": 971, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "tweedie", "setting": "no_reanchor", "status": "ok", "html_kb": 474, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "exposure+weights", "status": "ok", "html_kb": 946, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "binary", "setting": "no_reanchor", "status": "ok", "html_kb": 971, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "gamma", "setting": "offset", "status": "ok", "html_kb": 815, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "default", "status": "ok", "html_kb": 1095, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "default", "status": "ok", "html_kb": 1253, "critical": [], "early_stopping": ["warning", "5 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "weights", "status": "ok", "html_kb": 2212, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "exposure+weights", "status": "refused", "error": "ValueError: exposure is not supported with objective='squared_error': it enters as a log(exposure) offset, which has no meaning under the identity link. Use objective='poisson', 'gamma' or 'tweedie' f"}
+{"task": "gamma", "setting": "groups", "status": "ok", "html_kb": 2062, "critical": [], "early_stopping": ["warning", "6 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "eval_set", "status": "ok", "html_kb": 849, "critical": [], "early_stopping": ["warning", "6 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "offset", "status": "ok", "html_kb": 1551, "critical": [], "early_stopping": ["warning", "2 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "weights", "status": "ok", "html_kb": 1275, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "exposure+weights", "status": "refused", "error": "ValueError: exposure is not supported for multiclass (K >= 3) classification"}
+{"task": "multiclass", "setting": "offset", "status": "refused", "error": "ValueError: eval_set, callbacks and offset support regression and binary classification only"}
+{"task": "squared_error", "setting": "groups", "status": "ok", "html_kb": 703, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "gamma", "setting": "cell_refit", "status": "ok", "html_kb": 936, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "groups", "status": "ok", "html_kb": 867, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "multiclass", "setting": "eval_set", "status": "refused", "error": "ValueError: eval_set, callbacks and offset support regression and binary classification only"}
+{"task": "squared_error", "setting": "eval_set", "status": "ok", "html_kb": 1225, "critical": [], "early_stopping": ["warning", "1 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "one_bag", "status": "ok", "html_kb": 1774, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "squared_error", "setting": "cell_refit", "status": "ok", "html_kb": 1095, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "cell_refit", "status": "ok", "html_kb": 1253, "critical": [], "early_stopping": ["warning", "5 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "one_bag", "status": "ok", "html_kb": 880, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (early_stopping)"]}
+{"task": "multiclass", "setting": "one_bag", "status": "ok", "html_kb": 1141, "critical": [], "early_stopping": ["warning", "1 of 1 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "unpruned", "status": "ok", "html_kb": 9051, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "monotone", "status": "ok", "html_kb": 804, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "unpruned", "status": "ok", "html_kb": 7997, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "multichannel", "status": "ok", "html_kb": 996, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "class_freq", "status": "refused", "error": "ValueError: cat_channels='class_freq' has no effect on a regression fit and cannot be honored: the per-class frequency channels replace the ORDINAL label-mean categorical encoding, which only exists o"}
+{"task": "multiclass", "setting": "unpruned", "status": "ok", "html_kb": 5237, "critical": [], "early_stopping": ["warning", "5 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "monotone", "status": "refused", "error": "ValueError: monotone_constraints do not guarantee monotone softmax probabilities; multiclass constrained fits are not supported"}
+{"task": "gamma", "setting": "callback", "status": "ok", "html_kb": 468, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (callback)"]}
+{"task": "squared_error", "setting": "monotone", "status": "ok", "html_kb": 1648, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "fixed_graduation", "status": "ok", "html_kb": 936, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "multichannel", "status": "ok", "html_kb": 1495, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "gamma", "setting": "no_reanchor", "status": "ok", "html_kb": 936, "critical": [], "early_stopping": ["warning", "3 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "multichannel", "status": "ok", "html_kb": 2288, "critical": [], "early_stopping": ["warning", "6 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "class_freq", "status": "refused", "error": "ValueError: cat_channels='class_freq' has no effect on a regression fit and cannot be honored: the per-class frequency channels replace the ORDINAL label-mean categorical encoding, which only exists o"}
+{"task": "squared_error", "setting": "callback", "status": "ok", "html_kb": 520, "critical": [], "early_stopping": ["pass", "every bag stopped before n_trees (callback)"]}
+{"task": "multiclass", "setting": "class_freq", "status": "ok", "html_kb": 1682, "critical": [], "early_stopping": ["warning", "8 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "callback", "status": "refused", "error": "ValueError: eval_set, callbacks and offset support regression and binary classification only"}
+{"task": "squared_error", "setting": "fixed_graduation", "status": "ok", "html_kb": 1094, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "squared_error", "setting": "no_reanchor", "status": "ok", "html_kb": 1095, "critical": [], "early_stopping": ["warning", "4 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "fixed_graduation", "status": "ok", "html_kb": 1253, "critical": [], "early_stopping": ["warning", "5 of 8 bag(s) reached n_trees without early stopping; the model may be under-fitted"]}
+{"task": "multiclass", "setting": "no_reanchor", "status": "refused", "error": "ValueError: reanchor has no effect on multiclass (K>=3) fits: the native multiclass path is v1's base boosting loop only and does not apply intercept re-anchoring. Leave reanchor at its default, or us"}
