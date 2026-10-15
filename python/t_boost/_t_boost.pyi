@@ -616,6 +616,7 @@ class _TableModel:
 
 @final
 class _MultiClassModel:
+    def fit_report(self) -> list[tuple[int, int, str, list[float], list[float]]] | None: ...
     @staticmethod
     def from_json(s: str) -> _MultiClassModel: ...
 

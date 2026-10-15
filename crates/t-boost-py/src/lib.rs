@@ -6591,8 +6591,36 @@ struct PyMultiClassModel {
     model: Arc<MultiClassModel>,
 }
 
+/// The per-bag boosting report of a multiclass fit: every class of a bag shares its rounds, so
+/// the first class's report stands for all of them.
+fn multiclass_fit_report(mc: &MultiClassModel) -> Option<&[t_boost_core::engine::BagFitReport]> {
+    mc.classes.first()?.fit_report.as_deref()
+}
+
 #[pymethods]
 impl PyMultiClassModel {
+    /// Per-bag boosting report of the fit, in bag order: `(trees_kept, rounds_trained,
+    /// stop_reason, train_deviance_history, eval_deviance_history)`, as [`PyModel::fit_report`].
+    /// A round grows one tree per class, so the counts are rounds; the classes share them. The
+    /// histories are empty (a multiclass fit records none). `None` on a loaded model.
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of Python tuples.
+    fn fit_report(&self) -> Option<Vec<(u32, u32, String, Vec<f64>, Vec<f64>)>> {
+        multiclass_fit_report(&self.model).map(|reports| {
+            reports
+                .iter()
+                .map(|r| {
+                    (
+                        r.trees_kept,
+                        r.rounds_trained,
+                        r.reason.as_str().to_owned(),
+                        r.train_deviance.clone(),
+                        r.eval_deviance.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// `categorical_labels` merged over every class's encoders (each label once per feature).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
         merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
@@ -9494,6 +9522,24 @@ fn fit_multiclass_pruned_owned(
                     serde_json::to_value(reps).map_err(|err| {
                         PbError::Serialization(format!("could not serialize banding report: {err}"))
                     })?,
+                );
+            }
+            if let Some(reports) = multiclass_fit_report(&deploy_model) {
+                // The deployed fit's per-bag boosting report, lifted out by the estimator.
+                obj.insert(
+                    "fit_report".into(),
+                    serde_json::Value::Array(
+                        reports
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "trees_kept": r.trees_kept,
+                                    "rounds_trained": r.rounds_trained,
+                                    "reason": r.reason.as_str(),
+                                })
+                            })
+                            .collect(),
+                    ),
                 );
             }
             if let Some(cr) = deploy_model.cell_refit {

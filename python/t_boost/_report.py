@@ -1231,7 +1231,7 @@ def _graduation_tables(est: "_BaseTBoost", names: list[str]) -> list[dict[str, A
 
 def fit_section(est: "_BaseTBoost", multiclass: bool,
                 names: list[str] | None = None) -> dict[str, Any]:
-    loaded_or_multi = ("not recorded: a multiclass fit has no per-bag boosting report"
+    loaded_or_multi = ("not recorded with this model (a multiclass model saved before 0.9.1)"
                        if multiclass else "not recorded with this model (saved before 0.7.0)")
     history = getattr(est, "evals_result_", None)
     pruning = getattr(est, "pruning_report_", None)

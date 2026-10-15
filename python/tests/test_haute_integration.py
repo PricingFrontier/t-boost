@@ -480,10 +480,12 @@ def test_offset_refused_for_multiclass(split) -> None:
         TBoostClassifier(n_trees=5, n_bags=1).fit(x, np.digitize(y, [-0.5, 0.5]), offset=np.zeros(len(y)))
 
 
-def test_multiclass_fit_report_is_none() -> None:
+def test_a_multiclass_fit_reports_its_boosting_too() -> None:
+    # It used to report nothing (see test_multiclass_fit_report.py).
     frame, y = _frame(600)
     model = TBoostClassifier(n_trees=10, n_bags=1).fit(frame, np.digitize(y, [-0.5, 0.5]))
-    assert model.n_trees_per_bag_ is None and model.stopping_reason_ is None
+    assert len(model.n_trees_per_bag_) == 1 and 0 < model.n_trees_ <= 10
+    assert model.stopping_reason_ in ("early_stopping", "max_trees", "no_split")
 
 
 @pytest.mark.parametrize(

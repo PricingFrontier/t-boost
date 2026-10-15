@@ -2339,6 +2339,12 @@ fn fit_multiclass_single(
     let mut best_counts: Vec<usize> = vec![0; n_classes];
     let mut best_round_seen = 0u32;
     let mut interaction_gain_references: Vec<Option<f64>> = vec![None; n_classes];
+    // The bag's boosting report (the K>=3 twin of `fit_single`'s): rounds trained, rounds kept
+    // after early stopping, and why the loop ended. A round grows one tree per class, so rounds
+    // are what `n_trees` caps.
+    let mut rounds_trained = 0u32;
+    let mut rounds_kept = 0u32;
+    let mut stop_reason = StopReason::MaxTrees;
 
     for t in 0..config.n_trees {
         let mut round_cfg = grow_cfg.clone();
@@ -2476,7 +2482,12 @@ fn fit_multiclass_single(
         let any_grew = grew_by_class.into_iter().any(|grew| grew);
         // No class could split (converged / constant) — stop with what we have.
         if !any_grew {
+            stop_reason = StopReason::NoSplit;
             break;
+        }
+        rounds_trained = t + 1;
+        if validation_rows.is_none() {
+            rounds_kept = rounds_trained;
         }
         if let Some(val) = validation_rows.as_deref() {
             let dev = prof::timed("mc_earlystop_eval", || {
@@ -2500,9 +2511,11 @@ fn fit_multiclass_single(
                     })? = tk.len();
                 }
                 best_round_seen = t;
+                rounds_kept = t + 1;
             } else if (t as usize).saturating_sub(best_round_seen as usize)
                 >= config.effective_patience(best_round_seen as usize)
             {
+                stop_reason = StopReason::EarlyStopping;
                 break;
             }
         }
@@ -2560,7 +2573,15 @@ fn fit_multiclass_single(
             bag_in_bag: None,
             fit_cat_bins: None,
             delta_step_gate: None,
-            fit_report: None,
+            // Every class of the bag shares its rounds, so each carries the same report; the
+            // per-class soup gathers the bags' reports in bag order.
+            fit_report: Some(vec![BagFitReport {
+                trees_kept: rounds_kept,
+                rounds_trained,
+                reason: stop_reason,
+                train_deviance: Vec::new(),
+                eval_deviance: Vec::new(),
+            }]),
         };
         model.schema_version = model.required_schema_version();
         model.validate()?;

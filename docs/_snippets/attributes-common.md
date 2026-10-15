@@ -86,7 +86,8 @@ the `n_trees` training parameter in the following cases:
 - No split clears `min_split_gain`.
 - A callback stops the bag.
 
-`None` for a multiclassification model.
+For multiclassification, a boosting round grows one tree per class, and the counts are rounds,
+which `n_trees` caps.
 
 #### Type
 
@@ -96,7 +97,7 @@ int
 
 #### Purpose
 
-The number of trees each bag kept. `None` for a multiclassification model.
+The number of trees each bag kept (boosting rounds, for multiclassification).
 
 #### Type
 
@@ -108,7 +109,7 @@ list of ints
 
 Why the training stopped, summarized over the bags: `"callback"` if a callback stopped a bag, else
 `"early_stopping"` if a bag was stopped by early stopping, else `"no_split"` if a bag
-ran out of splits, else `"max_trees"`. `None` for a multiclassification model.
+ran out of splits, else `"max_trees"`.
 
 #### Type
 
@@ -118,8 +119,7 @@ string
 
 #### Purpose
 
-Why each bag stopped: `"early_stopping"`, `"max_trees"`, `"no_split"` or `"callback"`. `None` for
-a multiclassification model.
+Why each bag stopped: `"early_stopping"`, `"max_trees"`, `"no_split"` or `"callback"`.
 
 #### Type
 

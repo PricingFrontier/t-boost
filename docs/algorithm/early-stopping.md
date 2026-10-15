@@ -41,8 +41,8 @@ The validation dataset is one of the following:
 
 ## Results {#results}
 
-After a regression or binary classification fit, the following attributes describe the
-boosting (before pruning):
+After a fit, the following attributes describe the boosting (before pruning). For
+multiclassification the counts are boosting rounds, each of which grows one tree per class:
 
 `n_trees_per_bag_`
 :   The number of trees each bag kept.
@@ -56,6 +56,11 @@ boosting (before pruning):
 
 `evals_result_`
 :   With an `eval_set` or `callbacks`, the deviance of every iteration of every bag.
+
+A bag that stopped at `"max_trees"` was still improving on its validation objects when it reached
+the `n_trees` limit, so the model may be under-fitted; the
+[model report](../model-analysis/model-report.md) warns about it. Raise `n_trees` to let early
+stopping end the training.
 
 A function passed in `callbacks` is called after every iteration of every bag and can stop that
 bag by returning a true value. See [fit](../python-reference/tboostregressor/fit.md).

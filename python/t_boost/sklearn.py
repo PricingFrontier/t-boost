@@ -3756,7 +3756,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self.__dict__.pop("evals_result_", None)
 
     def _clear_fit_counts(self) -> None:
-        """No boosting report (a multiclass fit, or a model saved before 0.7.0)."""
+        """No boosting report (a model saved before it was recorded)."""
         self.n_trees_per_bag_ = self.stopping_reason_per_bag_ = None
         self.n_trees_ = self.stopping_reason_ = None
         self.__dict__.pop("evals_result_", None)
@@ -6703,13 +6703,13 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
 
         Notes
         -----
-        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        After a fit, ``n_trees_per_bag_`` holds the trees each bag kept,
         ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
         ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
         ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
         boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
+        model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
         ``evals_result_`` holds each bag's per-round mean deviances:
         ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
         ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
@@ -8286,13 +8286,15 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
 
         Notes
         -----
-        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        After a fit, ``n_trees_per_bag_`` holds the trees each bag kept,
         ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
         ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
-        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
-        boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
+        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). On a multiclass
+        (K>=3) fit a boosting round grows one tree per class, so the counts are rounds, which
+        ``n_trees`` caps. They describe the boosting, before pruning, and survive
+        ``to_bytes``/``to_json``; they are ``None`` for a model saved before 0.7.0 (a multiclass
+        one before 0.9.1). With ``eval_set`` or ``callbacks``,
         ``evals_result_`` holds each bag's per-round mean deviances:
         ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
         ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
@@ -8399,7 +8401,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
     ) -> _MultiClassModel | _MultiClassTableModel:
         self._clear_stale_fit_state()
-        self._clear_fit_counts()  # the boosting report covers regression and binary fits
+        self._clear_fit_counts()  # set again from the deployed fit's report below
         self._validate_high_order_alpha()
         self._validate_band_deviance_cap()
         self._validate_multiclass_inert_params()
@@ -8608,6 +8610,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                     **common,
                 )
             self.pruning_report_ = json.loads(report_json)
+            # The deployed fit's per-bag boosting report rides in the prune report (the native
+            # side keeps the ensemble), as the cell-refit diagnostics below do.
+            fit_report = self.pruning_report_.pop("fit_report", None)
+            if fit_report:
+                self._set_fit_counts([int(r["trees_kept"]) for r in fit_report],
+                                     [str(r["reason"]) for r in fit_report])
             # §G1 K>=3 OOB cell-refit diagnostics for the DEPLOYED fit — the multiclass analogue
             # of `delta_step_gate_`. Pruning replaces the `_MultiClassModel` with a
             # `_MultiClassTableModel`, which carries no fit-time diagnostics, so the native side
@@ -8636,6 +8644,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 bag_groups=bag_codes,
             )
             self.cell_refit_report_ = model.cell_refit_report
+            fit_report = model.fit_report()
+            if fit_report:
+                self._set_fit_counts([int(r[0]) for r in fit_report], [str(r[2]) for r in fit_report])
             # Every fit deploys rating tables: an unpruned fit keeps all of them and bands them
             # as a pruned fit does; only the selection is skipped.
             w_full = np.ascontiguousarray(
