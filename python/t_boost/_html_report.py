@@ -1100,8 +1100,9 @@ def bank_chart(r: dict[str, Any], w: float, h: float) -> str:
 def training_chart(r: dict[str, Any], w: float, h: float) -> str:
     """Each bag's deviance by boosting round on the rows it set aside for early stopping, the
     round it kept and the band of those rounds; with callbacks, each bag's training rows too.
-    Each bag sets aside its own rows, so the curves sit at different levels: an average over
-    the bags still running would jump whenever one finished, so every bag is drawn."""
+    The scale runs from 0 to the starting loss. Each bag sets aside its own rows, so the curves
+    sit at different levels: an average over the bags still running would jump whenever one
+    finished, so every bag is drawn."""
     fit = r["fit"]
     hist = fit["evals_result"]
     if not hist["available"]:
@@ -1117,11 +1118,11 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
     if not curves:
         return _none("No training history.")
     rounds = max(c[-1][0] for c in curves)
-    skip = max(5, rounds // 20)
-    tail = [v for c in curves for i, v in c if i >= skip] or [v for c in curves for _, v in c]
     left, right, top, bottom = 58.0, w - 14, 24.0, h - 22
     xs = _Lin(1.0, float(rounds), left, right, pad=0.0, n=5)
-    ys = _Lin(min(tail), max(tail), bottom, top, pad=0.12, n=4)
+    # From 0 to the starting loss (the highest first-round deviance of any bag), so each curve
+    # shows how much of its loss the boosting removed.
+    ys = _Lin(0.0, max(c[0][1] for c in curves), bottom, top, pad=0.04, zero=True, n=4)
 
     def dev_fmt(v: float) -> str:
         return _num(v, 4)
@@ -1132,7 +1133,7 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
         x0, x1 = xs(min(kept)), xs(max(kept))
         svg.add(f'<rect class="tol" x="{x0:.1f}" y="{top:.1f}" width="{max(x1 - x0, 1):.1f}" '
                 f'height="{bottom - top:.1f}"/>')
-        svg.text((x0 + x1) / 2, top + 14, "bags stop", anchor="middle")
+        svg.text((x0 + x1) / 2, bottom - 8, "bags stop", anchor="middle")
     _yaxis(svg, ys, left, right, dev_fmt)
     svg.hline(left, right, bottom, "ax")
     for j, t in enumerate(xs.ticks):
@@ -1149,14 +1150,8 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
                  + (", the round it kept marked" if marked else ""), cls="lbl")
     else:
         svg.text(left, 12, "deviance on each bag's training rows by round", cls="lbl")
-    def entering(c: list[tuple[int, float]]) -> list[tuple[int, float]]:
-        # The axis fits the later rounds, so the first ones lie above it: start each line at its
-        # last point above, clamped to the top edge, rather than drawing a flat run along it.
-        first = next((k for k, (_, v) in enumerate(c) if v <= ys.hi), len(c))
-        return c[max(first - 1, 0):] if first < len(c) else c
-
     for c, cls in [(c, "faded") for c in train_c] + [(c, "dfaded") for c in held_c]:
-        svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in entering(c)], cls)
+        svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in c], cls)
     if marked:
         for k, (b, n) in enumerate(zip(held, kept)):
             v = b[n - 1] if 1 <= n <= len(b) else None
