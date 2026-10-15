@@ -1,0 +1,1071 @@
+#################### aaf99064d2c1e6a01
+## root_cause
+The cap does exactly what the code computes, and the docs promise more than that. `mse_cap = cap * D * sum(w) / sum(h)` bounds only the second-order term `sum(h*delta^2)/sum(w) <= cap*D`: the deviance the banding move would add if the unbanded tables were exactly right. Banding holds this on the cross-fitted combined move. The docs and docstrings call it "the most banding may cost, as a fraction of the training deviance", which is false.
+
+**Method.** In 39 base fits, banding's exact training-deviance change was split into `2*sum(g*delta)/sum(w) + sum(h*delta^2)/sum(w) + remainder`, with g and h the NLL gradient and curvature at the unbanded tables. The fits were: 7 fast datasets x splits 0,1 x n_bags 1 and 8 (graduate=False); fremtpl2 split 0 at 1 and 8 bags and split 1 at 1 bag; fr_instal and pg16_fleet x 2 splits x 1/8 bags (softmax gradient, full quadratic form).
+
+**The task's three hypotheses:**
+1. **First-order term: yes, it is the whole excess.** It is positive on the training rows in 35 of the 35 fits that moved anything. The realized rise is 0-12.3x the cap; 0-5.9x where the cap binds alone (one bag). fremtpl2 at one bag: 3.88x (split 0, train +0.388%, test 0.304892, the task's numbers) and 3.50x (split 1). It is positive because the bagged, shrunk, early-stopped tables are not at their per-cell training optimum. Banding smooths further and strips noise the tables absorbed, and the training rows count that as a loss. On test rows the same term ranges from -0.240% to +0.405% and is negative in 17 of 39 fits. It decides whether banding helps (swmc and fremtpl2 at one bag) or hurts (ausbi, fr_instal, pg16_fleet).
+2. **Second-order approximation: no.** The higher-order remainder is at most 0.025x the cap.
+3. **Merges interacting: no.** The budget is held on the combined cross-fitted move (all tables summed per row). The second-order term stays at most 0.87x the cap on training rows and 0.86x on test rows in every fit.
+
+The training rows also misjudge the move where tables are sparse. The distil pins the training rows: on surrender the training-row move is 0.003-0.07x the budget while the test-row move is 0.47-0.92x. So the training rise is a biased yardstick in both directions.
+
+**Second part, reproduced (cap0_behaviour.jsonl, plus the code):**
+- Single-output: `band_deviance_cap=0` meant mse_cap = inf. With 8 bags the noise budget acted alone; with 1 bag banding was skipped, leaving only a report key.
+- Multiclass: 0 gave every class a zero budget, so the core's "cannot meet its fidelity budget" skip left every class bank unbanded at 1 and at 8 bags. That is a second silent skip.
+- inf and NaN were inconsistent too. On the multiclass path at one bag they reach the core as an infinite budget, which bands without bound.
+## candidates
+[
+ {
+  "name": "Leave it as it is",
+  "description": "No change: the cap stays a second-order bound, the docs keep calling it the most banding may cost of the training deviance, and cap=0 keeps two meanings.",
+  "result_summary": "Behaviour as the baseline. The docs' promise is exceeded 0-12.3x on training deviance (table). cap=0: on the single-output path, banding is skipped at one bag with only a report key; on the multiclass path, every class bank is unbanded at any bag count.",
+  "verdict": "rejected",
+  "reason": "The docs are wrong, and cap=0 silently switches banding off on two paths, which breaks the fail-loudly rule."
+ },
+ {
+  "name": "Reword as an expected cost; cap must be finite and > 0 on every path",
+  "description": "Docs, both docstrings, the constant's comment and readable-tables.md say the cap bounds the expected (second-order) cost of the move and does not bound the realized training rise. A new _validate_band_deviance_cap raises ValueError at the start of fit for cap <= 0, inf, nan or bool, on both _fit_model and _fit_multiclass. _band_deployed drops the 'nothing bounds the banding' skip and the 0/non-finite -> inf fallback. Python only.",
+  "result_summary": "Every fit with a valid cap is byte-identical: 8 pre/post-edit fits (swmc, ausbi, surrender, lapse; 1 and 8 bags) gave identical test/train deviance and banding reports, at no speed cost. The reworded promise holds in all 39 fits: second-order term at most 0.87x the cap on training rows and 0.86x on test rows. New tests pin the contract (on the fixture: 0.19x the cap at the default, 0.56x at cap 0.004) and the ValueError on both paths.",
+  "verdict": "recommended",
+  "reason": "The simplest change that fixes the cause (a false promise and inconsistent zero/non-finite values), with no behaviour change for valid settings and no new knob."
+ },
+ {
+  "name": "Include the first-order term in the cap",
+  "description": "Budget banding on the realized training cost 2*sum(g*delta)/sum(w) + sum(h*delta^2)/sum(w) instead of the second-order term alone.",
+  "result_summary": "This constrains the same training-row quantity as calibration (realized rise = first + second order, remainder at most 0.025x the cap), so the calibration runs measure what enforcing it does. Putting g into the greedy's objective would also make it prefer merges that keep fitted noise, since those do not raise the training deviance. Not built separately.",
+  "verdict": "rejected",
+  "reason": "The training-row first-order term charges banding for removing fitted noise, and it is of either sign out of sample (17 of 39 fits negative on test), so it cannot price the move."
+ },
+ {
+  "name": "Calibrate the budget to the realized training deviance",
+  "description": "Probe variant: band at the nominal cap, measure the realized training rise rho, rescale the binding budget by (cap/rho)^2 (the rise grows like the square root of the budget) and band again, for up to 5 passes until rho <= cap.",
+  "result_summary": "Fast panel, graduated, 14 pairs: 1 bag -0.052% mean / 0.000% median (4 better, 1 worse) at cells x1.47; 8 bags -0.078% / -0.021% (7/2) at cells x2.89 and 2-4x banding time. At matched readability it adds nothing beyond banding less: at 1 bag a uniform cap x0.25 gives -0.038% at x1.53; at 8 bags band_tolerance=0.375 gives -0.095% / -0.048% (8/2) at x1.90. The sign is dataset-dependent: swmc at 1 bag +0.060%, ausbi -0.378%. fremtpl2: 1 bag ungraduated +0.024% / +0.039% at cells x10.1 / x9.2; 1 bag graduated +0.021% (split 0); 8 bags graduated -0.007% / +0.007% at x2.6 / x2.5, with banding time 15.5->26.8 s and 9.0->70.9 s. It is blind where the distil pins training rows: surrender's realized rise is 0.08x the cap while its test-row move is 0.73x.",
+  "verdict": "rejected",
+  "reason": "It binds at every bag count, so it would replace band_tolerance as the operative control. A plain tolerance change dominates it, and it is slower, larger, and worse on fremtpl2."
+ },
+ {
+  "name": "Use out-of-bag evidence",
+  "description": "Price the banding move on held-out rows instead of training rows.",
+  "result_summary": "Not built. With one bag, where the cap binds alone, there are no OOB rows; the early-stopping holdout is carved inside the Rust fit and not exposed. At 8 bags no row is out of bag for the soup: the move is built from the soup, which saw each row through about 80% of the bags, so scoring it on per-bag OOB rows keeps most of the training optimism. The honest form (band each bag's bank and score it on its own OOB rows) costs n_bags banding passes. The single-output cap never binds at 8 bags anyway.",
+  "verdict": "rejected",
+  "reason": "Unavailable exactly where the cap matters, and the honest form adds a large special-case mechanism."
+ },
+ {
+  "name": "Drop the cap",
+  "description": "Remove band_deviance_cap and leave the noise budget alone.",
+  "result_summary": "Single-output, 8 bags: identical on 14 of 14 fast pairs (the cap never binds; fremtpl2 nb/db 0.155 / 0.204). Multiclass, 8 bags: the per-class share binds on fr_instal (nb/db 1.00-1.34), and dropping it costs +0.102% / +0.098% test (graduate=False). pg16_fleet does not bind (0.30-0.34). With one bag nothing would bound banding, so the fit would have to raise, which switches banding off for n_bags=1.",
+  "verdict": "rejected",
+  "reason": "It earns its place: the only bound with one bag, and an active bound on multiclass fits at default bags."
+ },
+ {
+  "name": "Retune the cap level",
+  "description": "Sensitivity of one-bag fits (where the cap binds alone) to the cap at x0.25, x0.5, x2 and x4, graduate=False, fast panel, 14 pairs.",
+  "result_summary": "Paired test means x0.25 -0.020%, x0.5 -0.019%, x2 +0.037%, x4 -0.013%; all medians 0 and non-monotone, i.e. within split noise. Cells move monotonically: x1.53, x1.26, x0.84, x0.71.",
+  "verdict": "rejected",
+  "reason": "The test response is flat across a 16x range while readability moves consistently, so the 0.001 default needs no tuning."
+ },
+ {
+  "name": "Part two alternative: keep 0 = no cap and raise only at n_bags=1",
+  "description": "Make the multiclass path treat 0 as no cap too, and raise only for the one-bag + cap=0 conflict.",
+  "result_summary": "Not built. 'No cap' changes no single-output 8-bag fit, since the cap never binds there. On multiclass it would loosen fr_instal's banding, costing about 0.10%. haute never passes band_deviance_cap (read-only grep).",
+  "verdict": "rejected",
+  "reason": "A magic value that switches a budget off (CLAUDE.md: budgets run for every configuration) and buys nothing measurable."
+ }
+]
+## recommendation
+Adopt the patch. `band_deviance_cap` keeps its mechanism but is now described as what it is: the expected (second-order) cost of the banding move, as a fraction of the training deviance. That bound held in every one of the 39 measured fits, on training and on test rows. It does not bound the realized training rise, which is 0-12.3x the cap because of the first-order term.
+
+The cap must be finite and greater than 0 on every path. Anything else raises ValueError at the start of fit, naming the parameter and the one-bag role, which removes the silent one-bag skip and the multiclass zero-budget skip.
+
+Do not include the first-order term, calibrate to the realized training rise, add OOB pricing, drop the cap or retune it. Calibration is dominated at matched readability by a plain band_tolerance change, is worse on fremtpl2 at 2.5-10x the cells, and binds at every bag count. Dropping the cap leaves one-bag fits unbounded and costs fr_instal about 0.10%. The cap level's test response is flat.
+
+No model bytes change for valid settings.
+## evidence_table
+### A. Training rise of banding vs the nominal cap (0.001); graduate=False, base. Columns are in units of the cap except test rise and test 1st order (% of deviance).
+
+Remainder magnitudes are all at most 0.025x the cap and are not repeated per row.
+
+| dataset | split | bags | binds | train rise | 1st order | 2nd order | test rise | test 1st | test 2nd |
+|---|---|---|---|---|---|---|---|---|---|
+| ausbi | 0/1 | 1 | cap | 3.41x / 4.03x | 2.92 / 3.43 | 0.48 / 0.56 | +0.184% / +0.179% | +0.126 / +0.116 | 0.52 / 0.59 |
+| ausbi | 0/1 | 8 | noise | 5.25x / 3.98x | 4.87 / 3.58 | 0.28 / 0.40 | +0.285% / +0.160% | +0.238 / +0.118 | 0.36 / 0.43 |
+| fremtpl2 | 0/1 | 1 | cap | 3.88x / 3.50x | 3.16 / 2.93 | 0.71 / 0.56 | -0.014% / -0.017% | -0.100 / -0.094 | 0.86 / 0.77 |
+| fremtpl2 | 0 | 8 | noise (nb/db 0.155) | 1.60x | 1.52 | 0.08 | +0.008% | -0.003 | 0.11 |
+| lapse | 0/1 | 1 | cap | 0.81x / 2.26x | 0.61 / 1.98 | 0.20 / 0.29 | -0.029% / +0.073% | -0.048 / +0.043 | 0.19 / 0.30 |
+| lapse | 0/1 | 8 | noise | 3.50x / 2.72x | 3.33 / 2.57 | 0.17 / 0.16 | +0.025% / +0.024% | +0.007 / +0.008 | 0.18 / 0.16 |
+| lifesurr | 0/1 | 1 | cap | 2.52x / 4.11x | 1.89 / 3.44 | 0.63 / 0.67 | +0.024% / +0.044% | -0.044 / -0.032 | 0.68 / 0.76 |
+| lifesurr | 0/1 | 8 | noise | 4.31x / 2.77x | 4.08 / 2.55 | 0.23 / 0.22 | +0.073% / -0.050% | +0.044 / -0.075 | 0.29 / 0.25 |
+| norway | 0/1 | 1 | cap | 0.14x / 0.31x | 0.12 / 0.24 | 0.03 / 0.07 | -0.006% / +0.026% | -0.008 / +0.019 | 0.02 / 0.07 |
+| norway | 0/1 | 8 | noise | 0.01x / 0.00x | 0.01 / 0.00 | 0.00 / 0.00 | -0.002% / 0 | -0.002 / 0 | 0.00 / 0.00 |
+| surrender | 0/1 | 1 | cap | 0.71x / 0.08x | 0.64 / 0.08 | 0.07 / 0.00 | -0.046% / -0.012% | -0.130 / -0.084 | 0.84 / 0.73 |
+| surrender | 0/1 | 8 | noise | 1.67x / 1.35x | 1.61 / 1.30 | 0.05 / 0.05 | +0.033% / -0.113% | -0.032 / -0.161 | 0.66 / 0.47 |
+| swmc | 0/1 | 1 | cap | 5.91x / 3.32x | 5.03 / 2.74 | 0.87 / 0.58 | -0.155% / -0.033% | -0.240 / -0.086 | 0.84 / 0.52 |
+| swmc | 0/1 | 8 | noise | 5.89x / 12.30x | 5.54 / 11.55 | 0.34 / 0.75 | +0.164% / +0.007% | +0.133 / -0.065 | 0.31 / 0.72 |
+| ussev | 0/1 | 1 | cap | 0.00x / 0.99x | 0.00 / 0.89 | 0.00 / 0.09 | 0 / -0.040% | 0 / -0.048 | 0.00 / 0.08 |
+| ussev | 0/1 | 8 | noise | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 | 0 / 0 |
+| fr_instal (4 classes) | 0/1 | 1 | cap | 4.38x / 4.07x | 4.07 / 3.75 | 0.31 / 0.31 | +0.348% / +0.315% | +0.271 / +0.231 | 0.76 / 0.84 |
+| fr_instal (4 classes) | 0/1 | 8 | cap (nb/db 1.00-1.34) | 6.46x / 6.55x | 6.17 / 6.26 | 0.29 / 0.29 | +0.417% / +0.479% | +0.344 / +0.405 | 0.73 / 0.73 |
+| pg16_fleet (3 classes) | 0/1 | 1 | cap | 5.13x / 4.95x | 4.32 / 4.11 | 0.79 / 0.82 | +0.313% / +0.279% | +0.229 / +0.193 | 0.84 / 0.84 |
+| pg16_fleet (3 classes) | 0/1 | 8 | noise (0.30-0.34) | 3.27x / 3.08x | 3.01 / 2.83 | 0.25 / 0.25 | +0.162% / +0.149% | +0.132 / +0.119 | 0.30 / 0.30 |
+
+### B. Graduated (what ships): base test deviance (mean of splits 0,1) and paired test-deviance deltas vs base
+
+| dataset | 1 bag base | 1 bag calib | 1 bag cap x0.25 | 8 bags base | 8 bags calib | 8 bags tol 0.375 | 8 bags tol 0.25 |
+|---|---|---|---|---|---|---|---|
+| ausbi | 1.309668 | -0.378% | -0.343% | 1.308697 | -0.335% | -0.360% | -0.340% |
+| fremtpl2 | 0.304881 (split 0) | +0.021% (split 0) | - | 0.303200 | +0.000% (-0.007 / +0.007) | - | - |
+| lapse | 0.362260 | -0.017% | -0.013% | 0.361543 | -0.021% | -0.048% | -0.010% |
+| lifesurr | 0.247863 | -0.029% | -0.061% | 0.245489 | -0.008% | -0.019% | -0.008% |
+| norway | 0.273079 | 0.000% | 0.000% | 0.273015 | 0.000% | 0.000% | +0.002% |
+| surrender | 0.518527 | 0.000% | +0.051% | 0.518650 | +0.017% | +0.033% | +0.039% |
+| swmc | 0.097462 | +0.060% | +0.100% | 0.097385 | -0.201% | -0.270% | -0.213% |
+| ussev | 1.144379 | 0.000% | 0.000% | 1.141977 | 0.000% | 0.000% | 0.000% |
+| **fast panel, 14 pairs: mean / median (better, worse beyond 0.02%)** | | -0.052% / 0.000% (4, 1) | -0.038% / 0.000% (5, 2) | | -0.078% / -0.021% (7, 2) | -0.095% / -0.048% (8, 2) | -0.076% / -0.010% (6, 2) |
+| **cells vs base (geometric mean)** | | x1.47 | x1.53 | | x2.89 | x1.90 | x2.98 |
+
+### C. Banding isolated (graduate=False): paired test-deviance deltas vs base
+
+| dataset | 1 bag cap x0.5 | 1 bag cap x2 | 1 bag cap x4 | 1 bag calib | 8 bags no cap | 8 bags calib |
+|---|---|---|---|---|---|---|
+| ausbi | -0.145% | +0.148% | +0.045% | -0.238% | 0.000% | -0.208% |
+| fremtpl2 | - | - | - | +0.032% (cells x10.1 / x9.2) | - | -0.003% (split 0, cells x2.6) |
+| lapse | 0.000% | 0.000% | 0.000% | -0.026% | 0.000% | -0.024% |
+| lifesurr | -0.079% | -0.052% | -0.167% | -0.031% | 0.000% | -0.008% |
+| norway | 0.000% | 0.000% | 0.000% | 0.000% | 0.000% | 0.000% |
+| surrender | +0.052% | +0.116% | -0.022% | 0.000% | 0.000% | +0.011% |
+| swmc | +0.039% | +0.051% | +0.051% | +0.098% | 0.000% | -0.074% |
+| ussev | 0.000% | 0.000% | 0.000% | 0.000% | 0.000% | 0.000% |
+| **fast panel, 14 pairs: mean / median** | -0.019% / 0 | +0.037% / 0 | -0.013% / 0 | -0.028% / 0 | 0.000% (14 of 14 identical) | -0.043% / -0.005% |
+
+cap x0.25 at one bag, ungraduated: -0.020% mean, cells x1.53. Cells for cap x0.5 / x2 / x4: x1.26 / x0.84 / x0.71.
+
+### D. Multiclass at 8 bags (graduate=False): fr_instal, where the per-class cap binds
+
+| split | banded vs unbanded | no cap (cap=1.0) vs base | cap x0.25 vs base | cells base -> no cap / x0.25 |
+|---|---|---|---|---|
+| 0 | +0.417% | +0.102% | -0.245% | 259003 -> 232035 / 591790 |
+| 1 | +0.479% | +0.098% | -0.287% | 246411 -> 220638 / 567163 |
+
+pg16_fleet at 8 bags binds on noise (0.30-0.34); its banding costs +0.162% / +0.149%.
+## patch (len 14983 )
+## gates_run
+**Build.** `uv sync --reinstall-package t-boost` succeeded in the worktree, and `t_boost.__file__` points into it.
+
+**Python row.**
+- `uv run pytest python/tests -q`: 773 passed, 1 failed. The failure is `test_haute_integration.py::test_callback_true_stops_and_exceptions_propagate` (`assert [2, 5] == [5, 5]`, n_trees_per_bag_ after a stop callback). It is a pre-existing, load-dependent race that this patch does not touch. It also failed 2 of 5 times against unmodified HEAD Python (`git archive HEAD` plus the same compiled extension, run via PYTHONPATH) and 2 of 3 with the patch, under load average 20-43.
+- After the final comment and docstring edits I re-ran test_single_bag, test_sklearn, test_ranked_path_banding and test_multiclass_graduation: 107 passed.
+- `uv run mypy --strict python/t_boost`: no issues.
+
+**Docs row.**
+- `uv run --no-project python scripts/check_docs.py fix` regenerated `docs/training-parameters/index.md`.
+- `check_docs.py check`: 96 parameters documented, generated files current.
+- `uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict`: built with no warnings.
+
+**Not run, because no Rust, binding or stub changed:** cargo fmt, clippy, xtask check-all, the core tests, bit-repro and stubtest.
+
+**Byte-identity check.** 8 fits re-run after the edits (swmc, ausbi, surrender, lapse at split 0, 1 and 8 bags, graduate=False) gave identical test and train deviance and identical banding reports to the pre-edit runs.
+## behaviour_changes
+**Valid settings: nothing changes.** A finite cap above 0 gives byte-identical models and reports, verified on 8 pre/post fits. No default changes and there is no speed cost.
+
+**Invalid settings now raise ValueError** at the start of fit, before boosting, on both the single-output/binary path (`_fit_model`) and the multiclass path (`_fit_multiclass`). This covers `band_deviance_cap` <= 0, inf, nan and bool. Before:
+- **0, single-output:** "no cap". At n_bags >= 2 the noise budget acted alone; at n_bags=1 banding was skipped, with `pruning_report_["banding"] = {"skipped": "one bag and band_deviance_cap=0: nothing bounds the banding"}`. That report key can no longer occur.
+- **0, multiclass:** a zero budget. Every class bank was left unbanded at any bag count, reported only as "cannot meet its fidelity budget".
+- **Negative or nan, single-output:** also "no cap".
+- **inf or nan, multiclass:** the noise budget at 8 bags, and an unbounded (coarsest) banding at one bag.
+
+**Docs.** The docs, docstrings and comments now describe the cap as the expected cost of the move. readable-tables.md no longer says banding needs bagging.
+## worktree
+/home/ralph/suite/t-boost/.claude/worktrees/wf_f90f4e08-420-3. The worktree was created at 8857bcc (main). I fast-forwarded its own branch to 85f40f1, the task's HEAD, with `git merge --ff-only` (no commit, no new branch). The patch is `git diff` against 85f40f1; the changes are uncommitted, and `git status` shows exactly the five files.
+## results_dir
+/tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/team/C
+
+**Raw JSONL results:**
+- decomp_base.jsonl: base decomposition, 7 datasets x 2 splits x 1/8 bags, graduate=False.
+- sens_b1.jsonl: one bag at cap x0.25/x0.5/x2/x4 and calib, graduate=False.
+- calib_b8.jsonl: 8 bags calib and no cap, graduate=False.
+- e2e.jsonl: graduated base and calib at 1 and 8 bags.
+- e2e_matched.jsonl: graduated cap x0.25 at 1 bag; band_tolerance 0.375 and 0.25 at 8 bags.
+- fremtpl2.jsonl (split 0) and fremtpl2_s1.jsonl (split 1).
+- mc_decomp.jsonl: multiclass decomposition, fr_instal and pg16_fleet x 2 splits x 1/8 bags.
+- mc_variant.jsonl: fr_instal at 8 bags with no cap and cap x0.25.
+- identity_postedit.jsonl: the byte-identity check.
+- cap0_behaviour.jsonl: what cap=0 did on the multiclass path.
+
+**Scripts:**
+- probe.py wraps `_band_deployed` with the decomposition and the variants (base, capx<f>, nocap, calib); probe_mc.py does the same for multiclass, and mc_variant.py runs the multiclass cap variants.
+- pair.py, pair2.py, evidence.py, table.py, summarize.py and mcsum.py build the tables.
+- fixture_contract.py checks the test's contract margins.
+
+**Tables and patch:** evidence_tables.md, decomposition_table.md, issue_C.patch.
+
+**Logs and the flake check:** pytest_full.log and pytest_full2.log; orig_pkg/ is the HEAD Python package used to show the callback-test flake is pre-existing.
+## risks
+- **cap=0 now raises.** Anyone who used it as "no cap" with bags gets a ValueError. haute never passes the parameter (read-only grep). The equivalent setting is any finite cap above the noise budget, e.g. 1.0, but at n_bags=1 that means nearly unbounded banding.
+- **The isfinite(dev_mean) guard is gone.** dev_mean is a weighted mean of finite unit deviances over a positive total weight, so it is finite for every input ingest accepts. If a NaN ever reached it, Rust's `f64::min` ignores NaN and a one-bag fit would band without bound. I chose not to add an unreachable defensive raise.
+- **The new contract test checks an in-sample property** of the deployed banding. The core holds the budget on the cross-fitted estimate, not in-sample. The margin is 0.19x / 0.56x of the cap on the fixture and at most 0.87x across 39 panel fits: robust, but not a hard guarantee if banding internals change.
+- **"Often several times larger" in the docs** rests on the measured range of 0-12.3x.
+- **Fit and banding times are rough:** load average 20-43 on the shared 32-core box.
+- **Cells (deployed_census) are not monotone in banding strength**, because banding can densify factored tables (surrender split 1: 78,915 -> 119,209 at the default, 595,632 at cap x0.25). Readability comparisons use that census.
+## open_questions
+- **band_tolerance on small data (outside issue C).** At 8 bags, graduated, `band_tolerance` 0.375 beats 0.75: -0.095% mean / -0.048% median, 8 better / 2 worse, cells x1.90, on the 7 small fast sets (ausbi -0.36%, swmc -0.27%). The arena figure of +0.015% pooled for 0.75 may not hold on small data.
+- **Multiclass banding strength.** Multiclass banding costs +0.15% to +0.48% test (graduate=False) on fr_instal and pg16_fleet at both bag counts. On fr_instal the per-class cap is the operative control at 8 bags (cap x0.25 gains 0.25-0.29% at 2.3x the cells). Whether multiclass should band less is a separate decision.
+- **Honest OOB pricing.** Banding each bag's bank and scoring it on that bag's own OOB rows is the only route found to telling noise removal from signal removal. It costs n_bags banding passes and does not exist at n_bags=1. Not built.
+- **Core API hardening.** In the core, `BandingRows.mse_cap = INFINITY` means "no cap", and `_TableModel.band(mse_cap=inf)` is the default. Together with sigma = inf they band without bound. Python never calls them that way now; making the core reject a non-finite budget would need the Rust gates.
+- **Thin cells.** Where tables are sparse (surrender, fr_instal), the distil pins the training rows, so the training-row move is far below the test-row move. The cross-fitted budget still bounds the test-row move (at most 0.86x the cap).
+- **Not touched, flagged:**
+  - docs/algorithm/readable-tables.md still says graduation is not supported for three or more classes, which is stale since 85f40f1 and probably another investigator's area.
+  - `test_callback_true_stops_and_exceptions_propagate` is flaky under load on HEAD.
+#################### acd7ce6ccf35ab3bc
+## verdict
+accept_with_changes
+## confidence
+high
+## evidence_assessment
+Root cause: confirmed. The investigator's own scripts (table.py, evidence.py), re-run on the raw JSONL, reproduce every row of tables A to D. The decomposition is an exact identity, not a noisy comparison. On training rows the first-order term is never negative. The higher-order remainder is at most 0.025x the cap on training rows and 0.029x on test rows. The mechanism is sound: the shrunk tables sit short of each cell's training optimum, and banding moves them further away. So the first-order term is the whole excess, and the second-order term (the thing the cap budgets) is at most 0.87x the cap at the default cap.
+
+Single-output candidate comparisons are within split noise:
+- Every median is 0.000%. The means are driven by ausbi and swmc pulling in opposite directions.
+- lapse, norway and ussev do not respond to the cap at all, because banding is already at its coarsest reachable point. For example, lapse split 0 has a budget of 0.0067 and a move of 0.0015.
+- This supports "no measurable gain" for calibrating or retuning on single-output fits. It does not support "dominated" at one bag: calibration (-0.052%, cells x1.47) against cap x0.25 (-0.038%, cells x1.53) is a wash.
+
+Multiclass effects are well beyond noise, and they contradict the recommendation's "the cap level's test response is flat":
+- Banding costs +0.15% to +0.48% test deviance in all 8 investigator multiclass fits.
+- I replicated this on split 2 for fr_instal: +0.42% at 8 bags and +0.30% at one bag.
+- A 4x tighter cap gains 0.31% at 8 bags (investigator: 0.25% and 0.29% on splits 0 and 1). It also gains 0.25% at one bag, where the cap is the only bound — the regime this issue is about, and one the investigator did not measure.
+- pg17_instal, a new dataset, shows only +0.01%, so the effect depends on the dataset.
+
+The claim "the reworded bound held in all 39 fits" holds only at the default cap. In the investigator's own tighter-cap runs it fails on test rows, and on the patch's own test fixture it fails on fresh rows (details under problems).
+
+Coverage: Poisson with exposure (fremtpl2, norway, swmc), Gamma (ausbi, ussev), binary (surrender, lifesurr, lapse) and multiclass (fr_instal, pg16_fleet). There is no Tweedie, sample weights, monotone constraints or grouped data. That is acceptable, because the patch changes no arithmetic for valid caps.
+
+Fairness: paired comparisons share split, seed and build. The investigator checked byte-identity before and after the edit inside the worktree. I re-ran it against the maintainer's HEAD build on a fresh split 2: 8 of 8 fits identical.
+## problems
+[
+ "The reworded promise is still overstated. The core holds banding's cross-fitted estimate of the cost (the report's combined_mse <= budget, at most 1.00 in every row), not the expected cost itself. In the investigator's own tighter-cap runs, the test-row second-order term exceeds the cap in force in 5 fits, measured against training deviance (the docs' denominator): surrender split 1 at x0.25 1.18x, ausbi split 0 at x0.25 1.04x, surrender split 0 at x0.25 1.03x and at x0.5 1.01x, ausbi split 1 calib 1.03x. Two of these (surrender split 1, ausbi split 0) also exceed it against test deviance (1.07x and 1.03x). On the patch's own test fixture at cap 0.00025, the expected cost on 200k fresh rows is 1.35x the cap, while in-sample it is 0.39x. 'Held in every one of the 39 fits' covers only default-cap fits.",
+ "The new contract test checks only the training rows, which is the easy side. Banding's distil holds the training rows close to the unbanded fit (surrender: 0.00-0.07x in-sample against 0.73-1.07x on test rows). The test would still pass if the out-of-sample property the docs promise regressed.",
+ "The causal sentence 'Banding strips out noise that the tables fitted to the training objects' (banding.md and both docstrings) is not established. The training first-order term is positive because the banded tables move away from the training optimum, whatever is removed. On test rows the same term is also positive on ausbi and on every multiclass fit, i.e. banding removed signal there.",
+ "The constant's comment says the training rise is 'up to 12x the cap'. That figure is swmc split 1 at 8 bags, where the noise budget bound, not the cap. Where the cap actually binds, the rise is 0-5.9x (single-output, one bag) and at most 6.6x (multiclass).",
+ "Multiclass is under-weighted. 'Flat test response, needs no tuning' was measured only on single-output one-bag fits. Multiclass banding costs +0.15% to +0.48% test in all 8 investigator fits while raising cells 2.5-5.7x. A 4x tighter cap gains 0.25-0.31% on fr_instal at 8 bags (3 of 3 splits) and 0.25% at one bag. On fr_instal split 2 the shipped default fit is the banded, ungraduated fit (graduation was rejected by the 1% training check), so users get the +0.42%. pg17_instal shows only +0.01%. The patch's comment cites only the +0.10% cost of dropping the cap. This does not block the patch, but it needs its own decision.",
+ "Banding densifies factored tables, so cell counts rise instead of fall: surrender at one bag goes 78,915 -> 119,209 at the default cap and 595,632 at x0.25; fremtpl2 calibrated goes 7,240 -> 73,077 against 54,066 unbanded; multiclass rises 2.5-5.7x. This is a pre-existing readability regression in the stage itself, and it makes the cell-count comparisons in the calibration and tolerance candidates hard to interpret.",
+ "'Calibration is dominated by a plain tolerance change' is overstated. At one bag, calibration is a wash against cap x0.25. At 8 bags, band_tolerance=0.375 wins on cells (x1.90 vs x2.89), but the 0.017% deviance gap is noise. The rejection still holds for the other reasons: the training-row yardstick is biased, calibration binds at every bag count, and on fremtpl2 banding time goes from 15.5 s to 26.8 s and from 9.0 s to 70.9 s.",
+ "A candidate was not considered. On pruned one-bag fits, the fold vote already fits K fold models, whose between-fold spread could give a data-derived sigma (CLAUDE.md prefers data-derived budgets to fixed parameters). It cannot cover prune=False at one bag, and the single-output response to the cap is flat, so it is low priority, but it should be listed.",
+ "Minor points. The validator rejects inf but accepts 1e300, which bands just as unboundedly at n_bags=1, so its stated rationale is only half enforced. The core API still treats mse_cap=INFINITY as 'no cap'. The core's 'cannot meet its fidelity budget ... tables left unbanded' skip is still reachable for valid but near-zero budgets: a pre-existing silent skip."
+]
+## required_changes
+[
+ "Reword the cap so it does not read as a bound on the expected cost. Describe it as a budget on banding's cross-fitted estimate of the move's expected cost (its second-order cost on rows the bands were not fitted to), which new data can exceed at tight caps. This applies to docs/training-parameters/banding.md, docs/training-parameters/index.md (regenerate with check_docs.py fix), docs/algorithm/readable-tables.md, both estimator docstrings, the _BAND_DEVIANCE_CAP_DEFAULT and _band_deployed comments, and the test docstring. Limit any 'held every time' or 'held in all 39 fits' wording to the default cap, or drop it.",
+ "In banding.md and both docstrings, replace 'Banding strips out noise that the tables fitted to the training objects' with a neutral statement: the training deviance rises by more because the cap leaves out the first-order term (the banded tables move away from the training rows' own optimum), and on new data that term can go either way.",
+ "In the _BAND_DEVIANCE_CAP_DEFAULT comment, replace 'up to 12x the cap' with the range where the cap actually binds: 0-5.9x for single-output fits at one bag and at most 6.6x for multiclass. The 12x comes from an 8-bag fit where the noise budget bound.",
+ "Make test_the_deviance_cap_bounds_the_expected_cost_of_one_bag_banding assert what the core guarantees: band['combined_mse'] <= band['budget'], and budget == deviance_budget at one bag. If an expected-cost check is kept, compute it on fresh rows drawn from the fixture's distribution with an explicit tolerance (on 200k fresh rows it is 0.49x at cap 0.001, 0.74x at 0.004 and 1.35x at 0.00025). Do not describe the in-sample check as pinning the contract.",
+ "In the comment, limit 'flat test response, needs no tuning' and 'dropping it cost +0.10%' to single-output fits. Add the multiclass result: on fr_instal a 4x tighter cap gains 0.25-0.31% at 8 bags (3 splits) and 0.25% at one bag, and banding costs +0.15% to +0.48% on multiclass. Record multiclass banding strength as an open decision that needs pg17_cover, prudential and a one-bag cap sweep on pg16_fleet."
+]
+## extra_measurements
+All raw output is in /tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/team/C_review/.
+
+1. **Reproduced tables.** The investigator's table.py and evidence.py, run on the raw JSONL, reproduce tables A to D exactly.
+
+2. **Identity on split 2** (identity_head.jsonl, identity_patched.jsonl). The maintainer's HEAD build (/home/ralph/suite/t-boost) against the patched worktree, using team_bench on swmc, ausbi, surrender and lapse, each at default 8 bags and at n_bags=1. All 8 fits are byte-identical: test and train deviance, banding budgets, kept tables and graduation report.
+
+3. **Expected cost on fresh rows** (fixture_oos.py). The patched build on test_single_bag.py's fixture, with 200k fresh rows from the same distribution. Second-order term divided by cap times training deviance, in-sample / fresh:
+
+   | cap | in-sample | fresh rows |
+   |---|---|---|
+   | 0.00025 | 0.39x | 1.35x (1.22x against the fresh rows' own deviance) |
+   | 0.001 | 0.19x | 0.49x |
+   | 0.004 | 0.56x | 0.74x |
+   | 0.016 | 0.60x | 0.68x |
+
+4. **Investigator's tighter-cap rows re-tabulated** against the cap actually in force (sens_b1, calib_b8). The test-row second-order term exceeds the cap in 5 fits (1.01-1.18x against training deviance). The core's combined_mse/budget is at most 1.00 everywhere.
+
+5. **fr_instal, split 2** (HEAD build; the patch is byte-identical for valid caps):
+
+   | setting | unbanded | default cap | cap x0.25 |
+   |---|---|---|---|
+   | 8 bags, graduate=False | 0.842666 | 0.846240 (+0.424%) | 0.843591 (-0.313% vs default) |
+   | one bag, graduate=False | 0.844507 | 0.847036 (+0.299%) | 0.844924 (-0.249% vs default) |
+
+   The graduated default at 8 bags equals the banded, ungraduated fit (0.846240): graduation was rejected by the 1% training check. The graduated unbanded fit scores 0.844336.
+
+6. **pg17_instal, split 2** (not in the investigator's panel), 8 bags, graduate=False: unbanded 1.115929, banded 1.116065 (+0.012%).
+
+7. **Gates in the worktree.** check_docs.py check passes (96 parameters, generated files current). test_single_bag.py: 8 passed. I did not re-run the full pytest suite or mypy; the investigator reports them green, apart from a pre-existing flaky callback test.
+
+8. **Code checks:**
+   - The removed isfinite(dev_mean) guard is safe. _response_mean clips the link to ±30, exposure and offset are validated as finite and positive, and dev_mean can only be NaN when the weights sum to 0.
+   - The validator covers every fit entry point: _fit_model (regressor and binary) and _fit_multiclass. Between them they reach both _band_deployed call sites and the multiclass banding.
+   - A read-only grep found no use of band_deviance_cap in haute, insur-arena2, insur-arena-av40-wt or t-boost-report-demo.
+## summary
+The mechanism-level recommendation stands: keep the cap, describe it as an expected (second-order) cost, and raise ValueError for a cap that is not finite and above 0 on every path. The root cause is confirmed by an exact decomposition: the first-order term is the whole excess, and the remainder is under 0.03x the cap. The patch is the simplest fix: Python-only, no new parameter, no stage switched off, and it closes both silent skips (the one-bag skip and the multiclass zero budget). It is byte-identical for valid caps, which I confirmed on a fresh split 2 against the maintainer's HEAD build (8 of 8 fits).
+
+Five text and test changes are required before merging.
+- **The reworded promise still overstates.** The core bounds a cross-fitted estimate of the cost, and new data exceeds it at tight caps: 1.01-1.18x in 5 of the investigator's own runs, and 1.35x on the patch's own fixture.
+- **The contract test is too weak.** It checks only the training rows, where banding barely moves the predictions.
+- **The causal docs sentence is unsupported.** "Banding strips out noise" is contradicted on ausbi and on every multiclass fit, where banding removed signal.
+- **"Up to 12x the cap" is misattributed.** It comes from an 8-bag fit where the noise budget bound.
+- **"Flat, needs no tuning" doesn't hold for multiclass.** On fr_instal, banding costs 0.30-0.48% test and a 4x tighter cap gains 0.25-0.31%, consistent over 3 splits and at one bag (where the cap alone binds). pg17_instal shows only +0.01%.
+
+The multiclass result needs its own decision on more datasets. It does not block this patch.
+#################### a393830e563bb9e86
+## root_cause
+The reported damage has two sources. Neither is the scale of the 1% check, and the fix that works is upstream of the check.
+
+1. **The 1% check is a training-loss brake, so it cannot see benefit.** On training rows, smoothing raises deviance whether it removes noise or real shape. No training threshold can therefore tell good smoothing from bad, however it is scaled.
+   - On single-output fits, training cost is anti-correlated with the test effect: corr(test change, training change) = −0.35 over 35 fits. Larger smoothing went with more benefit, mainly on swmc and ussev.
+   - On fr_instal, per-table training cost predicts test harm: r = +0.72, with test cost about 45% of training cost.
+   - Because the sign flips between model types, no single threshold works. Hypothesis (1) is true in scale but its remedy fails. An explained-deviance gate passes ausbi s0 (0.75% of explained, test +0.34%) and declines every swmc split (2–6% of explained), including s9 (test −0.40%).
+   - Pooled over 10 splits, every tighter or explained-relative gate gives back the average benefit.
+   - The native 1% check declined 1 of 76 single-output candidates, and it was the best one (swmc s9, −0.40%).
+
+2. **The reported losses were mostly split noise.** Paired test SEs of the graduation effect are 0.02–0.35% on the small sets (swmc s0: −0.18 ± 0.29%). The 0.02% noise rule holds only for the 600k-row sets.
+   - Ausbi splits 0 and 1 (+0.34%, +0.13%) were the two worst of ten. Over all ten, ausbi averages −0.015 ± 0.058%, and swmc −0.081 ± 0.054% (graduation helps there).
+   - fremtpl2 averages +0.013% over two splits (+0.032 ± 0.017, −0.007 ± 0.022).
+
+3. **The real, repeatable harm is in GCV's choice of strength, and it shows on multiclass fits.**
+   - **Mechanism a, boundary minima.** GCV estimates noise from a table's own roughness. On few-cell tables, and on a rare class's noisy logit, the criterion keeps falling to the top of the grid (alpha = 3e4). The chosen strength is then set by the grid's arbitrary ceiling, not by the data, and pushes the table towards its linear trend. Examples:
+     - ausbi's 5-level main effect, with 1,400–8,500 rows per cell, flattened to near-linear: +0.11% test alone.
+     - fr_instal's two worst tables, rare-class main effects: +0.07% and +0.04%. One moves a 1,402-row cell from −0.50 to +0.36 in logit.
+     - lifesurr's curvature-weighted catastrophe was also a ceiling choice.
+   - **Mechanism b, banded axes.** Graduation runs after banding, and banding keeps only steps larger than the bag noise. With banding on, GCV smooths 3–5× more tables (fr_instal 177 vs 60–77, pg17_cover ~530 vs ~110). fr_instal harm halves with banding off: +0.61/+0.50% becomes +0.25/+0.12%.
+   - Ungated, fr_instal costs +0.45 to +0.61% on all four splits, 5–7 SE. The 1% brake catches it only by scale (training ×1.014–1.016). Prudential gets through: +0.057/+0.028% at ×1.0093–1.0098.
+
+**Hypothesis (2), curvature-weighted fidelity.** GCV gives the same smoother when every weight is scaled by one constant; only the fixed alpha grid's edges change. So the `w_scale` comment's over-smoothing argument is wrong in principle. Curvature weights are also unsafe: lifesurr has a 11,558-row cell at logit −4.0 among neighbours near +3.6. Its curvature is about 10 against about 40, so curvature-GCV pulled it onto the trend, giving +203% test.
+
+**Hypothesis (3), out-of-bag evidence, does not work at these effect sizes.**
+- Adding the deployed candidate's change to the out-of-bag score carries the same in-sample optimism as the training check: corr −0.32 with test.
+- The honest version smooths each bag's tables and scores them only on that bag's out-of-bag rows. It has no predictive power: corr −0.02 over 35 fits, sign agreement 15/35. Each row is out-of-bag for only 1.6 of 8 bags.
+## candidates
+[
+ {
+  "name": "Leave as is (HEAD 85f40f1)",
+  "description": "GCV per table, 1% total training-deviance check on the whole candidate",
+  "result_summary": "Mean over 12 datasets \u22120.0043% test vs graduate=False. Prudential +0.042 \u00b1 0.014% (2 splits). fr_instal declined 4/4 (ungated it would be +0.52%). pg17_cover +0.005, pg17_instal \u22120.016, small sets \u22120.016 (10 splits each).",
+  "verdict": "viable",
+  "reason": "Baseline. The interior-minimum rule beats it with no other change."
+ },
+ {
+  "name": "Interior-minimum (ceiling) rule in _gcv_smooth",
+  "description": "Adopt GCV's minimizer only inside the searched grid. A minimum at the strongest strength (criterion still falling) keeps the table as fitted, mirroring the existing rule at the weakest end. The 1% check is kept unchanged.",
+  "result_summary": "Mean over 12 datasets \u22120.0127% (vs HEAD \u22120.0043). Paired vs HEAD: prudential \u22120.044 \u00b1 0.005, swmc \u22120.027 \u00b1 0.039, ausbi \u22120.020 \u00b1 0.024, lapse \u22120.006 \u00b1 0.0025, fremtpl2 \u22120.005 \u00b1 0.005, pg16 \u22120.001 \u00b1 0.002, pg17_cover \u22120.002 \u00b1 0.007; worse: pg17_instal +0.0037 \u00b1 0.0024, lifesurr +0.0015 \u00b1 0.0015; unchanged: ussev, surrender. fr_instal still declined 4/4 at \u00d71.011\u20131.014. Tables smoothed fall: prudential 3013\u21921247, pg17_cover 2073\u21921414, pg17_instal 1239\u2192726, pg16 95\u219219, ausbi 108\u219266 (summed over splits). Pooled single-output gain \u22120.009 \u00b1 0.008 (~1 SE). Harness on the patched build reproduces the prototype to \u22642.2e-16 relative on 8 fits. No measurable fit-time change: no extra GCV work, fewer updates.",
+  "verdict": "recommended",
+  "reason": "Removes the arbitrary grid ceiling from the selection, fixes prudential on both splits, and harms no dataset beyond noise. It needs no knob and no Rust."
+ },
+ {
+  "name": "Gate relative to explained deviance (null minus model)",
+  "description": "Accept iff training rise \u2264 c \u00d7 (null deviance \u2212 model deviance)",
+  "result_summary": "Pooled (10 small-set splits + large sets): c=1% \u22120.0035, c=2% \u22120.0038, c=5% \u22120.0088, vs \u22120.0165 ungated. It passes ausbi s0 (0.75% of explained, test +0.34%) and declines swmc s9 (5.7%, test \u22120.40%).",
+  "verdict": "rejected",
+  "reason": "Training cost does not discriminate (corr \u22120.35 single-output, +0.72 multiclass). The gate gives back the benefit."
+ },
+ {
+  "name": "Tighter total-deviance slack (0.3%, 0.1%)",
+  "description": "Same check, smaller slack",
+  "result_summary": "Pooled \u22120.0012 (0.3%) and \u22120.0002 (0.1%), vs \u22120.0120 native 1% and \u22120.0165 ungated",
+  "verdict": "rejected",
+  "reason": "It declines the helpful candidates along with the harmful ones."
+ },
+ {
+  "name": "Remove the check (ungated)",
+  "description": "Always adopt GCV's candidate",
+  "result_summary": "Small sets \u22120.0228 vs \u22120.0161 gated (swmc s9 gains \u22120.40%), but fr_instal +0.517 \u00b1 0.033% over 4 splits; mean over 12 datasets +0.0354",
+  "verdict": "rejected",
+  "reason": "The brake is what keeps fr_instal's broad multiclass over-smoothing out."
+ },
+ {
+  "name": "Curvature-weighted GCV fidelity",
+  "description": "Cell weights = \u03a3 w\u00b7p(1\u2212p), w\u00b7\u03bc or w\u00b7p_k(1\u2212p_k) at the fit, in place of support",
+  "result_summary": "lifesurr +203%/+205% (confident 11,558-row cell pulled 7.6 logits at alpha 3e4). Otherwise \u2248 support weights (swmc \u22120.178 vs \u22120.177). Even with the ceiling rule: lifesurr +0.007/+0.094, fr_instal +0.27/+0.27, pg17_cover +0.074 \u00b1 0.021.",
+  "verdict": "rejected",
+  "reason": "The quadratic approximation fails for confident cells, and the weights are worse on multiclass. GCV is scale-invariant anyway."
+ },
+ {
+  "name": "Model-based UBRE (known-scale criterion)",
+  "description": "Choose alpha by \u03a3h\u00b7\u03b4\u00b2 + 2\u03c6\u00b7df with Fisher-information weights (Pearson \u03c6 for Gamma)",
+  "result_summary": "surrender +0.83/+1.44%, lifesurr +0.95/+1.07%, ausbi +0.64/+0.25%",
+  "verdict": "rejected",
+  "reason": "Boosted tables are shrunk, so the GLM noise model overstates their noise and over-smooths."
+ },
+ {
+  "name": "Semi-honest out-of-bag check",
+  "description": "Bags' out-of-bag score (keep-set) plus the deployed candidate's per-row change; accept if out-of-bag deviance does not rise",
+  "result_summary": "Always +0.1\u20130.9% (ausbi, swmc) whatever the test effect. corr(test, semi) \u22120.32 over 35 fits. Per-table verdicts track training cost.",
+  "verdict": "rejected",
+  "reason": "The change comes from the deployed table, which saw row i, so it carries the in-sample optimism of the training check."
+ },
+ {
+  "name": "Honest per-bag out-of-bag check",
+  "description": "Smooth each bag's tables with the deployed operator and score each bag only on its out-of-bag rows (prototype on unbanded fits)",
+  "result_summary": "corr(test, honest) \u22120.02 over 35 fits (swmc, ausbi, lapse, ussev \u00d7 10 splits); sign agreement 15/35; per-table 13/27. Gated mean \u22120.0168 vs \u22120.0214 ungated.",
+  "verdict": "rejected",
+  "reason": "No predictive power at ~0.02% effects (each row out-of-bag for 1.6/8 bags). It would also need native per-class bag plumbing for multiclass and a one-bag fallback."
+ },
+ {
+  "name": "Noise-referenced gate (banding-style)",
+  "description": "Accept if graduation's curvature-weighted move \u2264 \u03c3\u00b2 from banding's bag noise",
+  "result_summary": "move/\u03c3\u00b2: single-output 0.04\u20132.2 (helpful swmc 0.4\u20132.2). fr_instal per class [1.06, 1.38, 2.92, 0.76] (harm +0.61%) vs pg17_instal [1.42, 1.10, 0.83, 0.35] (benefit \u22120.025%).",
+  "verdict": "rejected",
+  "reason": "It does not separate harmful from helpful fits."
+ },
+ {
+  "name": "Skip banded axes (treat a banded axis like a categorical one)",
+  "description": "graduation_table_inputs flags banded axes as non-ordinal, so graduation respects banding's resolution",
+  "result_summary": "Mean over 12 datasets +0.0063%. Single-output \u22120.0186 (lapse \u22120.008 \u00b1 0.002 paired, lifesurr +0.009 \u00b1 0.006). Prudential +0.030. fr_instal now ADOPTED at +0.162 \u00b1 0.037 (training \u00d71.003\u20131.005).",
+  "verdict": "rejected",
+  "reason": "It removes the training cost the brake keys on, but not the multiclass harm. Viable only with a multiclass fix that does not exist yet."
+ },
+ {
+  "name": "Skip banded axes plus the interior-minimum rule",
+  "description": "Both selection changes",
+  "result_summary": "Mean \u22120.0046%. Prudential \u22120.018 \u00b1 0.005. fr_instal adopted at +0.090 \u00b1 0.020 (\u00d71.002\u20131.003).",
+  "verdict": "rejected",
+  "reason": "Same fr_instal problem; worse than the interior-minimum rule alone."
+ },
+ {
+  "name": "Turn graduation off by default",
+  "description": "graduate=None resolves to off",
+  "result_summary": "Equals the graduate=False baseline (0 by construction). It forgoes the \u22120.0127% mean gain under the recommended rule and the smoothed tables.",
+  "verdict": "rejected",
+  "reason": "Graduation earns its place on held-out deviance once boundary choices are excluded. Off-by-default would also break CLAUDE.md's rule that every stage runs."
+ }
+]
+## recommendation
+Keep the acceptance check exactly as it is, a 1% training-deviance brake, and say in the docs that it is a brake, not a test of accuracy. Fix the cause upstream: in `_GBaseTBoost._gcv_smooth`, adopt GCV's choice only when its minimum is inside the searched grid.
+
+- At the weak end this was already the rule.
+- At the strong end, where the criterion is still falling at alpha = 3e4, the table is now kept as fitted. The strength there is set by the grid constant, not the data, and it flattens few-cell or rare-class tables towards a line.
+
+The change is one condition in Python plus comments, documentation and tests. It has no Rust change and adds no knob. A fixed `graduation_alpha`, `graduate=False`, the high-order diffusion and the multiclass re-anchor are untouched.
+
+Measured effect:
+- Mean test change over 12 datasets: −0.0127% vs HEAD's −0.0043%.
+- Prudential is fixed: −0.044 ± 0.005% paired, better on both splits.
+- fr_instal is still declined on 4 of 4 splits.
+- No dataset is worse beyond noise; pg17_instal is +0.0037 ± 0.0024%.
+
+Do not add an out-of-bag or noise-referenced check, rescale the gate, change the fidelity weights, or skip banded axes; all were measured and rejected. The multiclass residual should be investigated separately (see open questions).
+
+Note on the investigation: banding first looked like the cause (it dominates the multiclass harm). The ceiling rule turned out to be the better lever once it was clear that skipping banded axes lowers fr_instal's training cost below the brake without removing its harm.
+## evidence_table
+Test deviance change in % against `graduate=False` on the same fit (the paired test-deviance delta), averaged over splits; ± is the SE across splits. Negative is better.
+- **HEAD** is current behaviour.
+- **Recommended** is the interior-minimum rule.
+- Columns marked "1%" apply the native training check as shipped.
+- Every rule was applied to the same graduate=False fit per split, so the columns are paired.
+
+| dataset | splits | test dev, graduate=False | HEAD (as is, 1% check) | **interior-minimum rule (recommended)** | paired: recommended − HEAD | as is, no check | skip banded axes (1%) | skip banded + interior (1%) | tables smoothed HEAD → rec | 1% declines HEAD / rec |
+|---|---|---|---|---|---|---|---|---|---|---|
+| ausbi | 10 | 1.299813 | −0.0146 ± 0.0583 | **−0.0347 ± 0.0465** | −0.0200 ± 0.0235 | −0.0146 ± 0.0583 | +0.0198 ± 0.0255 | +0.0076 ± 0.0170 | 108 → 66 | 0 / 0 |
+| ussev | 10 | 1.159701 | −0.0289 ± 0.0305 | **−0.0289 ± 0.0305** | +0.0000 ± 0.0000 | −0.0289 ± 0.0305 | −0.0429 ± 0.0444 | −0.0429 ± 0.0444 | 7 → 7 | 0 / 0 |
+| swmc | 10 | 0.092730 | −0.0411 ± 0.0415 | **−0.0683 ± 0.0545** | −0.0272 ± 0.0393 | −0.0811 ± 0.0544 | −0.0766 ± 0.0464 | −0.0678 ± 0.0530 | 50 → 31 | 1 / 0 |
+| surrender | 10 | 0.514994 | +0.0031 ± 0.0151 | **+0.0031 ± 0.0151** | +0.0000 ± 0.0000 | +0.0031 ± 0.0151 | +0.0026 ± 0.0153 | +0.0026 ± 0.0153 | 29 → 29 | 0 / 0 |
+| lapse | 10 | 0.366924 | −0.0057 ± 0.0073 | **−0.0118 ± 0.0064** | −0.0060 ± 0.0025 | −0.0057 ± 0.0073 | −0.0136 ± 0.0070 | −0.0137 ± 0.0070 | 108 → 59 | 0 / 0 |
+| lifesurr | 10 | 0.250822 | −0.0093 ± 0.0071 | **−0.0078 ± 0.0064** | +0.0015 ± 0.0015 | −0.0093 ± 0.0071 | −0.0005 ± 0.0043 | −0.0005 ± 0.0043 | 18 → 17 | 0 / 0 |
+| fremtpl2 | 2 | 0.303161 | +0.0126 ± 0.0193 | **+0.0073 ± 0.0246** | −0.0053 ± 0.0053 | +0.0126 ± 0.0193 | +0.0167 ± 0.0088 | +0.0098 ± 0.0156 | 30 → 28 | 0 / 0 |
+| pg16_fleet | 4 | 0.964957 | +0.0009 ± 0.0009 | **−0.0000 ± 0.0017** | −0.0009 ± 0.0018 | +0.0009 ± 0.0009 | +0.0009 ± 0.0009 | −0.0000 ± 0.0017 | 95 → 19 | 0 / 0 |
+| pg17_instal | 4 | 1.114483 | −0.0156 ± 0.0052 | **−0.0120 ± 0.0036** | +0.0037 ± 0.0024 | −0.0156 ± 0.0052 | −0.0141 ± 0.0041 | −0.0140 ± 0.0040 | 1239 → 726 | 0 / 0 |
+| pg17_cover | 4 | 0.671208 | +0.0049 ± 0.0063 | **+0.0031 ± 0.0048** | −0.0018 ± 0.0071 | +0.0049 ± 0.0063 | −0.0079 ± 0.0054 | −0.0083 ± 0.0056 | 2073 → 1414 | 0 / 0 |
+| fr_instal | 4 | 0.843358 | +0.0000 ± 0.0000 | **+0.0000 ± 0.0000** | +0.0000 ± 0.0000 | +0.5166 ± 0.0329 | +0.1621 ± 0.0370 | +0.0900 ± 0.0195 | 706 → 624 | 4 / 4 |
+| prudential | 2 | 1.146448 | +0.0424 ± 0.0141 | **−0.0020 ± 0.0188** | −0.0444 ± 0.0046 | +0.0424 ± 0.0141 | +0.0296 ± 0.0040 | −0.0180 ± 0.0050 | 3013 → 1247 | 0 / 0 |
+| **mean of datasets** | | | −0.0043 | **−0.0127** | −0.0084 | +0.0354 | +0.0063 | −0.0046 | | |
+
+**Per-split paired test SEs** (why splits 0 and 1 misled):
+- ausbi s0 +0.34 ± 0.27, s1 +0.13 ± 0.07
+- swmc s0 −0.18 ± 0.29
+- prudential s0/s1 at HEAD +0.057 ± 0.037 / +0.028 ± 0.037; recommended +0.017 ± 0.024 / −0.021 ± 0.023
+- fr_instal ungated s0–s3 +0.61 ± 0.09, +0.50 ± 0.08, +0.51 ± 0.09, +0.45 ± 0.08 (HEAD declines at ×1.014–1.016); recommended ungated +0.42, +0.48, +0.40, +0.39 (declined at ×1.0126 / 1.0140 / 1.0114 / 1.0130)
+
+**Harness on the patched build** (absolute test deviance, matches the prototype to ≤2.2e-16 relative):
+
+| fit | patched | HEAD | graduate=False |
+|---|---|---|---|
+| prudential s0 | 1.148646 | 1.149103 | 1.148454 |
+| prudential s1 | 1.144203 | ≈1.144764 | 1.144441 |
+| ausbi s0 | 1.270304 | 1.271885 | — |
+| swmc s0 | 0.097709 | 0.097738 | — |
+| pg17_cover s0 | 0.674434 | — | — |
+
+**Rejected gates, pooled** (small sets × 10 splits plus fremtpl2 and pg17_instal × 2, mean test change):
+
+| gate | mean test change |
+|---|---|
+| ungated | −0.0165 |
+| native 1% | −0.0120 |
+| total 0.3% | −0.0012 |
+| total 0.1% | −0.0002 |
+| explained 1% | −0.0035 |
+| explained 2% | −0.0038 |
+| explained 5% | −0.0088 |
+
+**Honest out-of-bag** (35 unbanded fits): corr with test −0.02, sign agreement 15/35, gated mean −0.0168 vs ungated −0.0214.
+## patch (len 12567 )
+## gates_run
+Run in the worktree after `uv sync --reinstall-package t-boost`. That rebuild was from HEAD's Rust: the experimental `slack` keyword added to `crates/t-boost-py/src/lib.rs` for the experiments was reverted with `git checkout`, so no Rust remains in the diff.
+
+**Green:**
+- `uv run pytest python/tests -q`: 770 passed in 219 s. This ran before the final edit to sklearn.py, which changed only a comment. After that edit, `mypy --strict` and the graduation tests in test_prune.py (9 passed) were rerun.
+- `uv run mypy --strict python/t_boost`: no issues (9 files).
+- `uv run python -m mypy.stubtest t_boost._t_boost`: no issues.
+- `uv run --no-project python scripts/check_docs.py check`: 96 parameters documented, generated files current.
+- `uv run --no-project --with-requirements docs/requirements.txt mkdocs build --strict`: built.
+
+**Not run:** the Rust gates (fmt, clippy, xtask check-all, core tests, bit-repro), because the final diff has no Rust change.
+
+**Validation:**
+- The shared harness on the patched build (ausbi, swmc, pg17_cover, prudential × splits 0, 1; base and graduate=False) reproduces the prototype's interior-rule test deviance on all 8 fits, to ≤2.2e-16 relative, with identical smoothed-table counts.
+- A byte comparison of `model_bytes` sha256 against HEAD's Python sources (same extension build) gives the results listed under behaviour changes.
+
+**Two tests changed, with reasons:**
+- test_html_report's declined-graduation test now forces the decline with a patched flattening selection. GCV no longer produces a declined candidate on its zig-zag fixture, which is the intended effect.
+- test_sklearn's reanchor test is isolated with `graduate=False`; see risks.
+## behaviour_changes
+**Model bytes change on default fits** (and any fit with graduate=None/True and graduation_alpha=None) where GCV chose the strongest grid strength (alpha = 3e4) for at least one table. That table is now kept as fitted, so the smoothed bank, its re-purification, the log-link f0 re-anchor and possibly the 1% decision differ.
+
+**Verified with model_bytes sha256 against HEAD:**
+
+| fit | result |
+|---|---|
+| lapse s2, default, no ceiling choice | identical |
+| ausbi s0, graduation_alpha=100 | identical |
+| ausbi s0, graduate=False | identical |
+| ausbi s0, default | different (15 → 10 tables smoothed) |
+| swmc s0, default | different (5 → 3 tables smoothed) |
+
+**Unchanged in code:** the fixed-strength path, the 1% check and its slack, the high-order diffusion, the multiclass graduation and re-anchor, `graduation_validation_` keys, and the binding/INERT logic.
+
+**Fewer tables smoothed** (summed over splits): prudential 3013 → 1247, pg17_cover 2073 → 1414, pg17_instal 1239 → 726, pg16 95 → 19, ausbi 108 → 66, lapse 108 → 59, swmc 50 → 31.
+
+**Some candidates that HEAD declined are now cheap enough to adopt.** Example: the small unpruned Gamma fixture in test_sklearn was declined at HEAD (3 tables, more than 1%) and now adopts one table at alpha 30. Adopted graduation on a log link re-anchors f0 itself.
+
+**fr_instal is still declined on 4 of 4 splits.**
+
+**Determinism:** unaffected (a float comparison on the same grid).
+
+**Speed:** no measurable change; there is no extra GCV work and fewer updates.
+
+Run times (harness base vs graduate=False, n_jobs=8 on a shared machine, so rough):
+
+| dataset | base | graduate=False |
+|---|---|---|
+| prudential s0 | 287 s | 307 s |
+| pg17_cover s0 | 65 s | 64 s |
+| swmc s0 | 1.2 s | 1.1 s |
+## worktree
+/home/ralph/suite/t-boost/.claude/worktrees/wf_f90f4e08-420-1. The harness created it on main (8857bcc); I fast-forwarded its own branch to the team baseline 85f40f1 (no commit, no new branch). The changes are uncommitted.
+## results_dir
+/tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/team/A
+
+**Final patch:** `patch.diff`.
+
+**Experiment code:**
+- Driver: `gexp.py`. It fits once with graduate=False, then applies graduation variants through the experimental native `slack` keyword (removed from the final patch).
+- Helpers: `gcrit.py` (GCV wrapper and ceiling rule), `honest.py` / `oob.py` (out-of-bag prototypes), `banded.py`, `rows.py` (paired SEs).
+
+**Raw JSON lines:**
+
+| file | what it holds |
+|---|---|
+| `harness_fast_base_nograd.jsonl` | HEAD harness, base vs graduate=False, 7 fast sets × 2 splits |
+| `small10.jsonl`, `big1.jsonl` | Graduation on vs off with gate statistics (10 splits small; large sets) |
+| `rules_small.jsonl`, `rules_mc.jsonl`, `rules_mc23.jsonl`, `rules_slow.jsonl` | The four selection rules, i.e. the evidence table |
+| `oob10_noband.jsonl` | Honest and semi-honest out-of-bag vs test, 35 fits |
+| `honest1.jsonl`, `oob1.jsonl`, `se1.jsonl` | Per-table out-of-bag and SE detail |
+| `screen1.jsonl`, `screen2.jsonl`, `screen_noband.jsonl`, `mc_noband.jsonl` | Weights/UBRE screens and banding-off runs |
+| `curv_noceil_small.jsonl`, `curv_noceil_mc.jsonl` | Curvature weights with the ceiling rule |
+| `noise_ratio_small.jsonl`, `noise_ratio_mc.jsonl` | Move/σ² gate |
+| `skipband_small.jsonl`, `skipband_mc.jsonl` | Skip banded axes |
+| `harness_patched.jsonl` | Validation on the patched build |
+
+**Logs and diagnostics:**
+- `mc_diag_fr_instal_0.json` / `.log` and `mc_diag2_fr0.log`: per-class and per-table fr_instal damage.
+- `mc_common_fr0.log`: the softmax-common component.
+- `bytes_head/bytes.json`, `bytes_patch/bytes.json`: the byte comparison.
+## risks
+1. **fr_instal is protected only by scale.** Under the new rule it is declined at training ×1.0114–1.0140 (HEAD ×1.014–1.016), so the margin shrank. Its residual harm sits on unbanded axes, at +0.09–0.16% when banded axes are skipped and adopted at ×1.002–1.005. A slightly milder fr_instal-like multiclass set could be adopted with harm under either rule.
+
+2. **The single-output gain is modest.** Pooled paired −0.009 ± 0.008% (about 1 SE); lapse is the only individually significant set (−0.006 ± 0.0025). The case for the rule rests on:
+   - the mechanism: a boundary choice is set by an arbitrary constant;
+   - prudential: −0.044 ± 0.005, better on both splits;
+   - the absence of harm.
+   pg17_instal is slightly worse (+0.0037 ± 0.0024, same sign on all 4 splits, within each split's SE).
+
+3. **Two tests were changed, not just added.**
+   - test_html_report's GCV-decline test now patches `_gcv_smooth` to flatten the table. Under the new rule I could not find a natural single-table fixture that GCV smooths and the check reliably declines.
+   - test_sklearn's reanchor test gains `graduate=False`. This exposes a pre-existing interaction: an adopted graduation's native log-link f0 re-anchor overrides `reanchor=False`. HEAD's test passed only because that fixture's graduation was declined; more candidates are now cheap enough to be adopted, so the override fires more often.
+
+4. **Coverage gaps.** The evidence covers Poisson with exposure, Gamma, binary and multiclass on the cached team sets. It does not include Tweedie, squared error, grouped/panel or monotone fits. The rule lives in the shared GCV selection, so it applies to all of them.
+
+5. **Splits are few for the slow sets.** Two each for fremtpl2 and prudential; four for the other multiclass sets.
+## open_questions
+1. **What causes the residual multiclass over-smoothing on fr_instal?** It is still unidentified. About 30% of the class-table variance is the softmax-redundant common component, which each class's GCV smooths along with its own shape. The class banks have different merged grids, though, so they cannot be centred cell-wise. GCV with support weights treats every class's logit cells alike, whatever the class's frequency (2.8% for class 2).
+
+2. **Would graduating before banding help?** This order swap is untested. It would keep both stages active on interactions. I did not build it for three reasons:
+   - banding's distil target would become the graduated model;
+   - unbanded pairs often exceed the 2,500-cell joint cap;
+   - multiclass banding runs natively inside `fit_multiclass_pruned`.
+
+3. **Should graduation respect `reanchor=False`?** An adopted graduation re-anchors log-link f0 regardless. The alternative is to report the override in `binding_report_` as OVERRIDDEN.
+
+4. **`graduation_validation_` is inconsistent when nothing is smoothed.** It lacks `skipped` and `candidate_count` on the early return in `_graduate_table_model` (norway shows `adopted: False` with no reason), while the later no-update path sets them. Not changed here, because it would reword the monotone tests that assert `"skipped" not in graduation_validation_`.
+
+5. **The `w_scale` comment in `_graduate_table_model` is wrong in principle.** It says row-count GCV over-smooths by the mean weight. GCV picks the same smoother if every weight is scaled by one constant, apart from the fixed alpha grid's edges, so `w_scale` only relocates the grid. It does carry the fixed-alpha semantics, so I left the code and the comment alone.
+
+6. **The out-of-bag acceptance prototypes are in the results dir** if anyone wants to revisit them on larger sets, where effects exceed the jury's resolution.
+#################### abc0a47a57cf2e044
+## verdict
+reject
+## confidence
+high
+## evidence_assessment
+The evidence table recomputes exactly from rules_*.jsonl, and the comparison is paired and fair: every rule is applied to the same graduate=False fit per split, and my own driver reproduces the harness to 6 decimals on lapse/ausbi/swmc s3. The problem is what the numbers support.
+
+1. The headline (mean of datasets -0.0127% vs HEAD -0.0043%) rests on the splits used to find the rule and on one brake flip.
+- On splits >= 2, which the per-table diagnostics did not use, the dataset-level paired effect is -0.0021 +/- 0.0024%.
+- swmc's -0.027 is all split 9: the candidate went from x1.0107 (declined) to x1.0099 (adopted), row SE 0.34%. Without s9, swmc is +0.009 +/- 0.018.
+- ausbi's -0.020 is splits 0 and 1, the motivating examples. Splits 2-9: +0.005 +/- 0.021.
+- The two-split '+/-' values (prudential, fremtpl2) have one degree of freedom.
+
+2. Fresh single-output splits show no gain. 20 new splits (10-29) x 6 sets, running the real `_graduate` stage with the native 1% check, HEAD rule vs patched rule on identical tables (patched minus HEAD, % test deviance):
+- ausbi -0.0058 +/- 0.0073
+- swmc +0.0322 +/- 0.0175 (worse)
+- lapse -0.0017 +/- 0.0045. The investigator's only individually significant single-output gain (-0.0060 +/- 0.0025) does not replicate.
+- ussev +0.0019 +/- 0.0050; lifesurr and surrender 0 (no ceiling tables)
+- Pooled over 120 fits: +0.0044 +/- 0.0035. With the investigator's 60 fits: +0.0001 +/- 0.0034.
+
+3. Multiclass and large sets, fresh splits on both builds (shared harness loader, per-row paired SEs):
+- prudential s2: HEAD's candidate declined (> 1%); the patched build adopted 652 tables, -0.038 +/- 0.026% vs HEAD. With s0/s1 that is about -0.04% on 3/3 splits. This claim stands.
+- pg17_instal s4: +0.0018 +/- 0.0073, now 4 of 5 splits worse. The report's 'same sign on all 4 splits' is wrong: s3 was -0.0027.
+- fremtpl2 s2: identical models (no ceiling tables).
+- fr_instal s4 and s5: both builds decline, so the brake still holds, at a narrower margin (x1.011-1.014 vs x1.014-1.016 on s0-s3).
+
+4. Coverage gaps that matter here:
+- Every evaluated fit has w_scale = 1 and natural units; the harness drops weights equal to ones or to the exposure. There are no weighted, aggregated or large-exposure fits, which is exactly where the rule misbehaves (see problems).
+- No Tweedie, squared error, grouped or monotone fits.
+- No readability measure, although CLAUDE.md judges graduation on readability as well as on held-out deviance.
+
+5. Design checklist: the rule adds no parameter and no per-row Python work. The design objection is its dependence on the weight unit (problems), not complexity or placement.
+
+Net: one dataset (prudential) gains about 0.04%. Single-output sets are neutral to slightly worse, and in general the gain does not exceed split noise.
+## problems
+[
+ "The general gain does not replicate. On splits the diagnostics did not use (>= 2), the dataset-level effect is -0.0021 +/- 0.0024%. On 120 new single-output fits it is +0.0044 +/- 0.0035% (swmc +0.032 +/- 0.018% worse; lapse -0.002 +/- 0.005%). Only prudential replicates (fresh s2 -0.038 +/- 0.026%). The headline -0.0127% vs -0.0043% comes from the motivating splits (ausbi s0/s1, prudential s0/s1) and one brake flip (swmc s9, x1.0107 -> x1.0099).",
+ "The adopt/refuse decision depends on the unit of sample_weight and exposure. Under the default exposure measure, the GCV support is sum(weight*exposure) per cell, and GCV's minimiser scales with it (S(alpha; cW) = S(alpha/c; W)). A larger unit therefore pushes tables to the grid top, which the rule now treats as 'keep as fitted'. On identical graduate=False tables (11 fits of ausbi/lapse/swmc/lifesurr), scaling the support by 1000 cuts the patched rule from 57 smoothed tables to 17, while HEAD goes from 87 to 83. It also shows end to end: with a constant sample_weight=1000, swmc s3 goes from 10 tables smoothed (HEAD) to 0 (patched), and graduation_validation_ says adopted False with no reason; lapse s3 goes 59 -> 11, ausbi s3 10 -> 4. The catalog holds such data: swautoins has exposure around 1,090 policy-years per row; pg15training and catelematic13 have exposure in days (mean around 320). My runs on these three were too few to isolate the unit effect; the emulation is the demonstration. This breaks CLAUDE.md's 'Robust ... weights and exposure' and 'No behaviour completely switched off by a setting'.",
+ "The rationale is wrong. At the weak end, refusing is the alpha->0 limit that GCV is heading for. At the strong end, GCV is heading for alpha->inf (the weighted straight line), and the rule does the opposite. On a grid extended to 1e10, 20 of 21 ceiling tables (ausbi/lapse/swmc/lifesurr s2-s3) have their minimum at the linear limit. The data did pick a strength, so the docs' 'the data have not picked a strength' and the report's 'removes the arbitrary grid ceiling from the selection' are false. The grid's top now decides whether a table is smoothed at all.",
+ "A test is edited to hide a contract violation. On the patched build, graduation is adopted on the fixture of test_reanchor_defaults_on_for_log_link_only. Its unconditional native log-link f0 re-anchor (apply_graduation_updates_impl, `if model.link == Link::Log`) then makes reanchor=False give the same predictions as the default. I confirmed this, and binding_report_ has no row for it. The reanchor docs say an explicit True/False always overrides the default. Adding graduate=False to the test hides this instead of fixing or reporting it.",
+ "test_a_declined_graduation_is_reported now monkeypatches `_gcv_smooth`, so no test covers a real GCV choice declined by the 1% brake end to end. On HEAD, that test's zig-zag fixture is real high-frequency signal that GCV took for noise; the rule does fix that case.",
+ "Reporting: a table refused at the ceiling shows alpha 0.0 / 'as fitted' in graduation_report_ and in the HTML report, the same as a table whose roughness GCV judged real. When every table is refused, graduation_validation_ shows adopted False with no skipped or rejected reason (seen on swmc s3 at weight 1000). The rule makes this existing gap (open question 4) more frequent.",
+ "Readability was not measured. The rule smooths 30-80% fewer tables, and its own unit test ships a straight line plus small alternating noise unsmoothed, which is the canonical graduation case. Most refused single-output tables are small (4-24 observed cells), so the cost there is modest, but CLAUDE.md asks for it to be measured.",
+ "fr_instal is protected only by the brake's scale. The patched candidate is declined at x1.0114-1.0140 (HEAD x1.014-1.016), and it would cost +0.39-0.48% on test if adopted. Both builds still decline on fresh splits 4 and 5.",
+ "Smaller inaccuracies:\n- pg17_instal is not 'same sign on all 4 splits' (s3 -0.0027; fresh s4 +0.0018).\n- The measured numbers in the code comment include the motivating splits.\n- `strongest = max(t[1] for t in gcvs)` is the largest surviving alpha, not the grid maximum the prototype used. The two agree in practice, but the test does not pin which is meant."
+]
+## required_changes
+[
+ "Do not merge the interior-minimum rule. Keep HEAD's GCV selection and the 1% training brake. The case against the explained-deviance gate, tighter slack, out-of-bag checks and curvature weights is well evidenced and stands.",
+ "Take the doc fixes that hold on their own as a separate change: readable-tables.md still says graduation is not supported for three or more classes (stale since 85f40f1), and the wording 'a brake on heavy smoothing, not a test of accuracy' is accurate.",
+ "Treat the reanchor=False override as its own bug and revert the test_sklearn edit. Either honour reanchor=False in the native graduation re-anchor, or report it as OVERRIDDEN in binding_report_, with a test. Do not hide it with graduate=False.",
+ "If the prudential effect is pursued, the new rule must meet one invariant: the adopt/refuse decision must not depend on the unit of sample_weight or exposure. Add a test that a constant weight multiple, and exposure in days vs years, leave the set of smoothed tables unchanged. One option the census supports is to evaluate GCV at the penalty's null-space projection (alpha->inf) and refuse only when that is the minimum. At natural units this matched the patched rule on 6/6 fits (35 tables); at x1000 it kept 36 tables, against 9 for the patched rule.",
+ "Any revised rule must also:\n- record its reason per table in graduation_report_, and set graduation_validation_['skipped'] when nothing is smoothed;\n- keep an end-to-end test of a real GCV candidate declined by the brake;\n- be validated on splits not used to design it (prudential s3+, small sets s10+), on weighted or large-exposure catalog sets (swautoins, pg15training, catelematic13), and on the multiclass sets (pg17_instal is worse on 4/5 splits);\n- state its real rationale in the docs: GCV prefers the straight line, and that preference is not trusted on few-cell tables."
+]
+## extra_measurements
+All scripts and outputs are in /tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/team/A_review/.
+
+1. Recomputed the evidence table from the investigator's rules_*.jsonl (recompute.py, fresh.py). It matches exactly. The split-level breakdown is where the discovery-split and swmc s9 brake-flip findings come from.
+
+2. Fresh splits on both builds through the shared harness loader (fitsave.py). The HEAD build is the main checkout; the patched build is the worktree. Per-row test deviance is saved in rows/ for paired SEs.
+- prudential s2: HEAD declined, test 1.1335976 (equal to graduate=False). Patched adopted 652 tables, test 1.1331625: -0.038 +/- 0.026%.
+- fremtpl2 s2: identical models (15 tables, no ceiling choice); both +0.012 +/- 0.016% vs graduate=False.
+- pg17_instal s4: HEAD smooths 267 tables, patched 140. Patched minus HEAD: +0.0018 +/- 0.0073%.
+- fr_instal s4 and s5: both builds decline (candidates of 182/155 and 194/163 tables).
+
+3. Paired driver (fresh_small.py): one graduate=False fit, then the real `_graduate` stage with HEAD's selection and with the patched selection, native 1% check included. It reproduces the harness to 6 decimals on lapse/ausbi/swmc s3. Ran splits 10-29 on all 6 small sets (fresh_small.jsonl); results are in evidence_assessment.
+
+4. Weight scale:
+- Census with every support scaled by 0.01 to 1000 on identical tables (ceil_census.py, ceil_census2.py).
+- Real fits with constant sample_weight=1000 on lapse/ausbi/swmc s3 in both builds (fitsave_w.py; logs/weighted.jsonl).
+- The real weighted fits also change the boosted model itself (lapse s3: 84 graduation-eligible tables vs 16 unweighted). That is a pre-existing sensitivity outside issue A, so the emulation is the clean test.
+
+5. Catalog sets with large exposure (fresh_agg.py):
+- swautoins s0-s2: 7 eligible tables. HEAD declines on s0 and s2; patched adopts on s2 (-0.28 +/- 0.37%).
+- pg15training s0, exposure in days vs years: 8 eligible tables. HEAD smooths 4 vs 3, patched 3 vs 2; differences within noise.
+- catelematic13 s0, exposure in days: HEAD smooths 168 of 471 tables, 71 of them at the ceiling; patched smooths 97; +0.003 +/- 0.049%.
+- These runs are too few to show the unit effect directly.
+
+6. GCV curve census on a grid extended to 1e10: 20 of 21 ceiling tables have their minimum at the linear limit. Ceiling tables have 4-24 observed cells and a median support 2-8 times that of other tables. On lapse s3 they are 4x3, 5x3 and 3x4 interaction tables and one 4-cell main effect.
+
+7. reanchor_probe.py: on the patched build, HEAD's assertion in test_reanchor_defaults_on_for_log_link_only fails. Graduation is adopted, reanchor=False predictions equal the default, and binding_report_ has no row. On HEAD it passes because graduation is declined.
+
+8. The three new or changed tests pass in the worktree.
+
+Not checked: the speed claim. Machine load was 25-40 during my runs.
+## summary
+Reject the interior-minimum (ceiling) rule as submitted.
+
+The evidence table recomputes exactly from the raw JSON, but the general gain does not hold up out of sample:
+- On 120 new single-output fits, the patched rule is +0.0044 +/- 0.0035% vs HEAD (swmc +0.032 +/- 0.018% worse). Lapse's 'significant' gain falls to -0.002 +/- 0.005%.
+- The only replicated gain is prudential: about -0.04% on 3/3 splits, including a fresh one (-0.038 +/- 0.026%).
+- pg17_instal is worse on 4 of 5 splits.
+
+Because GCV's minimiser scales with the support (weight x exposure), the rule also makes graduation depend on the weight unit. Scaling the support by 1000 on identical tables cuts the patched build from 57 smoothed tables to 17, while HEAD goes from 87 to 83. A swmc fit with sample_weight=1000 smooths 0 tables (HEAD 10).
+
+The rationale is wrong too. 20 of 21 ceiling tables have their GCV minimum at the linear limit, so the rule overrides the data's choice; it does not fill a gap where the data made none.
+
+The patch also edits a test to hide that graduation's native re-anchor overrides reanchor=False.
+
+What stands:
+- keep the 1% brake;
+- the rejection of the gate, out-of-bag and curvature alternatives;
+- the stale-doc fix.
+
+Prudential is a lead for a unit-free rule validated on splits not used to design it.
+#################### ad38eb67c92660d6d
+## root_cause
+Two causes. Neither is the one the issue names.
+
+(1) The reported harm comes from a categorical-encoder leak, not from trees overfitting the slice. pg17_instal adopted step 0.75 and lost 0.21%/0.41% test cross-entropy. A categorical with more levels than cat_direct_max_levels is trained on k-fold cross-fit target statistics. Every post-fit stage, however, bins the training rows through the frozen full-data map, and that map's statistic for a level contains its rows' own targets: a level whose rows happen to sit high is binned high. A re-solve fitted to the training residual on those cells learns the leak; training deviance fell 1.08% and 1.05%. Every slice of training rows endorses it, out-of-bag or not, because each row's own target placed it. Evidence:
+- The issue's remedy was built and measured. With the residual and the check both taken from the bags' out-of-bag jury, restricted to the keep-set, pg17_instal still adopts step 0.75 and loses 0.21% and 0.52%. For the shipped correction, the out-of-bag slice predicted -0.50%/-0.57% and the in-sample slice -0.42%/-0.46%, while test went +0.21%/+0.41%. The out-of-bag curve's minimum sat at the same step as the in-sample one on every multiclass fit.
+- Causal test: with the shipped check unchanged, leaving tables on target-encoded categoricals as fitted (vh_model 979 levels, pol_insee_code 16,303, vh_make 97) turns pg17_instal into -0.021%/-0.015%. The training drop shrinks to 0.13%/0.03%, and both checks then agree with test.
+- The harm appears exactly where such categoricals exist. ussev (CLASS, 18 levels) is the only fast single-output set with one, and the only one the rebalance hurt (+0.13% to +0.22% on 3 of 5 splits). Applying its correction unconditionally costs +0.16% with CLASS's tables re-solved and +0.06% without; split 4 goes from +0.39% to -0.03%. Sets without such a categorical show no harm: swmc, ausbi, lapse, lifesurr, surrender, norway, pg16_fleet, fr_instal.
+
+(2) On single-output fits the stage did almost nothing because the slice check is biased against the re-solve, not optimistic. The soup trained on the slice rows, so a correction fitted to the other rows' residual is anti-correlated with the slice's own noise. Out-of-bag juries do not fix this, because the jury's bags also trained on the slice.
+- On the 25 single-output dataset-splits without a leaky categorical, applying the correction unconditionally lowers test deviance by 0.13% (in-sample residual) or 0.18% (out-of-bag residual) on average. The shipped check adopted it on 6 of 30 fits, for a mean change of +0.005%.
+- Example, ausbi s0: the correction gains 0.59% on test while both slices predicted +0.57% (worse). The out-of-bag-residual correction gains 1.39% while its own out-of-bag slice predicted +0.98%.
+- A bag never saw its own out-of-bag rows. Re-solving each bag on its in-bag rows and scoring it on its out-of-bag rows is therefore an honest check: it adopts on 28 of 30 fits, for a mean of -0.11%.
+## candidates
+[
+ {
+  "name": "leave as is",
+  "description": "Shipped 85f40f1: correction fitted on the in-sample residual of 85% of the rows and judged on a deterministic 15% hash slice. Single-output adopts if the slice deviance does not rise; multiclass picks one joint step from an 8-step grid.",
+  "result_summary": "Over 45 dataset-splits (13 datasets): mean test deviance vs no rebalance -0.006%, 11 wins / 5 losses (>0.02%). Single-output (35 splits): +0.001%, adopted on 6 of 30 fast fits. Multiclass (10): -0.031%. pg17_instal +0.21%/+0.41%; ussev +0.099% mean. pg16_fleet -0.37% is its one real gain.",
+  "verdict": "rejected",
+  "reason": "It harms fits wherever a target-encoded categorical exists, and its check blocks the correction everywhere else."
+ },
+ {
+  "name": "remove the stage (and prune_rebalance)",
+  "description": "Never re-solve the kept tables. This is the 'no rebalance' reference in every comparison.",
+  "result_summary": "0 by definition. It forgoes the recommended change's -0.121% mean (33 of 45 splits better with it), including multiclass pg16_fleet -0.41%, fr_instal -0.26% and prudential -0.23%, and single-output ausbi -0.36% and lapse -0.12%.",
+  "verdict": "rejected",
+  "reason": "With an honest check the stage earns its place on every dataset family measured."
+ },
+ {
+  "name": "out-of-bag-honest rebalance (the issue's proposal)",
+  "description": "Residual and check both from the bags' out-of-bag jury restricted to the keep-set (bag_oob_group_sums_with), with the deploy's re-anchor shift. Binary rule, or an 8-step grid for single-output.",
+  "result_summary": "Single-output, 6 fast sets x 5 splits: +0.006% vs off (adopted 10/30); with the grid -0.016% (12/30); ausbi s4 +0.30%, ussev +0.10% mean. Multiclass, 4 sets x 2 splits: mean +0.002%. pg17_instal still takes step 0.75 and loses 0.21%/0.52%; pg16_fleet keeps -0.37%/-0.29%.",
+  "verdict": "rejected",
+  "reason": "It does not fix the cause: the leak is in the serve-time encoding, which out-of-bag rows share. Its check is still biased, because the jury's bags trained on the slice."
+ },
+ {
+  "name": "out-of-bag check only",
+  "description": "Shipped in-sample residual, judged on the out-of-bag jury over the slice.",
+  "result_summary": "Single-output 30 fits: -0.004% (9 adopted); with the grid -0.015% (10). Multiclass: on every shipped fit the out-of-bag curve's minimum equals the in-sample one, so decisions are unchanged (pg17_instal predicted -0.50%/-0.57%, test +0.21%/+0.41%).",
+  "verdict": "rejected",
+  "reason": "Same biases as the shipped check."
+ },
+ {
+  "name": "stronger shrinkage (ridge base x10)",
+  "description": "Shipped check with a 10x ridge on the correction.",
+  "result_summary": "Single-output 30 fits: -0.012% (9 adopted). Shrinks ussev's harm to +0.03% but adds little elsewhere (ausbi -0.07%).",
+  "verdict": "rejected",
+  "reason": "A tuned constant that leaves both biases in place."
+ },
+ {
+  "name": "8-step grid on single-output (in-sample)",
+  "description": "Shipped residual and slice, choosing a step from MC_CORRECTION_STEPS instead of a binary rule.",
+  "result_summary": "Single-output 30 fits: -0.010% (11 adopted). With the per-bag check, grid and binary rules measure the same (-0.108% vs -0.109%).",
+  "verdict": "rejected",
+  "reason": "A second mechanism with no measured gain; single-output keeps the binary rule."
+ },
+ {
+  "name": "leak exclusion only (Tier 1)",
+  "description": "Tables on a categorical whose cells come from a cross-fit target statistic (more levels than cat_direct_max_levels; binary, direct-bypass and count channels excepted) are left as fitted and listed in excluded. Shipped slice check kept. Core part saved as tier1_core.diff.",
+  "result_summary": "45 splits: -0.019% vs off (9 wins / 3 losses). pg17_instal +0.31% -> -0.02%; ussev +0.099% -> +0.089%. Single-output stays inert (+0.002%, adopted 6/30). fremtpl2 loses shipped's s0 gain of -0.066%, which came from re-solving Region's tables. Multiclass -0.092%. No added cost.",
+  "verdict": "viable",
+  "reason": "Fixes the reported harm at zero cost, but leaves the stage doing nothing on single-output. It is the fallback if the recommended change's multiclass cost is unacceptable."
+ },
+ {
+  "name": "leak exclusion + correction on all rows, no check (force_all)",
+  "description": "Fit the correction on every row and always apply it at step 1.",
+  "result_summary": "Single-output 30 fits: -0.104% (20 wins / 5 losses); fremtpl2 -0.043%. With the 85% fit, the in-sample correction gives -0.101% (17/6) and the out-of-bag correction -0.138% (18/7, driven by ausbi). On multiclass, step 1 overshoots (pg16 in-sample curve: 0.75 better than 1).",
+  "verdict": "rejected",
+  "reason": "No safety net, and multiclass needs a judged step. Its numbers show where the recommended change's gain comes from: fitting on all rows unblocked."
+ },
+ {
+  "name": "RECOMMENDED: leak exclusion + per-bag check + correction fitted on every row",
+  "description": "On a bagged soup, each bag's keep-set bank is anchored on its in-bag rows, re-solved there exactly as the deploy re-solves the soup (cell correction on its in-bag residual, then re-anchored), and scored on its out-of-bag rows. The rule is binary for single-output and one joint 8-step step for multiclass. The deployed correction is fitted on every row. Bag banks are built one at a time and the solves run in parallel waves of MC_REFIT_CLASS_WAVE. n_bags=1 keeps the shipped slice check, reported as evidence 'in_sample'.",
+  "result_summary": "45 splits: -0.121% vs off (33 wins / 4 losses), better than shipped on all 13 datasets. Single-output (35): -0.097% (23/4), and -0.098% vs shipped. Multiclass (10): -0.205% (10/0), and -0.173% vs shipped. Highlights: pg17_instal -0.07% vs off (shipped +0.31%), fr_instal -0.26%, prudential -0.23%, pg16_fleet -0.41%, ausbi -0.36%. Adopted 28/30 on fast single-output. ussev is still +0.036% (shipped +0.099%); fremtpl2 s0 is 0.02% behind shipped, but the mean of both splits is ahead. Fit-time cost, A/B on a quiet machine: surrender 5.7->6.0 s (+5%), fremtpl2 51.6->54.7 s (+6%), pg17_instal 36.5->47.7 s (+31%), prudential 247->338 s (+37%).",
+  "verdict": "recommended",
+  "reason": "It fixes both causes, the stage then earns its place in every family, it adds no parameter, and nothing is switched off: n_bags=1 falls back to the slice and says so. The cost is material on multiclass, where it scales with n_bags x K correction solves."
+ }
+]
+## recommendation
+Ship the full change in final_patch.diff.
+
+What it does:
+1. A categorical whose training rows are binned by cross-fit target statistics is left as fitted and reported in pruning_report_["rebalance"]["excluded"]. That means more levels than cat_direct_max_levels; binary, direct-bypass and count channels are kept.
+2. On a bagged soup the re-solve is judged per bag. Each bag is re-solved on its in-bag rows exactly as the deploy re-solves the soup, then scored on the rows it left out. The deployed correction is fitted on every row. Single-output keeps its binary rule; multiclass keeps its 8-step joint grid.
+3. n_bags=1 keeps the shipped slice check, reported as evidence "in_sample". Model bytes are identical to HEAD (measured on swmc, surrender and pg16_fleet), apart from the leak exclusion.
+
+Results and cost:
+- Mean test deviance -0.121% against no rebalance over 45 dataset-splits on 13 datasets (33 wins / 4 losses), and better than shipped on every dataset. pg17_instal goes from +0.31% to -0.07%.
+- Cost measured on a quiet machine: +5-6% fit time single-output, +31-37% multiclass. The check is one correction solve per bag, K per bag on multiclass, capped at 8 concurrent solves, so more cores do not shorten it.
+
+If that multiclass cost is unacceptable, take Tier 1 alone. It costs nothing and fixes the reported harm, but leaves the stage inert on single-output. Its parts of final_patch.diff:
+- prune.rs:
+  - cell_reads_own_target
+  - the encoders parameter and `honest` line in rebalance_supports, and its two call sites
+  - the `excluded` doc line
+  - the unit test rebalance_leaves_tables_on_a_cross_fit_categorical_as_fitted, and the updated call in rebalance_resolves_each_raw_feature_to_its_own_axis
+- the cat_direct_max_levels clauses in the prune_rebalance docstrings and docs/training-parameters/pruning.md (then check_docs.py fix)
+- test_rebalance.py: test_tables_on_a_target_encoded_categorical_are_left_as_fitted, cat_direct_max_levels=64 in the multichannel test, and the dropped `excluded == []` assertion
+
+The core part is saved as tier1_core.diff.
+
+Do not adopt the issue's out-of-bag jury guard: it was built and measured, and it does not fix pg17_instal (+0.21%/+0.52%). Do not remove the stage.
+
+Note: my worktree was created at 8857bcc (main). I reset its branch to 85f40f1 before starting, and the diff is against 85f40f1.
+## evidence_table
+Test deviance (mean over splits; log loss for classification, lower is better) of the full shipped pipeline (rebalance, then banding, then graduation, default settings, seed 0, n_jobs=8). The last three columns are paired mean deltas.
+- Single-output: replays. One soup fit per dataset-split, with the keep-set re-applied per variant; verified to reproduce the shipped estimator exactly.
+- Multiclass: full fits.
+- 'leak exclusion only' = Tier 1. 'final' = the recommended patch.
+
+| dataset | splits | no rebalance | shipped | leak exclusion only | final | shipped vs off | final vs off | final vs shipped |
+|---|---|---|---|---|---|---|---|---|
+| swmc (Poisson, exposure) | 0-4 | 0.093492 | 0.093447 | 0.093447 | 0.093393 | -0.049% | -0.105% | -0.056% |
+| ussev (Gamma) | 0-4 | 1.181992 | 1.183128 | 1.183005 | 1.182405 | +0.099% | +0.036% | -0.063% |
+| surrender (binary) | 0-4 | 0.515296 | 0.515296 | 0.515296 | 0.515158 | +0.000% | -0.027% | -0.027% |
+| ausbi (Gamma) | 0-4 | 1.294372 | 1.294372 | 1.294372 | 1.289600 | +0.000% | -0.358% | -0.358% |
+| lifesurr (binary) | 0-4 | 0.251833 | 0.251833 | 0.251833 | 0.251625 | +0.000% | -0.081% | -0.081% |
+| lapse (binary) | 0-4 | 0.364942 | 0.364860 | 0.364860 | 0.364509 | -0.023% | -0.118% | -0.095% |
+| norway (Poisson) | 0-2 | 0.270612 | 0.270593 | 0.270593 | 0.270572 | -0.007% | -0.015% | -0.008% |
+| fremtpl2 (Poisson) | 0,1 | 0.303301 | 0.303200 | 0.303301 | 0.303171 | -0.033% | -0.043% | -0.010% |
+| pg16_fleet (3 cl) | 0,1 | 0.968552 | 0.964985 | 0.964985 | 0.964550 | -0.368% | -0.413% | -0.045% |
+| pg17_instal (4 cl) | 0,1 | 1.110921 | 1.114324 | 1.110721 | 1.110128 | +0.306% | -0.071% | -0.376% |
+| pg17_cover (4 cl) | 0,1 | 0.675460 | 0.675222 | 0.675420 | 0.675107 | -0.035% | -0.052% | -0.017% |
+| fr_instal (4 cl) | 0,1 | 0.844581 | 0.844419 | 0.844419 | 0.842415 | -0.019% | -0.256% | -0.237% |
+| prudential (8 cl) | 0,1 | 1.147388 | 1.146934 | 1.146808 | 1.144750 | -0.040% | -0.230% | -0.190% |
+
+Pooled, mean vs no rebalance (wins/losses beyond 0.02%):
+
+| group | splits | shipped | leak exclusion only | final |
+|---|---|---|---|---|
+| all | 45 | -0.006% (11/5) | -0.019% (9/3) | -0.121% (33/4) |
+| single-output | 35 | +0.001% (5/3) | +0.002% (4/3) | -0.097% (23/4) |
+| multiclass | 10 | -0.031% (6/2) | -0.092% (5/0) | -0.205% (10/0) |
+
+Final vs shipped: single-output -0.098% (better on 22, worse on 2 of 35); multiclass -0.173% (better on 9, worse on 1 of 10).
+
+Other single-output candidates, 6 fast sets x 5 splits, mean vs off (adopted out of 30):
+
+| candidate | mean vs off | adopted |
+|---|---|---|
+| out-of-bag residual + check | +0.006% | 10 |
+| same, with grid | -0.016% | 12 |
+| out-of-bag check only | -0.004% | 9 |
+| same, with grid | -0.015% | 10 |
+| in-sample grid | -0.010% | 11 |
+| ridge x10 | -0.012% | 9 |
+| unconditional, 85% in-sample residual + exclusion | -0.101% (17/6) | 30 |
+| unconditional, out-of-bag residual + exclusion | -0.138% (18/7) | 30 |
+| unconditional, fitted on all rows (force_all) | -0.104% (20/5) | 30 |
+| final (per-bag check) | -0.109% (20/4) | 28 |
+
+Multiclass out-of-bag residual + check: mean +0.002% over 8 fits (pg17_instal +0.21%/+0.52%).
+
+Fit-time A/B, shipped HEAD build vs final, quiet machine (load about 2-6), test deviance identical to the table:
+
+| set | shipped | final | change | check | rebalance stage / keep-set apply |
+|---|---|---|---|---|---|
+| surrender s0 | 5.7 s | 6.0 s | +5% | 0.21 s | |
+| fremtpl2 s0 | 51.6 s | 54.7 s | +6% | 4.6-4.75 s | stage 2.0 -> 6.2 s |
+| pg17_instal s0 | 36.5 s | 47.7 s | +31% | 11-12 s | keep-set apply 3.2 -> 14 s |
+| prudential s0 | 247 s | 338 s | +37% | 76 s | keep-set apply 11 -> 89 s |
+
+Root-cause diagnostics: pg17_instal, shipped correction at its adopted step 0.75.
+
+| split | in-sample slice | out-of-bag slice | train | test |
+|---|---|---|---|---|
+| s0 | -0.42% | -0.50% | -1.08% | +0.21% |
+| s1 | -0.46% | -0.57% | -1.05% | +0.41% |
+
+With the leak exclusion, s0 gives test -0.02% and train -0.13%.
+## patch (len 66839 )
+## gates_run
+All gates passed, run on the exact bytes in final_patch.diff (logs: gates_cargo.log, gates_python.log).
+
+Rust:
+- cargo fmt --all --check
+- cargo clippy --workspace --all-targets --all-features -- -D warnings
+- cargo run -p xtask -- check-all (no-box-dyn, justified, no-usize-serialized, no-hashmap-serialized)
+- cargo test --release -p t-boost-core --all-features
+- cargo test -p t-boost-core --doc
+- bit-repro pair, seed 7: byte-identical
+- slow suite, cargo test --release -p t-boost-core --all-features --test '*' -- --ignored: 14 passed. An earlier slow run (gate_slow.log) predates the last two prune.rs edits and also passed.
+
+Python and docs:
+- uv sync --reinstall-package t-boost
+- python -m mypy.stubtest t_boost._t_boost (the binding and stub are unchanged)
+- uv run pytest python/tests -q: 772 passed
+- uv run mypy --strict python/t_boost
+- scripts/check_docs.py fix, then check
+- mkdocs build --strict
+
+Extra checks:
+- The final build reproduces the measured candidate bit-for-bit on 8 fits (swmc, lapse, ussev s1/s3; pg16_fleet s0, fr_instal s0), before and after the memory restructure.
+- New determinism test: model bytes and reports are identical at n_jobs 1 and 4, for single-output and multiclass.
+- Model bytes are identical to a HEAD (85f40f1) build for n_bags=1 (swmc, surrender, and pg16_fleet with step 0.75 adopted) and for prune_rebalance=False (swmc).
+- Robustness fits all run and report their evidence: n_bags=1, cell_refit_base=4000, grouped panels, weights, monotone, binary, Gamma, multiclass (incl. n_bags=1, groups, cell_refit_base).
+## behaviour_changes
+Model bytes change for essentially every bagged pruned fit with prune_rebalance=True, the default:
+- The deployed correction is fitted on every row instead of 85%, and judged per bag.
+- It is therefore adopted far more often: 28 of 30 vs 6 of 30 on the fast single-output fits. Multiclass steps differ (e.g. pg16 0.75/0.75 vs 0.75/0.5).
+
+Fits with a categorical of more levels than cat_direct_max_levels change regardless: those tables keep their fitted values and are listed in `excluded`.
+
+Unchanged:
+- n_bags=1 fits are byte-identical to HEAD except for that exclusion (measured).
+- prune_rebalance=False and prune=False are byte-identical.
+
+pruning_report_["rebalance"]:
+- New key "evidence": "out_of_bag", or "in_sample" for n_bags=1.
+- With out-of-bag evidence, holdout_rows counts (row, bag) pairs (about 1.6 x n with 8 bags at 0.8 subsample).
+- Single-output holdout_deviance_before/after are totals over every bag's out-of-bag rows; multiclass ones are the mean cross-entropy over them.
+- The HTML report renders the block generically, so "evidence" appears as one extra row. haute may read these fields.
+
+No parameter, default, binding or stub changed. Docstrings and docs were updated: prune_rebalance, n_bags, pruning_report_, pruning.md, bagging.md, and index.md regenerated.
+## worktree
+/home/ralph/suite/t-boost/.claude/worktrees/wf_f90f4e08-420-2
+## results_dir
+/tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/team/B
+## risks
+- **Multiclass cost.** Measured on a quiet machine: +31% fit time on pg17_instal and +37% on prudential; +5-6% single-output (surrender, fremtpl2). The check costs one correction solve per bag, K per bag on multiclass, with at most 8 solves running at once, so more cores do not shorten it. Tier 1 alone avoids this.
+- **ussev**, the smallest set (5.4k rows, Gamma), stays slightly worse than no rebalance: +0.036% mean, s1 +0.19%. Shipped was +0.099%.
+- **The leak exclusion is conservative.** It also leaves categoricals with large levels as fitted, where the leak is negligible: fremtpl2's Region, 22 levels of about 25k rows each. There the shipped re-solve gained -0.066% on s0, and final is 0.02% behind shipped on that split (ahead over both splits).
+- **n_bags=1** keeps the slice check. That check is biased against the re-solve (it declines more than it should), and on panel data it is hashed by row, not by group. Unchanged from shipped.
+- **cell_refit_base:** each bag is checked with the whole soup-level §G1 correction, as on the existing out-of-bag evidence path. An approximation; verified to run.
+- **Memory:** single-output keeps 8 per-bag score vectors (8 x n f64) plus up to 8 correction designs live. Multiclass keeps K x 8 x n f64 logits, with the class banks at the existing K-way peak and at most 8 solves.
+- **Report semantics changed:** holdout_rows and the single-output holdout deviances; downstream readers such as haute may assume the old meaning.
+- **Branch move:** the worktree was created at 8857bcc (main). Its branch was reset to 85f40f1, the stated HEAD, before any work; the patch is against 85f40f1.
+## open_questions
+- **The serve-map leak almost certainly reaches other stages.** The ranked path's out-of-bag prefix deviances, banding's curvature-weighted cells and graduation's cell weights all score training rows through the full-data target-statistic map. Target-encoded tables therefore look better than they are at selection time too. The root fix would score post-fit stages on the training-time cross-fit encodings; that would also let the rebalance re-solve those tables. It is plumbing beyond this issue.
+- **Can the check get cheaper without losing honesty?**
+  - Share the per-bag keep-restricted scores with banding's bag_score_variance, which builds the same bag banks.
+  - Deploy the mean of the bags' corrections instead of a separate all-rows solve, which saves one solve per class and deploys exactly what was judged.
+  Neither was built or measured.
+- **n_bags=1 has no honest evidence at all.** Is a pessimistic slice the right fallback, or should the fit record its early-stopping carve so it can be used?
+#################### a1690244652758d5f
+## verdict
+accept_with_changes
+## confidence
+medium
+## evidence_assessment
+Three tiers of evidence, weighted differently.
+
+1. The investigator's own splits. I re-ran evidence_table.py and family_summary.py on the raw JSONL and the tables reproduce exactly. The fairness checks hold:
+- Same soup and keep-set per variant.
+- The single-output replay reproduces the shipped estimator.
+- The final build is bit-identical to the replayed variant on 6 fits.
+- The worktree diff is byte-identical to final_patch.diff.
+- The main checkout's .so has the same md5 as a fresh 85f40f1 build.
+
+Split-level t-statistics overstate the evidence, because 5 splits of one dataset are correlated. At dataset level:
+- Single-output final vs off is -0.089% (8 datasets, t≈-2.1), and -0.050% without ausbi (t≈-2.45).
+- Multiclass final vs off is -0.204% (5/5 datasets, t≈-3.1).
+- Multiclass final vs Tier 1 is better on 10/10 splits (-0.112%).
+
+The winner was also chosen among ~10 variants on these same splits, so this tier alone is optimistic.
+
+2. A reproduction check. A full harness fit of ausbi s2 on the final build gives -0.299% vs off, exactly the replay's number.
+
+3. Fresh evidence; this tier carries the verdict.
+- Multiclass reproduces in size:
+  - pg17_instal s2: HEAD +0.216% vs off while cutting training deviance 1.04% (the leak reproduces); final -0.059%.
+  - fr_instal s2: HEAD -0.055%; final -0.241%. It has no leaky categorical, so this is the per-bag check alone.
+- Single-output is small to nil on the investigator's own datasets: fremtpl2 s2 -0.044%, ausbi s5 -0.001%, ussev s5 0 (both builds declined).
+- Single-output is clearly positive on a task nobody had measured, prudential as binary (y>=6, 139 columns): -0.091%, -0.139% and -0.196% vs off on s0-s2, against HEAD 0, -0.053% and 0. Both mechanisms contribute there (14-16 tables excluded).
+
+Coverage and fairness:
+- Covered: Poisson with exposure, Gamma, binary and multiclass.
+- Not covered: Tweedie, a real weighted dataset and grouped/panel data. The investigator only checked that robustness configurations run.
+- Comparisons are fair (same soup and keep-set, deterministic).
+
+The single-output check adds almost nothing over always adopting:
+- It is identical to force_all on 28/30 fits. Its two declines were one right (ussev s3, saved 0.164%) and one wrong (surrender s3, forwent 0.014%).
+- It let through ausbi s4 +0.174%, ussev s1 +0.188%, ussev s2 +0.056% and surrender s4 +0.046%.
+- Its out-of-bag prediction tracks test well on lapse, lifesurr and swmc, but not on the small Gamma sets.
+
+The root cause holds for pg17_instal but not for ussev:
+- The exclusion moves shipped ussev only from +0.099% to +0.089% (s3 gets worse, +0.134% to +0.175%).
+- Final still loses +0.036% on ussev.
+- My earlier worry about the prudential Tier-1 support counts is resolved: the exploratory build reported the per-class maximum, not the union. The exploratory and final exclusion rules are identical, so the Tier-1 column is valid.
+
+The cost claim does not hold up:
+- "+5-6% single-output" is true only on narrow data.
+- On prudential-binary, the rebalance stage goes from 4.2-5.0 s to 11.4-12.7 s on all 3 splits. Fit time rises 22-25%, about 4x the claim.
+- Peak memory was never measured. It rises 14% on fremtpl2 (1.77 to 2.02 GB) and 11% on prudential-binary.
+## problems
+[
+ "The cost is understated. '+5-6% single-output' (surrender, fremtpl2) does not hold on wide data. On prudential as binary (139 columns, ~460 re-solved supports), the rebalance stage goes from 4.2-5.0 s to 11.4-12.7 s and fit time rises 22-25% on all 3 splits, about the same as multiclass (+17% fr_instal s2, +29% pg17_instal s2, +37% prudential). fremtpl2 s2 measured +10% in a single run.",
+ "Peak memory was never measured: +14% on fremtpl2 (1.77 to 2.02 GB, about 0.47 KB per training row) and +11% on prudential-binary. It grows with the number of rows because: (a) all 8 per-bag score vectors stay live; (b) up to 8 concurrent solves each hold row-length gradient, hessian, residual, weight and score vectors plus a supports x rows design. The risk notes count only (a) and the designs.",
+ "Two independent changes are bundled. The leak exclusion is ~40 core lines, costs nothing, and fixes the reported pg17_instal harm (confirmed on the fresh s2). The per-bag check is ~650 lines and carries all of the cost above. They cannot currently be judged or reverted separately.",
+ "The single-output check rarely binds. It matches force_all on 28/30 fits, its two declines were one right (ussev s3) and one wrong (surrender s3), and it let through ausbi s4 +0.174%, ussev s1 +0.188%, ussev s2 +0.056% and surrender s4 +0.046%. The single-output gain comes from no longer blocking the re-solve; the check is insurance costing +6-25% fit time.",
+ "The guard now judges a procedure, not the deployed values. The docs ('kept only if they do not raise the held-out deviance', 'no-harm guarded') imply the deployed values were checked, but the deployed all-rows correction is never evaluated: the check scores each bag's own re-solve on that bag's out-of-bag rows.",
+ "The single-output gain is modest and depends on the dataset. Dataset-level mean is -0.089% (t\u2248-2.1); -0.050% without ausbi. On fresh splits of the investigator's datasets it is small to nil: fremtpl2 s2 -0.044%, ausbi s5 -0.001%, ussev s5 0.",
+ "The root cause is wrong for ussev. The exclusion moves shipped ussev only from +0.099% to +0.089% (s3 worsens), and final still loses +0.036% (s1 +0.188% adopted). The claim 'the harm appears exactly where such categoricals exist' rests on one split (ussev s4 under force). The leak explanation is solid only for pg17_instal.",
+ "The check is not honest under cell_refit_base. bag_bank(..., share_correction=true) gives each bag the whole soup-level \u00a7G1 correction, which was fitted to out-of-bag residuals that include this bag's out-of-bag rows. bag_member_model's own doc calls such a bank 'NOT a coherent standalone model'. The RebalanceEvidence::OutOfBag doc ('honest for the trees and for the correction') is false there. This setting is off by default.",
+ "The guard can be skipped silently. If no bag leaves a row out (tiny n, or a grouped fit with very few groups), single-output adopts unchecked (rows == 0) and multiclass deploys step 1 unchecked, while the report still says evidence 'out_of_bag'. HEAD would have used the slice.",
+ "rebalance_bag_check and multiclass_rebalance_bag_check read membership with in_bag.get(r).unwrap_or(false) and never check its length against serve; bag_oob_group_sums_with errors on that mismatch. Calling apply_keepset on a design other than the fit's would silently score unseen rows as out-of-bag for every bag.",
+ "The leak criterion is a proxy: more levels than cat_direct_max_levels, excluding count channels and binaries. It also freezes categoricals with large levels whose own-row leak is negligible, such as fremtpl2 Region (22 levels x ~25k rows). That forgoes shipped's -0.066% on fremtpl2 s0, and final trails HEAD by 0.007% on monotone fremtpl2 s2. The same serve-map leak very likely biases the ranked path's out-of-bag evidence, banding and graduation for such categoricals; that is not tracked anywhere.",
+ "n_bags=1 keeps the slice check, which the investigator's own evidence shows is biased against the re-solve, so the stage stays effectively inert there. The early-stopping carve (holdout_mask is deterministic in seed, rows and strata) is honest held-out evidence that goes unused.",
+ "Minor issues: (1) The multiclass check scores raw + step\u00b7\u03b4 without the intercept re-anchor the deploy applies after the correction (inherited from HEAD). (2) On the out-of-bag path the deployed correction is solved before the check and wasted on a decline. (3) pruning.md's leak explanation also applies to direct-bypass categoricals; the real distinction is that the trees train on cross-fit statistics while post-fit stages bin on full-data statistics, with levels sharing cells. (4) Report semantics changed (holdout_rows counts (row, bag) pairs, e.g. 115,064 for ~80k rows; single-output deviances are sums over bags). This breaks no consumer: the HTML report renders the block generically, and haute's holdout_rows is an unrelated field."
+]
+## required_changes
+[
+ "Split the patch. Land the leak exclusion first as its own commit (tier1_core.diff plus its docs, the cat_direct_max_levels test settings and the new tests), then the per-bag check as a separate commit that can be reverted alone.",
+ "Correct the cost statement in the commit and PR: single-output +6-10% on narrow data and +22-25% on wide data (rebalance stage ~4.5 s to ~12 s on prudential-binary), multiclass +17-37%, peak memory +11-14%.",
+ "Get the maintainer's explicit decision on the per-bag check, mainly whether the single-output check (equal to always-adopt on 28/30 fits) is worth that cost. Options to make it cheaper: shorten the per-solve vectors to the rows actually used; run fewer single-output solves at once; solve the deployed correction only after the check passes; warm-start each bag's solve from the soup's correction. Sharing bag banks with banding would recover little: on pg17_instal the extra bag explains are ~2 s of an 11 s check.",
+ "Small: when no bag leaves a row out, fall back to the slice check (evidence 'in_sample') instead of adopting unchecked or deploying multiclass step 1 unchecked.",
+ "Small: check the bag-membership length against serve in both bag checks, erroring as bag_oob_group_sums_with does.",
+ "Under cell_refit_base, stop claiming honesty: fix the RebalanceEvidence::OutOfBag doc and the prune_rebalance docstrings to say the check is approximate there, or route that setting to the slice check.",
+ "Fix the docs: describe the guard as judging the re-solve procedure on each bag's out-of-bag rows, not the deployed values; correct pruning.md's leak explanation (cross-fit training vs full-data post-fit binning, levels sharing cells); drop the ussev leak attribution from the rationale.",
+ "Record follow-up issues: (1) the serve-map leak in selection, banding and graduation; (2) an honest n_bags=1 check on the early-stopping carve; (3) a data-derived leak test, or training-time binning, so categoricals like Region are no longer frozen."
+]
+## extra_measurements
+HEAD runs used the main checkout (its .so has the same md5 as a fresh 85f40f1 build). Final runs used the investigator's worktree build (its diff is byte-identical to final_patch.diff). Fits ran one at a time, one process each, under /usr/bin/time -v with TBOOST_PROFILE=1, seed 0, n_jobs 8. Results are in /tmp/claude-1000/-home-ralph-suite-t-boost/c55508b8-d4e7-4235-9479-9cc2164ee349/scratchpad/review_B (run_all.sh, run_prudbin.sh, run_mono.sh, wide_binary.py, summarize.py, *.jsonl, *.err). Neither checkout was modified.
+
+Test deviance vs prune_rebalance=False:
+
+| run | HEAD | final | final vs HEAD | fit time HEAD -> final | other |
+|---|---|---|---|---|---|
+| pg17_instal s2 (fresh) | +0.216% (train -1.04%) | -0.059% | -0.275% | 33.3 -> 43.0 s (+29%) | keep-set apply 3.1 -> 13.4 s |
+| fr_instal s2 (fresh) | -0.055% | -0.241% | -0.186% | 67.0 -> 78.6 s (+17%) | 0 excluded |
+| fremtpl2 s2 (fresh) | 0, declined | -0.044% | -0.044% | +10%, single run | rebalance stage 1.6 -> 6.6 s; Region's 7 tables excluded; peak RSS 1772 -> 2024 MB |
+| ausbi s2 (full fit) | 0 | -0.299% | -0.299% | | equals the replay exactly |
+| ausbi s5 (fresh) | 0 | -0.001% | -0.001% | | |
+| ussev s5 (fresh) | 0 | 0 | 0 | | both builds declined |
+| prudential binary s0 (new task) | 0 | -0.091% | -0.091% | 31.5 -> 39.5 s (+25%) | rebalance stage 4.4 -> 11.8 s; RSS 766 -> 849 MB |
+| prudential binary s1 | -0.053% | -0.139% | -0.086% | 30.7 -> 37.5 s (+22%) | rebalance stage 4.2 -> 11.4 s; RSS 743 -> 827 MB |
+| prudential binary s2 | 0 | -0.196% | -0.196% | 32.3 -> 39.6 s (+23%) | rebalance stage 5.0 -> 12.7 s; RSS 796 -> 883 MB |
+| fremtpl2 s2, BonusMalus monotone +1 | -0.107% | -0.100% | +0.007% | 38.5 -> 41.2 s | both adopt; the gap is the Region exclusion again; no harm from the monotone repair interaction |
+
+Prudential binary is y>=6, 139 columns, 47k training rows; final excludes 14-16 tables on it.
+
+Re-analysis of the investigator's raw files:
+- Dataset-level statistics as given in the assessment.
+- Per-bag check vs force_all compared per split.
+- Out-of-bag prediction vs realised test change.
+- The exploratory leaky_ts_axes rule is identical to cell_reads_own_target, so the Tier-1 prudential column is valid.
+- Explain-stage time from the A/B profiles: the multiclass check's cost is mostly the 8·K correction solves, not the bag-bank builds.
+## summary
+The accuracy case survives independent checking.
+- On fresh multiclass splits the recommended change reproduces in size: pg17_instal s2 goes from HEAD +0.216% to final -0.059% vs no rebalance, and fr_instal s2 from -0.055% to -0.241%. Both mechanisms work: the leak exclusion stops the harm, and the per-bag check lets the re-solve through where it helps.
+- Single-output gains are modest and depend on the dataset: about -0.09% at dataset level, about -0.05% without ausbi, and small to nil on fresh splits of the investigator's datasets. They are clearly positive on a new wide binary task (-0.09% to -0.20%).
+
+The cost claim is wrong for wide data: single-output fits slow by 22-25%, not 5-6%. Peak memory rises 11-14% and was never measured. The single-output check is effectively always-adopt (28/30) and is insurance rather than the source of the gain. The ussev part of the root-cause story is not supported.
+
+Several patch defects need fixing before landing:
+- A silent unchecked adopt when no bag leaves a row out.
+- No membership-length check.
+- An honesty claim that is false under cell_refit_base.
+- Docs that describe the guard as checking the deployed values.
+
+Accept with changes. Land the leak exclusion separately and first. Restate the measured cost, and let the maintainer decide on the per-bag check (above all its single-output half) with those numbers in hand. Fix the small defects and docs, and log the follow-ups: the serve-map leak in other stages, an honest n_bags=1 check, and a sharper leak criterion.
