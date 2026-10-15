@@ -1,7 +1,28 @@
 # Post-fit stages: open issues after the switch-off work
 
-Status: open. Written 2026-10-15 on branch `report-0.9.1` at `85f40f1`. Nothing below has been
-implemented; each issue says what is ready, what needs a decision and what needs more work.
+Status: written 2026-10-15 on branch `report-0.9.1` at `85f40f1`. The bugs were fixed the same
+day (see "Fixed" below); PF-03, PF-05 to PF-08 and PF-11 to PF-13 remain open.
+
+## Fixed (2026-10-15)
+
+| ID | Commit | What changed |
+|---|---|---|
+| PF-01 | `ec3937e` | `band_deviance_cap` must be finite and > 0 (ValueError on both paths); the core refuses an unbounded banding budget; the docs describe the cap as a budget on banding's cross-fitted estimate. Found while fixing it: a near-perfect fit could round its mean deviance below 0 and give a negative budget; the deviance is now clamped at 0. Byte-identical for valid caps. |
+| PF-02 | `5fd8d6b` | Tables on cross-fit-encoded categoricals are left out of the rebalance. pg17_instal split 0: test 1.108934 with the rebalance vs 1.109168 without (was +0.2% worse). |
+| PF-04 | `87c48a9` | Docs: multiclass graduation is supported; the 1% check is a brake, not an accuracy test. The `w_scale` comment is corrected (PF-08). |
+| PF-09 | `ed25646` | Graduation's log-link re-anchor honours the resolved `reanchor`. The `reanchor` docs also understated the default (it is on for poisson, gamma, tweedie and logistic) and `reanchor_slope`'s default was described as the same. |
+| PF-10 | `b7e7717` | Every graduation path records `skipped` and `candidate_count`. |
+| PF-14 | `ae23d59` | The test now asserts the documented contract: a truthy callback stops every bag after its current round, so the other bag stops at or before round 5. The fitted model therefore depends on bag timing when a callback stops the fit; making that deterministic would change the public callback contract and is left as a decision. |
+| PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
+
+Looked at and left as they are:
+
+- The core's "cannot meet its fidelity budget … tables left unbanded" is not a silent switch-off.
+  When even the finest banding moves more than the budget, the only move within it is none, and
+  the report says so.
+- A cap of 1e300 is finite and bands as coarsely as it allows; it is a legal, if odd, setting.
+- When the rebalance's held-out slice is empty (a handful of rows), single-output adopts the
+  re-solve and multiclass keeps step 1, unchecked; `holdout_rows` reports 0.
 
 ## Where this comes from
 
