@@ -1,0 +1,9 @@
+fr_instal s0 b8       unbanded: test 0.841070 (+0.000% vs U, -0.415% vs ship) cells 107032 first +0.000 joint 0.000 diag 0.000
+fr_instal s0 b8        shipped: test 0.844575 (+0.417% vs U, +0.000% vs ship) cells 259003 first +0.344 joint 0.073 diag 0.069
+noise {'dataset': 'fr_instal', 'split': 0, 'n_bags': 8, 'variant': '_noise', 'sigma_shipped': [0.06776640800546632, 0.06242073547895656, 0.17100720282153425, 0.11272669048885169], 'sigma_raw': [0.0677664080054663, 0.062420735478956844, 0.1710072028215345, 0.11272669048885167], 'sigma_centred': [0.05397321559058255, 0.041641700714175965, 0.1545234226677348, 0.10030243572123329], 'joint_over_diag_noise': 0.9019396707039942}
+base reproduces shipped bytes: True
+fr_instal s0 b8           base: test 0.844575 (+0.417% vs U, +0.000% vs ship) cells 259003 first +0.344 joint 0.073 diag 0.069
+fr_instal s0 b8        capx0.5: test 0.843292 (+0.264% vs U, -0.152% vs ship) cells 402851 first +0.226 joint 0.038 diag 0.036
+fr_instal s0 b8       capx0.25: test 0.842504 (+0.171% vs U, -0.245% vs ship) cells 591790 first +0.151 joint 0.019 diag 0.018
+fr_instal s0 b8           mass: test 0.844741 (+0.436% vs U, +0.020% vs ship) cells 349003 first +0.370 joint 0.067 diag 0.061
+fr_instal s0 b8          nosig: test 0.844575 (+0.417% vs U, +0.000% vs ship) cells 259003 first +0.344 joint 0.073 diag 0.069

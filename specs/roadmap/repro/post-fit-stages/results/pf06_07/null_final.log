@@ -1,0 +1,5 @@
+pg17_instal s0 b8      shipped null_refuse: d_test -0.019% train x1.0009 smoothed 170 [44, 41, 43, 42] ceiling 6 per-class []
+pg17_instal s1 b8      shipped null_refuse: d_test -0.016% train x1.0008 smoothed 189 [48, 43, 54, 44] ceiling 2 per-class []
+pg17_instal s2 b8      shipped null_refuse: d_test -0.003% train x1.0004 smoothed 116 [24, 25, 33, 34] ceiling 2 per-class []
+prudential s1 b8      shipped null_refuse: d_test -0.043% train x1.0046 smoothed 618 [65, 81, 99, 84, 108, 94, 40, 47] ceiling 23 per-class []
+NULL FINAL DONE

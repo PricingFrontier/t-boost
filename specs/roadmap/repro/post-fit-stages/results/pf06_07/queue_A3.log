@@ -1,0 +1,126 @@
+=== 09:39:59 grad prudential 0 8 B,U shipped,null_refuse
+prudential s0 b8      shipped    shipped: d_test +0.056% train x1.0098 smoothed 1448 [196, 205, 199, 168, 221, 184, 139, 136] ceiling 835 per-class [0.023, 0.041, -0.003, -0.004, 0.001, 0.012, -0.006, -0.0]
+prudential s0 b8      shipped null_refuse: d_test +0.016% train x1.0050 smoothed 590 [61, 80, 94, 81, 101, 76, 52, 45] ceiling 6 per-class []
+prudential s0 b8     unbanded    shipped: d_test +0.030% train x1.0032 smoothed 1820 [260, 270, 215, 203, 222, 228, 218, 204] ceiling 244 per-class [0.014, 0.029, -0.003, -0.001, -0.002, -0.002, 0.003, -0.004]
+prudential s0 b8     unbanded null_refuse: d_test -0.026% train x1.0023 smoothed 1563 [215, 231, 190, 172, 191, 203, 191, 170] ceiling 36 per-class []
+=== 09:44:16 done 0
+=== 09:44:16 band fr_instal 0 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=4000 best_round=3985 kept_rounds=3985
+[mc-prune] deploy_fit 17.75s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=3126 best_round=3026 kept_rounds=3026
+[mc-es] trained_rounds=4000 best_round=3988 kept_rounds=3988
+[mc-es] trained_rounds=4000 best_round=3998 kept_rounds=3998
+[mc-es] trained_rounds=4000 best_round=3950 kept_rounds=3950
+[mc-es] trained_rounds=4000 best_round=3965 kept_rounds=3965
+[mc-prune] keepset_apply 1.53s
+[mc-prune] banding 8.75s
+fr_instal s0 b1       unbanded: test 0.844812 (+0.000% vs U, -0.346% vs ship) cells 85873 first +0.000 joint 0.000 diag 0.000
+fr_instal s0 b1        shipped: test 0.847748 (+0.348% vs U, +0.000% vs ship) cells 242376 first +0.271 joint 0.076 diag 0.075
+fr_instal s0 b1        capx0.5: test 0.845848 (+0.123% vs U, -0.224% vs ship) cells 379295 first +0.085 joint 0.038 diag 0.038
+fr_instal s0 b1       capx0.25: test 0.845296 (+0.057% vs U, -0.289% vs ship) cells 532237 first +0.038 joint 0.020 diag 0.020
+fr_instal s0 b1           mass: test 0.847759 (+0.349% vs U, +0.001% vs ship) cells 300753 first +0.271 joint 0.078 diag 0.075
+=== 09:46:21 done 0
+=== 09:46:21 band fr_instal 1 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=4000 best_round=3999 kept_rounds=3999
+[mc-prune] deploy_fit 16.62s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=4000 best_round=3988 kept_rounds=3988
+[mc-es] trained_rounds=4000 best_round=3982 kept_rounds=3982
+[mc-es] trained_rounds=4000 best_round=3988 kept_rounds=3988
+[mc-es] trained_rounds=4000 best_round=3980 kept_rounds=3980
+[mc-es] trained_rounds=4000 best_round=3976 kept_rounds=3976
+[mc-prune] keepset_apply 1.62s
+[mc-prune] banding 11.10s
+fr_instal s1 b1       unbanded: test 0.844056 (+0.000% vs U, -0.314% vs ship) cells 85975 first +0.000 joint 0.000 diag 0.000
+fr_instal s1 b1        shipped: test 0.846714 (+0.315% vs U, +0.000% vs ship) cells 215654 first +0.231 joint 0.084 diag 0.081
+fr_instal s1 b1        capx0.5: test 0.845268 (+0.144% vs U, -0.171% vs ship) cells 336969 first +0.105 joint 0.038 diag 0.038
+fr_instal s1 b1       capx0.25: test 0.844721 (+0.079% vs U, -0.235% vs ship) cells 457401 first +0.057 joint 0.021 diag 0.021
+fr_instal s1 b1           mass: test 0.846502 (+0.290% vs U, -0.025% vs ship) cells 277853 first +0.203 joint 0.086 diag 0.081
+=== 09:48:42 done 0
+=== 09:48:42 band fr_instal 2 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=4000 best_round=3985 kept_rounds=3985
+[mc-prune] deploy_fit 15.85s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=3725 best_round=3625 kept_rounds=3625
+[mc-es] trained_rounds=4000 best_round=3954 kept_rounds=3954
+[mc-es] trained_rounds=4000 best_round=3985 kept_rounds=3985
+[mc-es] trained_rounds=4000 best_round=3979 kept_rounds=3979
+[mc-es] trained_rounds=4000 best_round=3974 kept_rounds=3974
+[mc-prune] keepset_apply 1.42s
+[mc-prune] banding 8.44s
+fr_instal s2 b1       unbanded: test 0.844507 (+0.000% vs U, -0.299% vs ship) cells 86043 first +0.000 joint 0.000 diag 0.000
+fr_instal s2 b1        shipped: test 0.847036 (+0.299% vs U, +0.000% vs ship) cells 255253 first +0.221 joint 0.077 diag 0.077
+fr_instal s2 b1        capx0.5: test 0.845356 (+0.101% vs U, -0.198% vs ship) cells 391555 first +0.063 joint 0.037 diag 0.038
+fr_instal s2 b1       capx0.25: test 0.844924 (+0.049% vs U, -0.249% vs ship) cells 555931 first +0.029 joint 0.021 diag 0.022
+fr_instal s2 b1           mass: test 0.847499 (+0.354% vs U, +0.055% vs ship) cells 339372 first +0.265 joint 0.089 diag 0.085
+=== 09:50:48 done 0
+=== 09:50:48 band pg17_cover 0 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=1017 best_round=517 kept_rounds=517
+[mc-prune] deploy_fit 8.11s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=561 best_round=461 kept_rounds=461
+[mc-es] trained_rounds=555 best_round=455 kept_rounds=455
+[mc-es] trained_rounds=573 best_round=473 kept_rounds=473
+[mc-es] trained_rounds=655 best_round=555 kept_rounds=555
+[mc-es] trained_rounds=718 best_round=618 kept_rounds=618
+[mc-prune] keepset_apply 2.73s
+[mc-prune] banding 9.00s
+pg17_cover s0 b1       unbanded: test 0.674478 (+0.000% vs U, -0.030% vs ship) cells 167962 first +0.000 joint 0.000 diag 0.000
+pg17_cover s0 b1        shipped: test 0.674681 (+0.030% vs U, +0.000% vs ship) cells 12051 first -0.028 joint 0.058 diag 0.057
+pg17_cover s0 b1        capx0.5: test 0.674679 (+0.030% vs U, -0.000% vs ship) cells 16017 first +0.000 joint 0.030 diag 0.029
+pg17_cover s0 b1       capx0.25: test 0.674629 (+0.022% vs U, -0.008% vs ship) cells 22349 first +0.007 joint 0.015 diag 0.015
+pg17_cover s0 b1           mass: test 0.674726 (+0.037% vs U, +0.007% vs ship) cells 12102 first -0.020 joint 0.057 diag 0.054
+=== 09:53:50 done 0
+=== 09:53:50 band pg17_cover 1 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=984 best_round=484 kept_rounds=484
+[mc-prune] deploy_fit 8.00s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=425 best_round=325 kept_rounds=325
+[mc-es] trained_rounds=491 best_round=391 kept_rounds=391
+[mc-es] trained_rounds=564 best_round=464 kept_rounds=464
+[mc-es] trained_rounds=671 best_round=571 kept_rounds=571
+[mc-es] trained_rounds=689 best_round=589 kept_rounds=589
+[mc-prune] keepset_apply 2.66s
+[mc-prune] banding 8.19s
+pg17_cover s1 b1       unbanded: test 0.677363 (+0.000% vs U, -0.079% vs ship) cells 161393 first +0.000 joint 0.000 diag 0.000
+pg17_cover s1 b1        shipped: test 0.677896 (+0.079% vs U, +0.000% vs ship) cells 11289 first +0.019 joint 0.059 diag 0.056
+pg17_cover s1 b1        capx0.5: test 0.677484 (+0.018% vs U, -0.061% vs ship) cells 14426 first -0.012 joint 0.030 diag 0.029
+pg17_cover s1 b1       capx0.25: test 0.677361 (-0.000% vs U, -0.079% vs ship) cells 20246 first -0.015 joint 0.014 diag 0.014
+pg17_cover s1 b1           mass: test 0.677871 (+0.075% vs U, -0.004% vs ship) cells 11131 first +0.012 joint 0.062 diag 0.059
+=== 09:56:58 done 0
+=== 09:56:58 band pg17_cover 2 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=1264 best_round=764 kept_rounds=764
+[mc-prune] deploy_fit 9.30s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=446 best_round=346 kept_rounds=346
+[mc-es] trained_rounds=526 best_round=426 kept_rounds=426
+[mc-es] trained_rounds=595 best_round=495 kept_rounds=495
+[mc-es] trained_rounds=759 best_round=659 kept_rounds=659
+[mc-es] trained_rounds=810 best_round=710 kept_rounds=710
+[mc-prune] keepset_apply 2.74s
+[mc-prune] banding 8.71s
+pg17_cover s2 b1       unbanded: test 0.671687 (+0.000% vs U, -0.040% vs ship) cells 313719 first +0.000 joint 0.000 diag 0.000
+pg17_cover s2 b1        shipped: test 0.671954 (+0.040% vs U, +0.000% vs ship) cells 19836 first -0.015 joint 0.055 diag 0.054
+pg17_cover s2 b1        capx0.5: test 0.671796 (+0.016% vs U, -0.024% vs ship) cells 30080 first -0.012 joint 0.028 diag 0.028
+pg17_cover s2 b1       capx0.25: test 0.671670 (-0.003% vs U, -0.042% vs ship) cells 48596 first -0.018 joint 0.016 diag 0.016
+pg17_cover s2 b1           mass: test 0.671745 (+0.009% vs U, -0.031% vs ship) cells 20301 first -0.045 joint 0.053 diag 0.052
+=== 09:59:08 done 0
+=== 09:59:08 band prudential 0 1 capx0.5,capx0.25,mass
+[mc-es] trained_rounds=1723 best_round=1223 kept_rounds=1223
+[mc-prune] deploy_fit 41.76s
+[mc-prune] ranked_path 0.00s
+[mc-es] trained_rounds=838 best_round=738 kept_rounds=738
+[mc-es] trained_rounds=940 best_round=840 kept_rounds=840
+[mc-es] trained_rounds=1017 best_round=917 kept_rounds=917
+[mc-es] trained_rounds=1087 best_round=987 kept_rounds=987
+[mc-es] trained_rounds=1091 best_round=991 kept_rounds=991
+[mc-prune] keepset_apply 8.77s
+[mc-prune] banding 34.06s
+prudential s0 b1       unbanded: test 1.144739 (+0.000% vs U, -0.101% vs ship) cells 759372 first +0.000 joint 0.000 diag 0.000
+prudential s0 b1        shipped: test 1.145893 (+0.101% vs U, +0.000% vs ship) cells 54081 first +0.019 joint 0.082 diag 0.081
+prudential s0 b1        capx0.5: test 1.145326 (+0.051% vs U, -0.049% vs ship) cells 66025 first +0.006 joint 0.045 diag 0.045
+prudential s0 b1       capx0.25: test 1.145127 (+0.034% vs U, -0.067% vs ship) cells 86953 first +0.009 joint 0.025 diag 0.025
+prudential s0 b1           mass: test 1.146145 (+0.123% vs U, +0.022% vs ship) cells 58503 first +0.041 joint 0.081 diag 0.081
+=== 10:05:35 done 0
+=== QUEUE FINISHED 10:05:35

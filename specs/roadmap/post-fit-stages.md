@@ -15,7 +15,7 @@ day, then PF-05 and PF-03 (see "Fixed" below); PF-06 to PF-08 and PF-11 to PF-13
 | PF-14 | `ae23d59`, `5831d31` | A truthy callback used to stop every bag after whatever round each had reached, so the fitted model depended on thread timing (the flaky test was this). On the maintainer's decision the contract changed: a truthy return stops the bag it was called for, as early stopping stops each bag at its own round, and a callback that decides from its dict alone gives a byte-identical model on every run and at any `n_jobs`. Return truthy for every bag to stop the whole fit; an exception still stops it. Haute does not pass t-boost callbacks. |
 | PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
 | PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
-| PF-03 | the commit after `d727ca2` | The rebalance is judged per bag on out-of-bag rows (the slice only without them), with the review's defects fixed. −0.109% over 17 datasets against no rebalance, −0.079% against the slice check; +0–22% fit time single-output, +17–45% multiclass; optimistic on the two smallest sets. See PF-03. |
+| PF-03 | `3365ecf` | The rebalance is judged per bag on out-of-bag rows (the slice only without them), with the review's defects fixed. −0.109% over 17 datasets against no rebalance, −0.079% against the slice check; +0–22% fit time single-output, +17–45% multiclass; optimistic on the two smallest sets. See PF-03. |
 
 Looked at and left as they are:
 
@@ -99,9 +99,9 @@ rejected, so they are not tried again.
 | PF-03 | Rebalance check is biased against the re-solve | Per-bag out-of-bag check, correction fitted on every row | +6–37% fit time, +11–14% memory | maintainer |
 | PF-04 | Graduation's 1% check | Keep it; say it is a brake, not an accuracy test | none | ready (docs) |
 | PF-05 | The serve-map leak in selection, banding and graduation | Investigate | unknown | next |
-| PF-06 | Multiclass banding too coarse on some sets | Measure more sets first | unknown | open |
-| PF-07 | Multiclass graduation over-smoothing (fr_instal), held off only by the brake's scale | Investigate | unknown | open |
-| PF-08 | GCV at the grid ceiling (Prudential lead) | A unit-free rule, validated on fresh splits | none expected | open |
+| PF-06 | Multiclass banding too coarse on some sets | Investigated 2026-10-15: no change until PF-17 is decided; centred noise budget is the lever | small | open |
+| PF-07 | Multiclass graduation over-smoothing (fr_instal), held off only by the brake's scale | Investigated 2026-10-15: no candidate fixes it; decide with PF-06 | none | open |
+| PF-08 | GCV at the grid ceiling (Prudential lead) | The unit-free null-space rule fixes Prudential's live harm; needs its validation list | none expected | open |
 | PF-09 | Graduation's re-anchor overrides `reanchor=False` | Honour it or report it as overridden | small | bug |
 | PF-10 | `graduation_validation_` has no reason when nothing is smoothed | Set `skipped` and `candidate_count` on every path | small | bug |
 | PF-11 | One-bag fits have no honest held-out evidence | Use the early-stopping carve; fold-model σ | medium | open |
@@ -109,6 +109,8 @@ rejected, so they are not tried again.
 | PF-13 | Banding can raise the cell count (densifies factored tables) | Investigate | unknown | open |
 | PF-14 | `test_callback_true_stops_and_exceptions_propagate` is flaky under load | Fix the test | small | bug |
 | PF-15 | Smaller defects and loose ends | See the list | small | mixed |
+| PF-16 | The per-bag rebalance check is optimistic on very small data | Investigate (single bag weaker than the soup) | unknown | open |
+| PF-17 | Multiclass fits stop at the 4,000-tree cap on fr_instal and pg16_fleet | Maintainer: raise or derive the cap; report it at least | 1.5–4× fit time where it binds | decision |
 
 ## PF-01. `band_deviance_cap` bounds an estimate, not the training rise
 
@@ -575,6 +577,50 @@ Before deciding: measure pg17_cover and prudential, and a one-bag cap sweep on p
 then include a tighter multiclass cap, a different per-class split of the cap, or a data-derived
 budget.
 
+### Investigation (2026-10-15)
+
+An agent measured all five multiclass sets (3 splits, Prudential 2) with its own build; results,
+scripts and the experiment hooks are in `repro/post-fit-stages/results/pf06_07/` (`summary.md`,
+`INDEX.txt`; `dumps/` is a regenerable cache and is not committed).
+
+Test cross-entropy change against banding off and graduation off, mean ± SE over splits:
+
+| set | trees reached | banding | graduation, banding off | default (banding + braked graduation) | graduation without the brake, on the banded bank | banding at one bag |
+|---|---|---|---|---|---|---|
+| fr_instal | 8/8 bags at the 4,000 cap | +0.440 ± 0.020 | +0.191 ± 0.037 | +0.440 (brake declines 3/3) | +0.538 ± 0.036 | +0.321 ± 0.014 |
+| pg16_fleet | 8/8 at the cap | +0.142 ± 0.014 | +0.003 | +0.142 | +0.000 | +0.282 ± 0.017 |
+| pg17_cover | early-stopped (321–659) | +0.005 ± 0.003 | −0.009 | +0.008 ± 0.008 | +0.003 | +0.049 ± 0.015 |
+| pg17_instal | early-stopped (244–654) | +0.004 ± 0.003 | −0.014 | −0.016 ± 0.006 | −0.020 | +0.035 ± 0.020 |
+| prudential | early-stopped (816–1,249) | +0.052 ± 0.008 | +0.025 | +0.078 ± 0.038 | +0.026 (brake adopts) | +0.114 ± 0.013 |
+
+Mechanisms:
+
+- **Banding's cost is the first-order term on held-out rows**, and only on the two soups the tree
+  cap cut short (a median 80% of banding's held-out cost there, 4× the second-order term). On the
+  converged sets it is a median 16%: there banding costs about what its budget says.
+- **Not the diagonal curvature** (the true softmax second-order cost is 0.95–1.13× the per-class
+  stand-in) **and not the 1/K split of the cap** (splitting by class curvature mass is worse or
+  mixed). The cost sits in the 3-way tables (+0.71% on fr_instal); the distilled pairs claw back
+  about −0.33%.
+- **One bag:** the cap is the only bound and a 4× tighter cap helps 14 of 14 one-bag fits
+  (−0.122 ± 0.025%) at 1.3–2.2× the cells. Unlike single-output (PF-01) the multiclass one-bag
+  response to the cap is not flat; this is a readability price to decide.
+
+Candidates (paired, same split and seed):
+
+| candidate | result | verdict |
+|---|---|---|
+| Budget the true joint softmax cost | joint and diagonal costs differ by under 13% | rejected |
+| Split the cap by class curvature mass | 8 bags −0.003 ± 0.005 (2 better / 3 worse); 1 bag 5 better / 9 worse | rejected |
+| Cap ×0.5 / ×0.25 | fr_instal −0.175 / −0.282 (3/3) at ×1.57 / ×2.30 cells, but graduation is then adopted with harm: net about 0 | rejected at 8 bags; one-bag price open |
+| Drop the noise budget | pg16_fleet +0.194 ± 0.028 | rejected |
+| **Centred noise budget** (each class's bag noise with the softmax-common part removed) | −0.030 ± 0.011 over 14 set-splits (10 better / 4 worse); fr_instal −0.102 ± 0.010 (3/3) at ×1.22 cells; pg16_fleet −0.036 (3/3) at ×1.14; pg17_cover +0.005 (0/3) at ×1.32; still declined by the brake on fr_instal | best-formed lever, not built: it tightens banding and costs cells where banding is free |
+| Out-of-bag pricing of the first-order term | overstates it about 2× (the deployed tables saw each row) | rejected |
+
+**Recommendation:** no change to banding now. Two of the five sets are cut short by the tree cap
+(PF-17), and at 12,000 trees banding's first-order share falls (4.7→2.7 and 5.6→4.6 on fr_instal,
+4.4→2.8 on pg16_fleet). Decide PF-17 first, then revisit with the centred noise budget.
+
 ## PF-07. Multiclass graduation over-smoothing, held off only by scale
 
 Ungated, graduation costs fr_instal +0.45% to +0.61% on all four splits (5–7 SE). The 1% check
@@ -598,6 +644,29 @@ What is known:
 Untested idea: graduate before banding. It would keep both stages active on interactions, but
 banding's distil target would become the graduated model, unbanded pairs often exceed the
 2,500-cell joint cap, and multiclass banding runs natively inside `fit_multiclass_pruned`.
+
+### Investigation (2026-10-15)
+
+From the same run (`results/pf06_07/`):
+
+- **GCV removes real class structure.** The harm is the second-order term (first-order about 0):
+  at 12,000 trees the banded bank's graduation costs 0.468% second-order and +0.003% first-order.
+- **Banded axes roughly triple it** (+0.538% on the banded bank, +0.191% unbanded).
+- **About half the unbanded harm sits in tables where GCV picks the top of its alpha grid.** The
+  worst single table is the rare class's DrivAge main effect at alpha 3e4 (+0.065%; an edge cell
+  pulled 1.9 logits). The harm is spread over all classes, not just the rare one.
+- **Ruled out:** the noise scale (GCV's implied cell noise matches the bag noise, median ratio
+  0.89); the softmax-common component (centring it out first: +0.176 ± 0.057 vs +0.191);
+  under-fitting alone (12,000-tree soups are still harmed, +0.50% / +0.29%).
+- **The brake is load-bearing only by accident.** It declines fr_instal (×1.014–1.016) because
+  banding raised the training deviance; on the unbanded bank it adopts the harm (×1.004–1.006),
+  and every banding tightening tested erodes the margin. **PF-06 and PF-07 cannot be decided
+  separately.**
+
+Rejected: one alpha per table across classes (pooled GCV: fr_instal +0.117 vs +0.191 unbanded,
+pg17_cover worse 3/3, adopted at +0.283% at 12,000 trees); known-noise smoothing (+0.229%,
+smooths 243 of 257 tables); graduating before banding (fr_instal +0.163 ± 0.042, adopted 3/3
+where today's default ships 0).
 
 ## PF-08. GCV choices at the grid ceiling (Prudential lead)
 
@@ -640,6 +709,17 @@ Related: the `w_scale` comment in `_graduate_table_model` says row-count GCV ove
 mean weight. GCV picks the same smoother when every weight is scaled by one constant, apart from
 the grid's edges, so `w_scale` only relocates the grid. It does carry the fixed-alpha semantics.
 Fix the comment.
+
+### Progress (2026-10-15)
+
+The unit-free version suggested above (refuse a table whose GCV criterion is lowest at the
+penalty's null space, alpha → ∞) was measured in the PF-06/07 run (`results/pf06_07/null_*`):
+Prudential −0.040% on both splits (+0.056→+0.016%, −0.004→−0.043%), fr_instal unbanded −0.043%,
+pg17_instal worse on 3 of 3 by about 0.008%, single-output −0.005% over 18 fits (6 better /
+3 worse), with 30–95% fewer tables smoothed. Still owed before it ships: the unit test
+(a constant weight multiple and exposure in days vs years leave the smoothed set unchanged),
+per-table reasons in `graduation_report_`, fresh splits (prudential 3+, small sets 10+), the
+weighted and large-exposure sets, and a readability measure.
 
 ## PF-09. Graduation's re-anchor overrides `reanchor=False` (bug)
 
@@ -706,6 +786,40 @@ with the callback; fix the test or make the stop deterministic.
 - Coverage gap across all three investigations: no Tweedie, squared error, real weighted or
   grouped (panel) data in the accuracy evidence; B checked only that those configurations run.
   Monotone fits were checked for B on fremtpl2 (BonusMalus +1): no harm from the repair.
+
+## PF-16. The per-bag rebalance check is optimistic on very small data
+
+Found while measuring PF-03 (`results/pf03.jsonl`). The check's prediction matches the test
+change on every mid-size and large set, but on TIC2000 (9.8k rows, 6% positive) and ussev (6.8k
+rows) it approves re-solves that hurt: +0.27 ± 0.12% and +0.15 ± 0.10% (paired SEs per split
+0.10–0.28%). The likely reason is that a single bag is much weaker than the soup on tiny data, so
+the re-solve helps the bag more than it helps the soup. Deploying the mean of the bags' own
+corrections trims the harm (+0.18%, +0.09%) but gives back a fifth of ausbi's gain; requiring the
+bags to agree does not separate the harmful splits. Ideas not yet tried: judge on the out-of-bag
+jury mean rather than single bags; let the check choose a step on single-output fits too.
+
+## PF-17. Multiclass fits stop at the tree cap (decision)
+
+Found by the PF-06/07 run (`results/pf06_07/summary.md`, "Convergence"). On fr_instal and
+pg16_fleet every bag is still improving at round 4,000, the default `n_trees` (best rounds
+3,746–4,000), while pg17_cover, pg17_instal and prudential early-stop at 244–1,249 and the
+single-output sets at 12–562. It is not specific to the softmax: a binary one-vs-rest fit on
+fr_instal also reaches the cap in half its bags.
+
+At 12,000 trees the shipped default improves by −4.49% / −3.34% test cross-entropy on fr_instal
+(splits 0/1) and −0.67% on pg16_fleet (one split), at 1.5–4× the fit time (fr_instal 466 s vs
+107–177 s; banding 227 s vs 40 s on a 723k-cell bank). Even 12,000 trees leaves 6 and 3 of
+fr_instal's 8 bags at the cap.
+
+Two things are wrong today, and only the second is a judgement call:
+
+1. **Nobody is told.** A multiclass fit has no boosting report (`n_trees_per_bag_` and
+   `stopping_reason_` are `None`), so a fit cut short by the cap looks like any other. At the
+   least it should report its rounds and stop reasons, and warn when bags stop at the cap.
+2. **The cap decides the model** on these sets. Options: raise the default cap for multiclass,
+   derive it from the data (keep boosting while the early-stopping deviance still improves, up to a
+   time or size budget), or raise the learning rate when the cap binds (not measured). The
+   fit-time cost is the price.
 
 ## Order of work (suggested)
 

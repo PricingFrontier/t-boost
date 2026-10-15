@@ -1,0 +1,47 @@
+=== 09:19:08 band pg16_fleet 0 8 "" nt12k '{"n_trees": 12000}'
+[mc-es] trained_rounds=4246 best_round=3746 kept_rounds=3746
+[mc-es] trained_rounds=6683 best_round=6183 kept_rounds=6183
+[mc-es] trained_rounds=7135 best_round=6635 kept_rounds=6635
+[mc-es] trained_rounds=8995 best_round=8495 kept_rounds=8495
+[mc-es] trained_rounds=8917 best_round=8417 kept_rounds=8417
+[mc-es] trained_rounds=9426 best_round=8926 kept_rounds=8926
+[mc-es] trained_rounds=9939 best_round=9439 kept_rounds=9439
+[mc-es] trained_rounds=11201 best_round=10701 kept_rounds=10701
+[mc-prune] deploy_fit 103.94s
+[mc-prune] ranked_path 1.26s
+[mc-prune] keepset_apply 11.06s
+[mc-prune] banding 63.25s
+pg16_fleet s0 b8       unbanded: test 0.959075 (+0.000% vs U, -0.171% vs ship) cells 7433 first +0.000 joint 0.000 diag 0.000
+pg16_fleet s0 b8        shipped: test 0.960719 (+0.171% vs U, +0.000% vs ship) cells 44276 first +0.126 joint 0.045 diag 0.043
+noise {'dataset': 'pg16_fleet', 'split': 0, 'n_bags': 8, 'variant': '_noise', 'tag': 'nt12k', 'sigma_shipped': [0.05051683249491387, 0.05603002418368439, 0.055436621057507664], 'sigma_raw': [0.050516832494913906, 0.0560300241836843, 0.05543662105750786], 'sigma_centred': [0.03746553649376067, 0.0463103468974701, 0.04128935198967241], 'joint_over_diag_noise': 0.8614934155078046}
+=== 09:22:38 done 0
+=== 09:22:38 grad pg16_fleet 0 8 B,U shipped,shared_h nt12k
+pg16_fleet s0 b8      shipped    shipped: d_test -0.013% train x1.0002 smoothed 26 [10, 6, 10] ceiling 23 per-class [-0.014, -0.01, 0.008]
+pg16_fleet s0 b8      shipped   shared_h: d_test -0.034% train x1.0002 smoothed 29 [10, 9, 10] ceiling 23 per-class []
+pg16_fleet s0 b8     unbanded    shipped: d_test -0.005% train x1.0002 smoothed 28 [10, 7, 11] ceiling 23 per-class [-0.013, -0.009, 0.014]
+pg16_fleet s0 b8     unbanded   shared_h: d_test -0.023% train x1.0002 smoothed 33 [11, 11, 11] ceiling 24 per-class []
+=== 09:26:49 done 0
+=== 09:26:49 band fr_instal 1 8 "" nt12k '{"n_trees": 12000}'
+[mc-es] trained_rounds=6045 best_round=5545 kept_rounds=5545
+[mc-es] trained_rounds=8002 best_round=7502 kept_rounds=7502
+[mc-es] trained_rounds=9121 best_round=8621 kept_rounds=8621
+[mc-es] trained_rounds=10372 best_round=9872 kept_rounds=9872
+[mc-es] trained_rounds=10679 best_round=10179 kept_rounds=10179
+[mc-es] trained_rounds=12000 best_round=11941 kept_rounds=11941
+[mc-es] trained_rounds=12000 best_round=11962 kept_rounds=11962
+[mc-es] trained_rounds=12000 best_round=11960 kept_rounds=11960
+[mc-prune] deploy_fit 115.41s
+[mc-prune] ranked_path 1.41s
+[mc-prune] keepset_apply 12.32s
+[mc-prune] banding 155.45s
+fr_instal s1 b8       unbanded: test 0.812749 (+0.000% vs U, -0.402% vs ship) cells 107911 first +0.000 joint 0.000 diag 0.000
+fr_instal s1 b8        shipped: test 0.816033 (+0.404% vs U, +0.000% vs ship) cells 616616 first +0.331 joint 0.072 diag 0.066
+noise {'dataset': 'fr_instal', 'split': 1, 'n_bags': 8, 'variant': '_noise', 'tag': 'nt12k', 'sigma_shipped': [0.09764142196025039, 0.08807588112846074, 0.24910901784633435, 0.15728321058989506], 'sigma_raw': [0.09764142196025022, 0.08807588112846078, 0.24910901784633455, 0.15728321058989517], 'sigma_centred': [0.07717875955664996, 0.06388057449268883, 0.2108660929076463, 0.13532990216051874], 'joint_over_diag_noise': 0.8954193029347336}
+=== 09:32:18 done 0
+=== 09:32:18 grad fr_instal 1 8 B,U shipped,shared_h nt12k
+fr_instal s1 b8      shipped    shipped: d_test +0.285% train x1.0110 smoothed 142 [38, 41, 34, 29] ceiling 18 per-class [0.09, 0.074, 0.054, 0.024]
+fr_instal s1 b8      shipped   shared_h: d_test +0.186% train x1.0087 smoothed 158 [39, 40, 40, 39] ceiling 12 per-class []
+fr_instal s1 b8     unbanded    shipped: d_test +0.109% train x1.0042 smoothed 64 [14, 19, 14, 17] ceiling 8 per-class [-0.005, 0.049, 0.038, 0.007]
+fr_instal s1 b8     unbanded   shared_h: d_test +0.094% train x1.0030 smoothed 64 [16, 16, 16, 16] ceiling 4 per-class []
+=== 09:36:45 done 0
+=== 09:36:45 band pg16_fleet 1 8 capx0.5,capx0.25,mass

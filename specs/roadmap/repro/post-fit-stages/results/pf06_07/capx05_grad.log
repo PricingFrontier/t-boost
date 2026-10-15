@@ -1,0 +1,4 @@
+fr_instal s0 b8 band_capx0.5    shipped: d_test +0.420% train x1.0095 smoothed 150 [41, 41, 37, 31] ceiling 17 per-class [0.061, 0.126, 0.176, 0.03]
+fr_instal s1 b8 band_capx0.5    shipped: d_test +0.321% train x1.0091 smoothed 166 [39, 46, 42, 39] ceiling 21 per-class [0.101, 0.098, 0.076, 0.023]
+fr_instal s2 b8 band_capx0.5    shipped: d_test +0.461% train x1.0114 smoothed 153 [35, 46, 39, 33] ceiling 15 per-class [0.066, 0.223, 0.085, 0.059]
+CAPX05 DONE

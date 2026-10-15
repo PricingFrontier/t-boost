@@ -1,0 +1,23 @@
+band pg16_fleet 0 8 "" nt12k '{"n_trees": 12000}'
+grad pg16_fleet 0 8 B,U shipped,shared_h nt12k
+band fr_instal 1 8 "" nt12k '{"n_trees": 12000}'
+grad fr_instal 1 8 B,U shipped,shared_h nt12k
+band pg16_fleet 1 8 capx0.5,capx0.25,mass
+grad pg16_fleet 1 8 B,U,band_capx0.25 shipped,shared_h
+band pg16_fleet 2 8 capx0.5,capx0.25,mass
+grad pg16_fleet 2 8 B,U,band_capx0.25 shipped,shared_h
+band pg17_instal 0 8 capx0.5,capx0.25,mass
+grad pg17_instal 0 8 B,U,band_capx0.25 shipped,shared_h
+band pg17_instal 1 8 capx0.5,capx0.25,mass
+grad pg17_instal 1 8 B,U,band_capx0.25 shipped,shared_h
+band pg17_instal 2 8 capx0.5,capx0.25,mass
+grad pg17_instal 2 8 B,U,band_capx0.25 shipped,shared_h
+band prudential 1 8 capx0.5,capx0.25,mass
+grad prudential 1 8 B,U,band_capx0.25 shipped,shared_h
+band pg16_fleet 0 1 capx0.5,capx0.25,mass
+band pg16_fleet 1 1 capx0.5,capx0.25,mass
+band pg16_fleet 2 1 capx0.5,capx0.25,mass
+band pg17_instal 0 1 capx0.5,capx0.25,mass
+band pg17_instal 1 1 capx0.5,capx0.25,mass
+band pg17_instal 2 1 capx0.5,capx0.25,mass
+band prudential 1 1 capx0.5,capx0.25,mass

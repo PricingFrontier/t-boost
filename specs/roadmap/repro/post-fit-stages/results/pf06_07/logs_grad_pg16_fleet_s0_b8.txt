@@ -1,0 +1,6 @@
+pg16_fleet s0 b8      shipped    shipped: d_test -0.002% train x1.0002 smoothed 24 [8, 5, 11] ceiling 23 per-class [-0.009, -0.009, 0.014]
+pg16_fleet s0 b8      shipped   shared_h: d_test -0.017% train x1.0002 smoothed 31 [11, 9, 11] ceiling 22 per-class []
+pg16_fleet s0 b8     unbanded    shipped: d_test +0.001% train x1.0002 smoothed 28 [8, 8, 12] ceiling 23 per-class [-0.008, -0.007, 0.014]
+pg16_fleet s0 b8     unbanded   shared_h: d_test -0.013% train x1.0002 smoothed 33 [11, 11, 11] ceiling 24 per-class []
+pg16_fleet s0 b8 gfirst    shipped: d_test vs band-only +0.003% (gated +0.003%) train x1.0002 smoothed 28 cells 35723 -> 35957
+pg16_fleet s0 b8 gfirst   shared_h: d_test vs band-only -0.002% (gated -0.002%) train x1.0002 smoothed 33 cells 35723 -> 35939

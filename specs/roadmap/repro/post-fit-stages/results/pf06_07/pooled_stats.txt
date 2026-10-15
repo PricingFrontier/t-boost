@@ -1,0 +1,16 @@
+all: 134 moves
+  joint/diag test: median 1.047, range 0.946-1.127
+  first-order share of the realized cost (cost > 0.02%): median 0.73, range -1.93-0.90 over 93
+  first / joint second-order: median 0.72, range -1.31-8.53
+truncated soups (fr_instal, pg16_fleet; 4000 trees): 58 moves
+  joint/diag test: median 1.058, range 0.946-1.115
+  first-order share of the realized cost (cost > 0.02%): median 0.80, range 0.58-0.90 over 58
+  first / joint second-order: median 4.03, range 1.38-8.53
+12000-tree soups: 3 moves
+  joint/diag test: median 1.098, range 1.056-1.101
+  first-order share of the realized cost (cost > 0.02%): median 0.74, range 0.73-0.82 over 3
+  first / joint second-order: median 2.81, range 2.73-4.58
+converged soups (pg17_cover, pg17_instal, prudential): 72 moves
+  joint/diag test: median 1.026, range 0.999-1.127
+  first-order share of the realized cost (cost > 0.02%): median 0.16, range -1.93-0.43 over 31
+  first / joint second-order: median -0.12, range -1.31-1.20
