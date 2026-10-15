@@ -376,16 +376,3 @@ def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
         defaults = cls.__init__.__kwdefaults__
         monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)
-
-
-def test_validation_fraction_is_reported_only_when_set_with_an_eval_set(data):
-    # The default validation_fraction is unused when eval_set supplies the early-stopping rows;
-    # only a value the caller set is INERT. A default eval_set fit passes check_bindings.
-    X, y = data
-    Xe, ye = X.iloc[:200], y[:200]
-    m = _mk(n_trees=40).fit(X, y, eval_set=(Xe, ye))
-    assert not [r for r in m.binding_report_ if r["param"] == "validation_fraction"]
-    m.check_bindings()
-    m = _mk(n_trees=40, validation_fraction=0.2).fit(X, y, eval_set=(Xe, ye))
-    row = next(r for r in m.binding_report_ if r["param"] == "validation_fraction")
-    assert (row["status"], row["overridden_by"]) == ("INERT", "eval_set")

@@ -712,8 +712,7 @@ def test_audit_binary_classifier_warns_when_a_parameter_has_no_effect():
 def test_audit_a_callback_keeps_the_group_holdout_of_an_unpruned_fit():
     # With `prune=False` and groups, a callback made the deploy extras non-empty, which skipped the
     # group-aware early-stopping carve and fell back to a row-level carve that leaks a group's rows
-    # into validation. Only an eval_set replaces the carve, so an observer that never stops the fit
-    # must leave the model byte-identical.
+    # into validation. An observer that never stops the fit must leave the model byte-identical.
     from _artifact import model_bytes
 
     rng = np.random.default_rng(0)

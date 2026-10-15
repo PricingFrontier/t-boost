@@ -1397,8 +1397,7 @@ fn fit_single(
     }
 
     let mut f0_eff = f64::from(f0_f32);
-    // An external evaluation holdout only scores early stopping: it never fits the slope.
-    if config.boosters.reanchor_slope && !control.external_holdout {
+    if config.boosters.reanchor_slope {
         if let Some(val_rows) = validation_rows.as_deref() {
             if let Some((a, b)) =
                 fit_affine_reanchor(spec.loss, y, &raw, weight, offset.as_deref(), val_rows)?
@@ -1440,14 +1439,7 @@ fn fit_single(
         }
     }
     let f0_model = {
-        let shifted = if config.boosters.reanchor && control.external_holdout {
-            // The intercept re-anchors on the training rows only: an external evaluation
-            // holdout's targets must not reach the model.
-            let train_y = gather_rows(y, &train_rows)?;
-            let train_w = gather_rows(weight, &train_rows)?;
-            let train_raw = gather_rows(&raw, &train_rows)?;
-            f0_eff + reanchor_delta(spec.loss.link(), &train_y, &train_w, &train_raw, None)?
-        } else if config.boosters.reanchor {
+        let shifted = if config.boosters.reanchor {
             f0_eff + reanchor_delta(spec.loss.link(), y, weight, &raw, None)?
         } else {
             f0_eff

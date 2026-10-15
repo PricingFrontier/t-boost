@@ -91,7 +91,6 @@ _FIT_REPORT_ATTRS = (
     "n_trees_",
     "stopping_reason_",
     "evals_result_",
-    "_fit_eval_set_",
 )
 
 
@@ -2494,14 +2493,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 how = "the trees enforce the signs; the full table bank is monotone as fitted"
             add("monotone_constraints", "HONOURED", how)
 
-        # Only when set away from its default, like every other row (the default 0.1 is simply
-        # unused when eval_set supplies the rows; reporting it made every eval_set fit fail
-        # check_bindings).
-        if (getattr(self, "_fit_eval_set_", False) and self.validation_fraction is not None
-                and self.validation_fraction != defaults.get("validation_fraction")):
-            add("validation_fraction", "INERT",
-                "eval_set supplied the early-stopping rows, so no holdout was carved", "eval_set")
-
         # A fixed graduation strength the training-deviance check declined: the tables were
         # deployed as fitted. (Under GCV-chosen strengths a decline is reported, not a binding.)
         graduation = getattr(self, "graduation_validation_", None) or {}
@@ -3384,9 +3375,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         """Return the model report: fit quality, structure, pruning evidence, rating tables,
         A/E by factor level, drift and review flags, as plain JSON (``report_version`` 2).
 
-        ``X``/``y`` are the train data; ``eval_set`` adds the test data as one ``(X, y)`` pair
-        (the ``fit`` convention), or validation and test data as a list of two pairs, with the
-        ``eval_*`` vectors as lists to match. The bags early-stop and prune on rows they hold
+        ``X``/``y`` are the train data; ``eval_set`` adds the test data as one ``(X, y)`` pair,
+        or validation and test data as a list of two pairs, with the ``eval_*`` vectors as
+        lists to match. The bags early-stop and prune on rows they hold
         back, so train and test are the usual pair. ``labels`` names the datasets in that order:
         ``("train", "test")`` or ``("train", "validation", "test")`` by default.
         Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``. ``thresholds`` overrides the review thresholds
@@ -3456,7 +3447,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         disable_cell_refit: bool = False,
         early_stopping_rounds_override: int | None = None,
         fit_pool_width: int | None = None,
-        external_eval: bool = False,
     ) -> _Booster:
         # `n_bags` override lets the v2-prune CV fit cheap single-bag fold models (structure, not
         # variance-reduction, drives table selection) while the deployed model keeps its full bagging.
@@ -3489,10 +3479,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         reanchor_slope = self.reanchor_slope
         if reanchor_slope is None:
             reanchor_slope = obj in {"poisson", "gamma", "tweedie"}
-        if external_eval:
-            # The slope recalibration fits on the stopping holdout, and an `eval_set` must only
-            # score early stopping (an explicit True was refused in `_stage_fit_extras`).
-            reanchor_slope = False
         # path_smooth `None` resolves objective-aware (2026-07-23): heavy-tail gamma/tweedie
         # deviance is dominated by sparse-evidence cell variance, and the parent-shrinkage
         # credibility blend is the zero-cost smoother for exactly that (6-set screen:
@@ -3605,49 +3591,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             fit_pool_width=fit_pool_width,
         )
 
-    def _stage_fit_extras(
-        self,
-        eval_set: Any,
-        eval_sample_weight: Any,
-        eval_exposure: Any,
-        callbacks: Any,
-        has_exposure: bool,
-        eval_offset: Any = None,
-        has_offset: bool = False,
-    ) -> None:
-        """Validate and stash the fit's `eval_set` / `callbacks` for the deployed fit. The
-        stash lives only for the duration of `fit` (see `_fit_with_extras`)."""
+    def _stage_fit_extras(self, callbacks: Any) -> None:
+        """Validate and stash the fit's `callbacks` for the deployed fit. The stash lives only
+        for the duration of `fit` (see `_fit_with_extras`)."""
         extras: dict[str, Any] = {}
-        if eval_set is not None:
-            if not isinstance(eval_set, (tuple, list)) or len(eval_set) != 2:
-                raise ValueError("eval_set must be an (X_val, y_val) pair")
-            if self.reanchor_slope is True:
-                raise ValueError(
-                    "reanchor_slope=True cannot be combined with eval_set: the slope "
-                    "recalibration fits on the early-stopping rows, and eval_set rows may only "
-                    "score early stopping. Leave reanchor_slope at None."
-                )
-            x_val, vectors = self._resolve_fit_vectors(
-                eval_set[0],
-                {
-                    "y": eval_set[1], "sample_weight": eval_sample_weight,
-                    "exposure": eval_exposure, "offset": eval_offset,
-                },
-            )
-            if vectors["y"] is None:
-                raise ValueError("eval_set needs a target: (X_val, y_val)")
-            if has_exposure and vectors["exposure"] is None:
-                raise ValueError("the fit rows have exposure, so eval_exposure is required")
-            if not has_exposure and vectors["exposure"] is not None:
-                raise ValueError("eval_exposure needs exposure on the fit rows too")
-            if has_offset != (vectors["offset"] is not None):
-                raise ValueError("offset and eval_offset must be given together")
-            extras["eval"] = (
-                x_val, vectors["y"], vectors["sample_weight"], vectors["exposure"],
-                vectors["offset"],
-            )
-        elif eval_sample_weight is not None or eval_exposure is not None or eval_offset is not None:
-            raise ValueError("eval_sample_weight, eval_exposure and eval_offset need eval_set")
         if callbacks is not None:
             funcs = [callbacks] if callable(callbacks) else list(callbacks)
             if not all(callable(f) for f in funcs):
@@ -3655,64 +3602,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if funcs:
                 extras["callbacks"] = funcs
         self._fit_extras_ = extras
-
-    def _eval_target(self, y: Any) -> np.ndarray:
-        return _as_float32_1d(y, "eval y")
-
-    def _eval_design(
-        self, evals: tuple[Any, Any, Any, Any, Any], cat_idx: list[int],
-        feature_names: list[str] | None, n_features: int, fit_cats: Any = None,
-    ) -> dict[str, Any]:
-        """The `eval_set` rows laid out exactly as the fit design (same columns, same
-        categorical split), for the native fit's `eval_*` arguments."""
-        x_val, y_val, w_val, e_val, o_val = evals
-        _reject_sparse(x_val)
-        x_val = collect_frame(x_val)
-        if is_polars_eager(x_val) and feature_names is not None:
-            x_val = select_feature_columns(x_val, feature_names)
-        if _n_columns(x_val) != n_features:
-            raise ValueError(
-                f"eval_set X has {_n_columns(x_val)} features but X has {n_features}"
-            )
-        xv32, cat_v, _ = self._split_columns(x_val, cat_idx, feature_names)
-        if getattr(self, "unknown_category", "rare") == "error" and cat_v:
-            # The model does not exist yet, so the fit rows' own labels are the known set.
-            for pos, fit_col, val_col in zip(cat_idx, fit_cats or [], cat_v):
-                known = set(fit_col)
-                unseen = [v for v in dict.fromkeys(val_col)
-                          if v != _CAT_MISSING and v not in known][:5]
-                if unseen:
-                    name = feature_names[pos] if feature_names else f"f{pos}"
-                    raise ValueError(
-                        f"eval_set feature {name!r} has categorical value(s) the fit never "
-                        f"saw: {', '.join(map(repr, unseen))} (unknown_category='error')"
-                    )
-        n = int(xv32.shape[0])
-        if n == 0:
-            raise ValueError("eval_set has 0 rows")
-        out: dict[str, Any] = {
-            "eval_x": xv32,
-            "eval_y": np.ascontiguousarray(self._eval_target(y_val)),
-            "eval_cat_x": cat_v,
-        }
-        for key, value, name in (
-            ("eval_weight", w_val, "eval_sample_weight"),
-            ("eval_exposure", e_val, "eval_exposure"),
-        ):
-            if value is not None:
-                out[key] = np.ascontiguousarray(_as_float32_1d(value, name))
-        for key in ("eval_y", "eval_weight", "eval_exposure"):
-            if key in out and out[key].shape[0] != n:
-                raise ValueError(f"{key} has {out[key].shape[0]} rows but eval_set X has {n}")
-        if "eval_weight" in out and float(np.sum(out["eval_weight"])) <= 0.0:
-            raise ValueError("eval_sample_weight sums to zero")
-        if o_val is not None:
-            out["eval_y"], exposure = self._apply_offset(
-                out["eval_y"], out.get("eval_exposure"), _offset_array(o_val, n, "eval_offset")
-            )
-            if exposure is not None:
-                out["eval_exposure"] = exposure
-        return out
 
     def _apply_offset(
         self, y32: np.ndarray, exposure32: np.ndarray | None, offset: np.ndarray
@@ -3743,13 +3632,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._clear_fit_counts()
             return
         self._set_fit_counts([int(r[0]) for r in report], [str(r[2]) for r in report])
-        deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
-        if deploy.get("record_history"):
-            result: dict[str, dict[str, list[list[float]]]] = {}
-            if any(r[3] for r in report):
-                result["train"] = {"deviance": [list(r[3]) for r in report]}
-            if any(r[4] for r in report):
-                result["eval"] = {"deviance": [list(r[4]) for r in report]}
+        result: dict[str, dict[str, list[list[float]]]] = {}
+        if any(r[3] for r in report):
+            result["train"] = {"deviance": [list(r[3]) for r in report]}
+        if any(r[4] for r in report):
+            result["eval"] = {"deviance": [list(r[4]) for r in report]}
+        if result:
             self.evals_result_ = result
         else:
             self.__dict__.pop("evals_result_", None)
@@ -3810,20 +3698,15 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         y32 = _as_float32_1d(y, "y")
         if x32.shape[0] != y32.shape[0]:
             raise ValueError(f"X has {x32.shape[0]} rows but y has {y32.shape[0]}")
-        extras = self.__dict__.get("_fit_extras_") or {}
-        deploy: dict[str, Any] = {}
-        if "eval" in extras:
-            deploy.update(
-                self._eval_design(extras["eval"], cat_idx, feature_names, n_features, cat_x)
-            )
-            if getattr(self, "unknown_category", "rare") == "rare":
-                deploy["eval_unseen_rare"] = True
+        # The staged dict itself (an empty one too): the pruned path reads `deploy` back from it.
+        extras = self.__dict__.setdefault("_fit_extras_", {})
+        # Every live fit keeps each bag's per-round deviance on its early-stopping rows: the
+        # stopping rule computes it anyway, so it costs nothing, and the model report draws the
+        # training curve from it (`evals_result_`, never saved with the model).
+        deploy: dict[str, Any] = {"record_history": True}
         if "callbacks" in extras:
             deploy["observer"] = _round_observer(extras["callbacks"], int(self.n_bags))
-        if deploy:
-            deploy["record_history"] = True
         extras["deploy"] = deploy
-        self._fit_eval_set_ = "eval" in extras
         if x32.shape[0] == 0:
             raise ValueError("X has 0 samples; need at least 1 row to fit")
         weight32 = None
@@ -3902,9 +3785,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         if monotone is not None and any(monotone) and self.cell_refit_base is not None:
             raise ValueError("cell_refit_base cannot preserve monotone_constraints; leave it unset")
-        booster = self._new_booster(
-            fit_pool_width=self._default_fit_pool(n_features), external_eval="eval_x" in deploy
-        )
+        booster = self._new_booster(fit_pool_width=self._default_fit_pool(n_features))
         model: _Model | _TableModel
         self._validate_box_budget_reachable()
         if self.prune:
@@ -3922,9 +3803,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         else:
             es_holdout: list[bool] | None = None
-            # An eval_set replaces the carve; a callback alone does not (it only adds an observer).
-            if (groups_arr is not None and self.validation_fraction is not None
-                    and "eval_x" not in deploy):
+            if groups_arr is not None and self.validation_fraction is not None:
                 seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
                 es_holdout = _carve_group_holdout(
                     groups_arr, float(self.validation_fraction), [seed, 1]
@@ -4348,7 +4227,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         deploy_es_holdout: list[bool] | None = None
         fold_es_holdout: list[bool] | None = None
         deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
-        if self.validation_fraction is not None and groups_arr is not None and "eval_x" not in deploy:
+        if self.validation_fraction is not None and groups_arr is not None:
             # ES-runaway fix #2 (2026-07-20): on high-zero-mass Poisson/Tweedie panels an
             # unstratified group-honest carve can land almost entirely on zero-event groups —
             # the group-carve analog of the row-level bug es_strata_for_loss fixes (native
@@ -6055,7 +5934,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
         level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        feature and up to five unseen values. A null
         is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
         value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
         :meth:`unseen_values` counts the unseen ones.
@@ -6617,10 +6496,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
         *,
         offset: Any | None = None,
-        eval_set: tuple[Any, Any] | None = None,
-        eval_sample_weight: Any | None = None,
-        eval_exposure: Any | None = None,
-        eval_offset: Any | None = None,
         callbacks: Any | None = None,
     ) -> "TBoostRegressor":
         """Fit the boosted ensemble.
@@ -6672,16 +6547,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             and like exposure there it also scales the row's mass in the tables' reference
             measure and ``support``. Scoring adds it only when passed again (``offset=`` on
             the ``predict*`` methods); omitted, a row scores on a zero offset.
-        eval_set : (X_val, y_val), optional
-            Rows that only score early stopping: every bag stops at its own best round on
-            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
-            they never reach training, the intercept, the cell refit, the tables or pruning.
-            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
-            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
-        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
-            The evaluation rows' weight, exposure and offset (``str`` names a column of
-            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
-            ``eval_offset`` when ``offset`` is.
         callbacks : callable or list of callables, optional
             Each called after every boosting round of the deployed fit with a dict:
             ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
@@ -6703,11 +6568,12 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
         ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
         boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
-        ``evals_result_`` holds each bag's per-round mean deviances:
-        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
-        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
-        is an extra pass per round, so it is computed only when ``callbacks`` are given.
+        model saved before 0.7.0. ``evals_result_`` holds each bag's per-round mean deviance on
+        the rows it set aside for early stopping (``validation_fraction``), ``{"eval":
+        {"deviance": [[...], ...]}}``, which the stopping rule computes anyway; with
+        ``callbacks`` it also holds ``"train"``, the deviance on the bag's training rows (an
+        extra pass per round). It is kept on the live fit only, not saved with the model, and is
+        absent when there is neither (``validation_fraction=None`` without ``callbacks``).
 
         Returns
         -------
@@ -6731,11 +6597,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             },
         )
         self._record_column_specs(y, sample_weight, exposure, groups)
-        self._stage_fit_extras(
-            eval_set, eval_sample_weight, eval_exposure, callbacks,
-            has_exposure=resolved["exposure"] is not None,
-            eval_offset=eval_offset, has_offset=resolved["offset"] is not None,
-        )
+        self._stage_fit_extras(callbacks)
         try:
             self._fit_model(
                 X,
@@ -7387,7 +7249,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
         level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        feature and up to five unseen values. A null
         is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
         value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
         :meth:`unseen_values` counts the unseen ones.
@@ -8194,10 +8056,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
         *,
         offset: Any | None = None,
-        eval_set: tuple[Any, Any] | None = None,
-        eval_sample_weight: Any | None = None,
-        eval_exposure: Any | None = None,
-        eval_offset: Any | None = None,
         callbacks: Any | None = None,
     ) -> "TBoostClassifier":
         """Fit the boosted ensemble.
@@ -8250,16 +8108,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             and like exposure there it also scales the row's mass in the tables' reference
             measure and ``support``. Scoring adds it only when passed again (``offset=`` on
             the ``predict*`` methods); omitted, a row scores on a zero offset.
-        eval_set : (X_val, y_val), optional
-            Rows that only score early stopping: every bag stops at its own best round on
-            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
-            they never reach training, the intercept, the cell refit, the tables or pruning.
-            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
-            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
-        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
-            The evaluation rows' weight, exposure and offset (``str`` names a column of
-            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
-            ``eval_offset`` when ``offset`` is.
         callbacks : callable or list of callables, optional
             Each called after every boosting round of the deployed fit with a dict:
             ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
@@ -8283,11 +8131,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         (K>=3) fit a boosting round grows one tree per class, so the counts are rounds, which
         ``n_trees`` caps. They describe the boosting, before pruning, and survive
         ``to_bytes``/``to_json``; they are ``None`` for a model saved before 0.7.0 (a multiclass
-        one before 0.9.1). With ``eval_set`` or ``callbacks``,
-        ``evals_result_`` holds each bag's per-round mean deviances:
-        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
-        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
-        is an extra pass per round, so it is computed only when ``callbacks`` are given.
+        one before 0.9.1). On a binary fit ``evals_result_`` holds each bag's per-round mean
+        deviance on the rows it set aside for early stopping (``validation_fraction``),
+        ``{"eval": {"deviance": [[...], ...]}}``, which the stopping rule computes anyway; with
+        ``callbacks`` it also holds ``"train"``, the deviance on the bag's training rows (an
+        extra pass per round). It is kept on the live fit only, not saved with the model, and is
+        absent when there is neither (``validation_fraction=None`` without ``callbacks``) and on
+        a multiclass fit, which records no per-round history.
 
         Returns
         -------
@@ -8339,11 +8189,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             # Binary stays on the exact logistic single-model path (unchanged wire format/behavior).
             self._multi_model = None
             y01 = (y_arr == classes[1]).astype(np.float32, copy=False)
-            self._stage_fit_extras(
-                eval_set, eval_sample_weight, eval_exposure, callbacks,
-                has_exposure=exposure is not None,
-                eval_offset=eval_offset, has_offset=offset is not None,
-            )
+            self._stage_fit_extras(callbacks)
             try:
                 self._fit_model(
                     X,
@@ -8359,9 +8205,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             self._warn_voided_params()
             return self
         # K >= 3: native-softmax (multinomial) multiclass path.
-        if eval_set is not None or callbacks is not None or offset is not None:
+        if callbacks is not None or offset is not None:
             raise ValueError(
-                "eval_set, callbacks and offset support regression and binary classification only"
+                "callbacks and offset support regression and binary classification only"
             )
         if exposure is not None:
             raise ValueError("exposure is not supported for multiclass (K >= 3) classification")
@@ -8371,14 +8217,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # the prune report and the deployed artifact. OVERRIDDEN only — see the method.
         self._warn_voided_params()
         return self
-
-    def _eval_target(self, y: Any) -> np.ndarray:
-        labels = np.asarray(y)
-        if labels.ndim == 2 and labels.shape[1] == 1:
-            labels = labels[:, 0]
-        if labels.ndim != 1 or not np.all(np.isin(labels, self.classes_)):
-            raise ValueError("eval_set y must hold only the class labels seen in y")
-        return cast(np.ndarray, (labels == self.classes_[1]).astype(np.float32))
 
     def _fit_multiclass(
         self,

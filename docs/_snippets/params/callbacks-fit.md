@@ -17,7 +17,7 @@ arrive in order, all on the calling thread. A true return value stops that bag (
 dictionary) after the iteration, just as early stopping stops each bag at its own iteration
 (`stopping_reason_per_bag_` is then `"callback"`). To stop the whole training, return a true
 value for every bag. A function that decides from the dictionary alone stops the same bags at the
-same iterations on every run. An exception stops the training and is raised from `fit`. The
+same iterations on every run. An exception stops the training and is raised from `fit`. Both
 deviances of every iteration are kept in `evals_result_`.
 
 **Possible types**

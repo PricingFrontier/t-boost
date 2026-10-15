@@ -977,23 +977,8 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                            "train data only: every metric is in-sample. Pass test data as "
                            "eval_set for out-of-sample evidence",
                            dataset=datasets[0]["label"]))
-    # Train and test need no note: the bags early-stop and prune on rows they hold back. A fit
-    # that early-stopped on an eval_set gets an info note, not a warning: the report cannot tell
-    # whether that eval_set is one of these datasets, and stopping on (say) a later period while
-    # reporting on a separate test set is a sound workflow that a warning would flag.
-    if len(datasets) == 2 and report["fit"]["early_stopping"]["eval_set"]:
-        flags.append(_flag(
-            "holdout_data", "info",
-            f"the fit early-stopped on an eval_set: if {datasets[1]['label']} is that data, its "
-            "metrics are not fully out-of-sample",
-            dataset=datasets[1]["label"]))
-    elif len(datasets) == 3 and report["fit"]["early_stopping"]["eval_set"]:
-        flags.append(_flag(
-            "holdout_data", "info",
-            f"the fit early-stopped on an eval_set: if that was {datasets[1]['label']}, its "
-            f"metrics are not fully out-of-sample; {datasets[2]['label']} is the independent "
-            "estimate",
-            dataset=datasets[1]["label"]))
+    # Train and test need no note: the bags early-stop and prune on rows they hold back, so
+    # the fit never sees the test data.
     train = datasets[0]
     first = None if train.get("error") else train["metrics"]["deviance_explained"]
     for ds in datasets[1:]:
@@ -1234,6 +1219,13 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
     loaded_or_multi = ("not recorded with this model (a multiclass model saved before 0.9.1)"
                        if multiclass else "not recorded with this model (saved before 0.7.0)")
     history = getattr(est, "evals_result_", None)
+    if multiclass:
+        no_history = "a multiclass fit records no per-round history"
+    elif getattr(est, "validation_fraction", None) is None:
+        no_history = ("early stopping was off (validation_fraction=None), so no per-round "
+                      "deviance was recorded")
+    else:
+        no_history = "the per-round history is kept on the live fit only, not saved with the model"
     pruning = getattr(est, "pruning_report_", None)
     why = ("" if pruning is not None
            else "the pruning report was not stored with this model (saved before it was)")
@@ -1249,9 +1241,7 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
         "stopping_reason": _available(getattr(est, "stopping_reason_", None), loaded_or_multi),
         "stopping_reason_per_bag": _available(
             getattr(est, "stopping_reason_per_bag_", None), loaded_or_multi),
-        "evals_result": _available(
-            history, "the per-round history is recorded only on a live fit with eval_set or "
-            "callbacks, and is not saved with the model"),
+        "evals_result": _available(history, no_history),
         "pruning": _available(pruning, why),
         "graduation": _available(getattr(est, "graduation_validation_", None),
                                  "no graduation diagnostics recorded"),
@@ -1261,7 +1251,6 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
             "stored)"),
         "binding_report": _available(binding, why_b),
         "early_stopping": {
-            "eval_set": bool(getattr(est, "_fit_eval_set_", False)),
             "validation_fraction": _display(getattr(est, "validation_fraction", None)),
             "early_stopping_rounds": _display(getattr(est, "early_stopping_rounds", None)),
         },

@@ -2030,18 +2030,14 @@ pub struct Config {
     /// this: a caller who named a cap gets exactly that cap for the whole fit, gate or no gate.
     /// See [`GatedDeltaStep`] for the signal, the engage semantics, and the evidence.
     pub max_delta_step_gated: GatedStepPolicy,
-    /// Run-time controls that never change what a round computes: an external evaluation
-    /// holdout, per-round history, a round observer. The default is inert (bit-identical).
+    /// Run-time controls that never change what a round computes: per-round history and a
+    /// round observer. The default is inert (bit-identical).
     pub fit_control: FitControl,
 }
 
 /// Run-time controls of a single-output fit ([`Config::fit_control`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FitControl {
-    /// The [`FitSpec::fixed_holdout`] rows are an external evaluation set, not fit rows: they
-    /// only score early stopping. The holdout slope recalibration (`reanchor_slope`) is skipped
-    /// and the intercept re-anchor uses the training rows only.
-    pub external_holdout: bool,
     /// Record each round's stopping deviance in [`BagFitReport`] (and the training deviance
     /// too when an observer is set, which computes it).
     pub record_history: bool,

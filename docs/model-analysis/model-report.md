@@ -28,12 +28,10 @@ The train data is `X`, `y`; `eval_set` adds the test data, or the validation and
 (a list of two pairs), named `train` and `test`, or `train`, `validation` and `test`, unless
 `labels` says otherwise. Train and test are the usual pair: t-boost's bags early-stop and prune
 on objects they hold back, so a model needs no separate validation data. Keep some only to
-early-stop on chosen data (for example the latest period) or to compare settings.
+compare settings.
 
 The report describes the data passed to it; it cannot verify which rows were used to fit the
-model and which were held out. If the model was early-stopped on an `eval_set` passed to `fit`,
-that data is not fully out-of-sample, and the report says so: pass it as the validation data and
-keep a test set for the independent estimate.
+model and which were held out.
 
 All three kinds of model are supported: regression, binary classification and
 multiclassification (one-vs-rest per class, with a class selector on the page). The per-row work
@@ -166,9 +164,9 @@ groups (main effects, kept, below the floor, past the cutoff). The cutoff is the
 first bank reaching `prune_path_fraction` of the total gain and the first within
 `prune_path_tolerance` of the minimum; the floor (`prune_min_variance_share`) then removes the
 tables below it that no kept table is built on. The pruning report is saved with the model. Then
-the smoothing strength of each table, and the deviance by boosting round with the rounds where
-the bags stopped (the curve is recorded only on a live fit with `eval_set` or callbacks, and is
-not saved with the model).
+the smoothing strength of each table, and the deviance on each bag's early-stopping objects by
+boosting round, with each bag's best round (the curves are kept on the trained model only: they
+are not saved with the model, and multiclassification records none).
 
 ### Checks {#checks}
 
@@ -182,8 +180,7 @@ team can apply its own:
 - the overall A/E of each dataset (`ae_train`, `ae_validation`, `ae_test`);
 - whether the deviance explained on each later dataset is positive (the model beats a constant);
 - the drop in deviance explained from train to each later dataset (`train_gap`);
-- whether the report has out-of-sample data at all, and whether the fit early-stopped on an
-  `eval_set` (if that is one of the datasets, its metrics are not fully out-of-sample);
+- whether the report has out-of-sample data at all;
 - whether graduation, the smoothing of the tables, was declined (see
   [Graduation settings](../training-parameters/graduation.md));
 - whether any bag reached `n_trees` without [early stopping](../algorithm/early-stopping.md);

@@ -82,7 +82,6 @@ SETTINGS: dict[str, tuple[dict[str, Any], dict[str, Any]]] = {
     "exposure+weights": ({}, {"exposure": True, "sample_weight": True}),
     "offset": ({}, {"offset": True}),
     "groups": ({}, {"groups": True}),
-    "eval_set": ({}, {"eval_set": True}),
     "cell_refit": ({"cell_refit_base": 4000.0}, {}),
     "one_bag": ({"n_bags": 1}, {}),
     "unpruned": ({"prune": False}, {}),
@@ -109,11 +108,7 @@ def fit_kwargs(task: str, keys: dict[str, Any], d: dict[str, Any]) -> dict[str, 
     if task in ("poisson", "tweedie") and "exposure" not in keys:
         out["exposure"] = d["exposure"][:cut]
     for k in keys:
-        if k == "eval_set":
-            out["eval_set"] = (d["X"][cut:], d["y"][cut:])
-            if task in ("poisson", "tweedie"):
-                out["eval_exposure"] = d["exposure"][cut:]
-        elif k == "callbacks":
+        if k == "callbacks":
             out["callbacks"] = lambda info: info["round"] >= 20
         else:
             out[k] = d[{"sample_weight": "weight"}.get(k, k)][:cut]

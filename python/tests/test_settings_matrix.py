@@ -2,7 +2,7 @@
 
 A categorical with more levels than bins has its fit rows scored at their out-of-fold bins
 (`Model::fit_cat_bins`); that path is recorded by every fit and read by the ranked path's evidence
-and the rebalance, so it must hold under an evaluation set, panel groups, a fit-time cell
+and the rebalance, so it must hold under a round callback, panel groups, a fit-time cell
 correction, weights with exposure, offsets, and on binary and multiclass fits. Each case must
 run, re-solve the categorical's tables with the rest, and give byte-identical models at any thread
 count. The full matrix (every objective x every setting, with the model report) is
@@ -46,7 +46,7 @@ def _data(task: str) -> dict:
 
 
 CASES = [
-    ("poisson", "eval_set"),
+    ("poisson", "callback"),
     ("poisson", "groups"),
     ("poisson", "exposure+weights"),
     ("gamma", "cell_refit"),
@@ -65,8 +65,8 @@ def _fit(task: str, setting: str, d: dict, n_jobs: int):
         ctor["cell_refit_base"] = 4000.0
     if task == "poisson":
         kw["exposure"] = d["exposure"][:cut]
-    if setting == "eval_set":
-        kw.update(eval_set=(d["X"][cut:], d["y"][cut:]), eval_exposure=d["exposure"][cut:])
+    if setting == "callback":
+        kw["callbacks"] = lambda info: None
     elif setting == "groups":
         kw["groups"] = d["groups"][:cut]
     elif setting == "exposure+weights":

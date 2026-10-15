@@ -551,8 +551,7 @@ ranking of the objects or the decomposition into rating tables.
 
 The recalibration is shrunk toward the identity and only applied when its improvement on the
 validation objects clears a penalty, so a small validation set leaves the model unchanged. It
-has no effect when `validation_fraction` is `None`. Setting it to `True` together with an
-`eval_set` raises an error.
+has no effect when `validation_fraction` is `None`.
 
 Not supported for multiclassification: setting it explicitly raises an error.
 

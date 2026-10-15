@@ -15,7 +15,7 @@ from t_boost import TBoostClassifier, TBoostRegressor, report_html
 from t_boost import metrics
 from t_boost import _report
 from t_boost._html_report import (_W_FACTOR, _W_FULL, _W_HALF, _Log, _table_cells, cell_labels,
-                                   run_label, span_label)
+                                   run_label, span_label, training_chart)
 from t_boost._t_boost import _report_cell_quantiles, _report_cell_sums, _report_ranking
 
 FAST = dict(n_trees=60, n_bags=3, n_jobs=1, seed=0)
@@ -706,14 +706,15 @@ def test_two_datasets_are_train_and_test(poisson):
     alone = m.pricing_report(tr, "y", exposure="exp")
     assert any(f["check"] == "holdout_data" and "Pass test data" in f["message"]
                for f in alone["review"])
-    # A fit that early-stopped on an eval_set: the second dataset may be that data.
-    features = ["age", "veh", "dens"]
-    stopped = TBoostRegressor(objective="poisson", **FAST).fit(
-        tr.select(features), tr["y"], exposure=tr["exp"],
-        eval_set=(ev.select(features), ev["y"]), eval_exposure=ev["exp"])
-    r = stopped.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp")
-    note = next(f for f in r["review"] if f["check"] == "holdout_data")
-    assert note["status"] == "info" and "if test is that data" in note["message"]
+
+
+def test_a_live_fit_draws_its_training_curve(poisson):
+    # Every live fit keeps each bag's deviance on its early-stopping rows (free: the stopping
+    # rule computes it), so the Training card has a curve without an eval_set at fit.
+    m, _, _, report = poisson
+    curves = report["fit"]["evals_result"]["value"]["eval"]["deviance"]
+    assert len(curves) == len(m.n_trees_per_bag_)
+    assert "early-stopping rows" in training_chart(report, 600, 240)
 
 
 def alternating(n=4000, seed=11):

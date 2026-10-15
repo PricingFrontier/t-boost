@@ -85,18 +85,14 @@ None
 
 The test data, or the validation and the test data, described beside the train data (`X`, `y`):
 
-- one pair `(X_test, y_test)`, the convention of `fit`;
+- one pair `(X_test, y_test)`;
 - a list of two pairs `[(X_validation, y_validation), (X_test, y_test)]`.
 
 Train and test are the usual pair: the bags early-stop and prune on objects they hold back, so
-a model needs no separate validation data. Keep some only to early-stop on chosen data (for
-example the latest period) or to compare settings.
+a model needs no separate validation data. Keep some only to compare settings.
 
 Each dataset gets its own metrics, A/E, unseen values and review checks, and the drift from the
 train data to it (PSI) is measured. A `y` may name a column of its polars `X`.
-
-If the model was early-stopped on an `eval_set` passed to `fit`, that data is not fully
-out-of-sample: pass it as the validation data and keep a test set for the independent estimate.
 
 **Possible types**
 

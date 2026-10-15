@@ -1,6 +1,6 @@
-//! `Config::fit_control`: the per-bag fit report, the per-round history and observer, and the
-//! external evaluation holdout. All of it is run-time control: with the defaults a fit is
-//! bit-identical, and history or an observer that never stops change nothing either.
+//! `Config::fit_control`: the per-bag fit report, the per-round history and the observer. All of
+//! it is run-time control: with the defaults a fit is bit-identical, and history or an observer
+//! that never stops change nothing either.
 
 #![allow(
     clippy::unwrap_used,
@@ -28,7 +28,7 @@ fn fixture(n: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     (x0, x1, y)
 }
 
-fn fit(config: Config, holdout: Option<&[bool]>) -> Model {
+fn fit(config: Config) -> Model {
     let (x0, x1, y) = fixture(2000);
     let x = bin_columns(&[&x0, &x1], None, &BinConfig::default(), 3).unwrap();
     let loss = SquaredError;
@@ -39,7 +39,7 @@ fn fit(config: Config, holdout: Option<&[bool]>) -> Model {
         monotone: MonotoneMap::new(),
         interaction: InteractionPolicy::default(),
         credibility: CredibilityFloor::default(),
-        fixed_holdout: holdout,
+        fixed_holdout: None,
         bag_groups: None,
         seed: 9,
     };
@@ -58,28 +58,25 @@ fn base() -> Config {
 
 #[test]
 fn report_counts_trees_and_reason() {
-    let model = fit(base(), None);
+    let model = fit(base());
     let report = model.fit_report.as_ref().unwrap();
     assert_eq!(report.len(), 1);
     assert_eq!(report[0].trees_kept as usize, model.trees.len());
     assert!(report[0].rounds_trained >= report[0].trees_kept);
     assert!(report[0].train_deviance.is_empty(), "history is opt-in");
 
-    let capped = fit(
-        Config {
-            validation_fraction: None,
-            n_trees: 25,
-            ..base()
-        },
-        None,
-    );
+    let capped = fit(Config {
+        validation_fraction: None,
+        n_trees: 25,
+        ..base()
+    });
     let r = &capped.fit_report.as_ref().unwrap()[0];
     assert_eq!((r.trees_kept, r.reason), (25, StopReason::MaxTrees));
 }
 
 #[test]
 fn history_and_a_silent_observer_leave_the_model_bit_identical() {
-    let plain = fit(base(), None);
+    let plain = fit(base());
     let calls = Arc::new(AtomicU32::new(0));
     let counter = Arc::clone(&calls);
     let mut watched = base();
@@ -90,7 +87,7 @@ fn history_and_a_silent_observer_leave_the_model_bit_identical() {
         assert!(event.eval_deviance.is_some());
         false
     })));
-    let traced = fit(watched, None);
+    let traced = fit(watched);
     assert_eq!(
         encode_model(&plain).unwrap(),
         encode_model(&traced).unwrap()
@@ -103,7 +100,7 @@ fn history_and_a_silent_observer_leave_the_model_bit_identical() {
     // History alone records the (free) stopping curve, not the training one.
     let mut history_only = base();
     history_only.fit_control.record_history = true;
-    let lean = fit(history_only, None);
+    let lean = fit(history_only);
     let r = &lean.fit_report.as_ref().unwrap()[0];
     assert!(r.train_deviance.is_empty());
     assert_eq!(r.eval_deviance.len(), r.rounds_trained as usize);
@@ -114,22 +111,7 @@ fn an_observer_can_stop_the_fit() {
     let mut config = base();
     config.validation_fraction = None;
     config.fit_control.observer = Some(RoundObserver(Arc::new(|event| event.round >= 4)));
-    let model = fit(config, None);
+    let model = fit(config);
     let r = &model.fit_report.as_ref().unwrap()[0];
     assert_eq!((r.trees_kept, r.reason), (4, StopReason::Callback));
-}
-
-#[test]
-fn an_external_holdout_never_moves_the_intercept() {
-    // Same holdout rows, marked internal vs external: only the external fit keeps their
-    // targets out of the intercept re-anchor, so the two may differ; with re-anchoring off
-    // they must agree exactly, since the rows only ever scored early stopping.
-    let mask: Vec<bool> = (0..2000).map(|i| i % 5 == 0).collect();
-    let mut internal = base();
-    internal.boosters.reanchor = false;
-    let mut external = internal.clone();
-    external.fit_control.external_holdout = true;
-    let a = fit(internal, Some(&mask));
-    let b = fit(external, Some(&mask));
-    assert_eq!(encode_model(&a).unwrap(), encode_model(&b).unwrap());
 }

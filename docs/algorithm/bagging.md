@@ -28,7 +28,7 @@ to `fit`, whole groups are sampled, so the out-of-bag objects never include an o
 was in the bag.
 
 Each bag then sets aside its own validation objects for [early stopping](early-stopping.md),
-unless `groups` or an `eval_set` is given (the bags then share one validation dataset), and
+unless `groups` is given (the bags then share one validation dataset of whole groups), and
 stops at its own best iteration.
 
 ## Averaging the bags {#averaging}

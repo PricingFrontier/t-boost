@@ -1098,27 +1098,25 @@ def bank_chart(r: dict[str, Any], w: float, h: float) -> str:
 
 
 def training_chart(r: dict[str, Any], w: float, h: float) -> str:
-    """Mean deviance on the early-stopping rows by boosting round, the band of rounds where the
-    bags stopped and the minimum."""
+    """Deviance on each bag's early-stopping rows by boosting round, the round each bag kept and
+    the band of those rounds. Each bag sets aside its own rows, so the curves sit at different
+    levels: an average over the bags still running would jump whenever one finished, so every
+    bag is drawn."""
     fit = r["fit"]
     hist = fit["evals_result"]
     if not hist["available"]:
         return f'<p class="note">Training curve: {_e(hist["reason"])}.</p>'
     per_bag = (hist["value"].get("eval") or {}).get("deviance") or []
-    label = "early-stopping rows"
+    label, stops = "early-stopping rows", True
     if not per_bag:
         per_bag = (hist["value"].get("train") or {}).get("deviance") or []
-        label = "train rows"
-    if not per_bag:
+        label, stops = "train rows", False
+    curves = [[(i + 1, v) for i, v in enumerate(b) if v is not None] for b in per_bag]
+    if not any(curves):
         return _none("No training history.")
-    rounds = max(len(b) for b in per_bag)
-    mean: list[float | None] = []
-    for i in range(rounds):
-        vals = [b[i] for b in per_bag if i < len(b) and b[i] is not None]
-        mean.append(sum(vals) / len(vals) if vals else None)
-    pts = [(i + 1, v) for i, v in enumerate(mean) if v is not None]
-    best_round, best = min(pts, key=lambda t: t[1])
-    tail = [v for i, v in pts if i >= max(5, len(pts) // 20)] or [best]
+    rounds = max(c[-1][0] for c in curves if c)
+    skip = max(5, rounds // 20)
+    tail = [v for c in curves for i, v in c if i >= skip] or [v for c in curves for _, v in c]
     left, right, top, bottom = 58.0, w - 14, 24.0, h - 22
     xs = _Lin(1.0, float(rounds), left, right, pad=0.0, n=5)
     ys = _Lin(min(tail), max(tail), bottom, top, pad=0.12, n=4)
@@ -1139,12 +1137,18 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
         last = j == len(xs.ticks) - 1
         svg.text(xs(t), bottom + 16, f"{t:,.0f} rounds" if last else f"{t:,.0f}",
                  anchor="end" if last and xs(t) > right - 40 else "middle")
-    svg.text(left, 12, f"mean deviance on the {label}, over the bags still running", cls="lbl")
-    svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in pts], "data")
-    xb, yb = xs(best_round), ys(best)
-    svg.vline(xb, yb - 6, yb - 30, "ref")
-    svg.add(f'<circle class="mk" cx="{xb:.1f}" cy="{yb:.1f}" r="4"/>')
-    svg.text(xb, yb - 36, f"minimum at round {best_round:,}", anchor="middle", cls="lbl")
+    marked = stops and len(kept) == len(per_bag)
+    title = f"deviance on each bag's {label} by round" + (", the round it kept marked" if marked else "")
+    svg.text(left, 12, title, cls="lbl")
+    for c in curves:
+        svg.path([(xs(i), ys(min(max(v, ys.lo), ys.hi))) for i, v in c], "dfaded")
+    if marked:
+        for k, (b, n) in enumerate(zip(per_bag, kept)):
+            v = b[n - 1] if 1 <= n <= len(b) else None
+            if v is not None and ys.lo <= v <= ys.hi:
+                svg.add(f'<circle class="ddot" cx="{xs(n):.1f}" cy="{ys(v):.1f}" r="3.5">'
+                        f"<title>bag {k + 1}: kept {n:,} rounds, deviance {_e(dev_fmt(v))}"
+                        "</title></circle>")
     return svg.render()
 
 
@@ -2748,13 +2752,14 @@ def _training(r: dict[str, Any]) -> str:
     per_bag = fit["n_trees_per_bag"]["value"] or []
     reasons = fit["stopping_reason_per_bag"]["value"] or []
     es = fit["early_stopping"]
-    rows_used = ("the eval_set" if es["eval_set"]
-                 else f"a validation_fraction={es['validation_fraction']} holdout")
+    stopping = (f"early stopping on a validation_fraction={es['validation_fraction']} holdout, "
+                f"patience {es['early_stopping_rounds']}" if es["validation_fraction"] is not None
+                else "no early stopping (validation_fraction=None)")
     if per_bag:
         what = (f"Trees kept per bag {min(per_bag):,}–{max(per_bag):,} over {len(per_bag)} bags; "
-                f"early stopping on {rows_used}, patience {es['early_stopping_rounds']}")
+                f"{stopping}")
     else:
-        what = f"Early stopping on {rows_used}, patience {es['early_stopping_rounds']}"
+        what = stopping[0].upper() + stopping[1:]
     bags = ""
     if per_bag:
         rows = [[str(i + 1), _num(n), _e(reasons[i] if i < len(reasons) else "—")]

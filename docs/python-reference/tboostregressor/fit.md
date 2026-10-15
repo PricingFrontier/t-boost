@@ -12,10 +12,6 @@ fit(X,
     groups=None,
     *,
     offset=None,
-    eval_set=None,
-    eval_sample_weight=None,
-    eval_exposure=None,
-    eval_offset=None,
     callbacks=None)
 ```
 
@@ -72,8 +68,6 @@ None
 
 --8<-- "_snippets/params/offset-fit.md"
 
---8<-- "_snippets/params/eval-fit.md"
-
 --8<-- "_snippets/params/callbacks-fit.md"
 
 ## Return value {#output-format}
@@ -89,7 +83,6 @@ The attributes `n_trees_per_bag_`, `stopping_reason_per_bag_`, `n_trees_`, `stop
 from t_boost import TBoostRegressor
 
 model = TBoostRegressor(objective="poisson")
-model.fit(train_data, "ClaimCount", exposure="Exposure",
-          eval_set=(valid_data, "ClaimCount"), eval_exposure="Exposure")
+model.fit(train_data, "ClaimCount", exposure="Exposure")
 print(model.n_trees_per_bag_, model.stopping_reason_)
 ```

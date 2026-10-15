@@ -130,17 +130,21 @@ list of strings
 #### Purpose
 
 Return the values of metrics calculated during the training: the mean deviance of every
-iteration of every bag, when an `eval_set` or `callbacks` were passed to `fit`.
+iteration of every bag on the validation objects of
+[early stopping](../../algorithm/early-stopping.md), and, when `callbacks` were passed to `fit`,
+on the bag's training objects too.
 
 Output format:
 
 ```
-{"train": {"deviance": [[value_1, value_2, ...], ...]}, "eval": {"deviance": [[value_1, value_2, ...], ...]}}
+{"eval": {"deviance": [[value_1, value_2, ...], ...]}, "train": {"deviance": [[value_1, value_2, ...], ...]}}
 ```
 
-with one list per bag. The `"eval"` curve (the validation objects) costs nothing extra. The
-`"train"` curve takes an extra pass per iteration, so it is calculated only when `callbacks` are
-given. Without either, the dictionary is empty. It is not saved with the model.
+with one list per bag. The `"eval"` curve is recorded on every training (early stopping
+calculates it anyway). The `"train"` curve takes an extra pass per iteration, so it is
+calculated only when `callbacks` are given. The attribute is absent when there is neither
+(`validation_fraction=None` without `callbacks`), for multiclassification, and on a loaded
+model: it is not saved with the model.
 
 #### Type
 
