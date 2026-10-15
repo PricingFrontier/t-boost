@@ -1,7 +1,13 @@
 # Post-fit stages: open issues after the switch-off work
 
-Status: written 2026-10-15 on branch `report-0.9.1` at `85f40f1`. The bugs were fixed the same
-day, then PF-05 and PF-03 (see "Fixed" below); PF-06 to PF-08 and PF-11 to PF-13 remain open.
+Status: written 2026-10-15 on branch `report-0.9.1` at `85f40f1`; updated the same day as items
+were fixed (see "Fixed" below).
+
+**Scope (maintainer, 2026-10-15).** The goal of this work is to simplify the library, remove logic
+that switches features off depending on settings, make the library easier to use, and fix bugs.
+Changing behaviour or defaults only to gain accuracy is out of scope. Items whose only motive is
+accuracy (PF-06, PF-07, PF-08, PF-11, PF-12, PF-16) are **parked**: their evidence stays below for
+a future accuracy-focused effort, but they are not on this roadmap's work list.
 
 ## Fixed (2026-10-15)
 
@@ -15,6 +21,7 @@ day, then PF-05 and PF-03 (see "Fixed" below); PF-06 to PF-08 and PF-11 to PF-13
 | PF-14 | `ae23d59`, `5831d31` | A truthy callback used to stop every bag after whatever round each had reached, so the fitted model depended on thread timing (the flaky test was this). On the maintainer's decision the contract changed: a truthy return stops the bag it was called for, as early stopping stops each bag at its own round, and a callback that decides from its dict alone gives a byte-identical model on every run and at any `n_jobs`. Return truthy for every bag to stop the whole fit; an exception still stops it. Haute does not pass t-boost callbacks. |
 | PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
 | PF-05 | `d727ca2` | Where a categorical's levels share bins, the ranked path's out-of-bag evidence and the rebalance score the fit rows as the trees saw them (out-of-fold bins); the PF-02 exclusion is gone. −0.011% over 8 datasets (7 better / 2 worse). See PF-05. |
+| PF-17 | `07db2af` | A multiclass fit now records its boosting report (`n_trees_per_bag_`, `stopping_reason_per_bag_`, `n_trees_`, `stopping_reason_`; counts are rounds), so the model report's existing "reached n_trees" warning fires for multiclass too. The cap itself stays the user's: they raise `n_trees` when the report says bags hit it (maintainer's decision). |
 | PF-03 | `3365ecf` | The rebalance is judged per bag on out-of-bag rows (the slice only without them), with the review's defects fixed. −0.109% over 17 datasets against no rebalance, −0.079% against the slice check; +0–22% fit time single-output, +17–45% multiclass; optimistic on the two smallest sets. See PF-03. |
 
 Looked at and left as they are:
@@ -94,23 +101,23 @@ rejected, so they are not tried again.
 
 | ID | Issue | Recommendation | Cost | Decision |
 |---|---|---|---|---|
-| PF-01 | `band_deviance_cap` wording; 0, inf and nan switch banding off | Reword; raise unless finite and > 0 | none; byte-identical for valid caps | ready |
-| PF-02 | Rebalance learns a target-encoding leak | Leave tables on cross-fit-encoded categoricals as fitted | none | ready |
-| PF-03 | Rebalance check is biased against the re-solve | Per-bag out-of-bag check, correction fitted on every row | +6–37% fit time, +11–14% memory | maintainer |
-| PF-04 | Graduation's 1% check | Keep it; say it is a brake, not an accuracy test | none | ready (docs) |
-| PF-05 | The serve-map leak in selection, banding and graduation | Investigate | unknown | next |
-| PF-06 | Multiclass banding too coarse on some sets | Investigated 2026-10-15: no change until PF-17 is decided; centred noise budget is the lever | small | open |
-| PF-07 | Multiclass graduation over-smoothing (fr_instal), held off only by the brake's scale | Investigated 2026-10-15: no candidate fixes it; decide with PF-06 | none | open |
-| PF-08 | GCV at the grid ceiling (Prudential lead) | The unit-free null-space rule fixes Prudential's live harm; needs its validation list | none expected | open |
-| PF-09 | Graduation's re-anchor overrides `reanchor=False` | Honour it or report it as overridden | small | bug |
-| PF-10 | `graduation_validation_` has no reason when nothing is smoothed | Set `skipped` and `candidate_count` on every path | small | bug |
-| PF-11 | One-bag fits have no honest held-out evidence | Use the early-stopping carve; fold-model σ | medium | open |
-| PF-12 | `band_tolerance` 0.375 beats 0.75 on small single-output sets | Measure on the arena and large sets | none | open |
-| PF-13 | Banding can raise the cell count (densifies factored tables) | Investigate | unknown | open |
-| PF-14 | `test_callback_true_stops_and_exceptions_propagate` is flaky under load | Fix the test | small | bug |
-| PF-15 | Smaller defects and loose ends | See the list | small | mixed |
-| PF-16 | The per-bag rebalance check is optimistic on very small data | Investigate (single bag weaker than the soup) | unknown | open |
-| PF-17 | Multiclass fits stop at the 4,000-tree cap on fr_instal and pg16_fleet | Maintainer: raise or derive the cap; report it at least | 1.5–4× fit time where it binds | decision |
+| PF-01 | `band_deviance_cap` wording; 0, inf and nan switch banding off | Reword; raise unless finite and > 0 | none; byte-identical for valid caps | fixed `ec3937e` |
+| PF-02 | Rebalance learns a target-encoding leak | Leave tables on cross-fit-encoded categoricals as fitted | none | fixed `5fd8d6b`, superseded by PF-05 |
+| PF-03 | Rebalance check is biased against the re-solve | Per-bag out-of-bag check, correction fitted on every row | +0–22% fit time single-output, +17–45% multiclass | shipped `3365ecf`; accuracy-motivated, so under the scope above it is a revert candidate |
+| PF-04 | Graduation's 1% check | Keep it; say it is a brake, not an accuracy test | none | fixed (docs) `87c48a9` |
+| PF-05 | The serve-map leak in selection and the rebalance | Score fit rows at their out-of-fold bins where levels share bins | none | fixed `d727ca2` (removes the PF-02 switch-off) |
+| PF-06 | Multiclass banding too coarse on some sets | Centred noise budget is the lever | small | parked (accuracy) |
+| PF-07 | Multiclass graduation over-smoothing (fr_instal), held off only by the brake's scale | No candidate fixes it | none | parked (accuracy) |
+| PF-08 | GCV at the grid ceiling (Prudential lead) | Unit-free null-space rule; needs its validation list | none expected | parked (accuracy) |
+| PF-09 | Graduation's re-anchor overrides `reanchor=False` | Honour it | small | fixed `ed25646` |
+| PF-10 | `graduation_validation_` has no reason when nothing is smoothed | Set `skipped` and `candidate_count` on every path | small | fixed `b7e7717` |
+| PF-11 | One-bag fits have no honest held-out evidence | Use the early-stopping carve | medium | parked (accuracy) |
+| PF-12 | `band_tolerance` 0.375 beats 0.75 on small single-output sets | — | none | parked (accuracy; not a default change this work makes) |
+| PF-13 | Banding can raise the cell count (densifies factored tables) | Find where; band factored tables in factored form | unknown | open (readability, low priority) |
+| PF-14 | `test_callback_true_stops_and_exceptions_propagate` is flaky under load | Make the stop deterministic | small | fixed `ae23d59`, `5831d31` |
+| PF-15 | Smaller defects and loose ends | See the list | small | fixed or left as is, apart from the validation coverage gap (open) |
+| PF-16 | The per-bag rebalance check is optimistic on very small data | Investigate | unknown | parked (accuracy; moot if PF-03 is reverted) |
+| PF-17 | Multiclass fits stop at the 4,000-tree cap without saying so | Report it; the user raises `n_trees` | none | fixed (reporting) |
 
 ## PF-01. `band_deviance_cap` bounds an estimate, not the training rise
 
@@ -786,6 +793,13 @@ with the callback; fix the test or make the stop deterministic.
 - Coverage gap across all three investigations: no Tweedie, squared error, real weighted or
   grouped (panel) data in the accuracy evidence; B checked only that those configurations run.
   Monotone fits were checked for B on fremtpl2 (BonusMalus +1): no harm from the repair.
+  **Still open:** the changes shipped here (PF-03, PF-05) need a correctness pass over those
+  settings (Tweedie, squared error, sample weights with exposure, panel data with `groups`,
+  `eval_set`, `cell_refit_base`): they must run, report sensibly and stay deterministic.
+
+Status of the rest: PF-01's loose ends were looked at and left as they are (see "Fixed"); the
+multiclass check's re-anchor was fixed in `e6fb8b0`; the wasted deployed solve on a declined
+rebalance is gone with `3365ecf`; the `w_scale` comment was fixed in `87c48a9`.
 
 ## PF-16. The per-bag rebalance check is optimistic on very small data
 
@@ -811,7 +825,13 @@ At 12,000 trees the shipped default improves by −4.49% / −3.34% test cross-e
 107–177 s; banding 227 s vs 40 s on a 723k-cell bank). Even 12,000 trees leaves 6 and 3 of
 fr_instal's 8 bags at the cap.
 
-Two things are wrong today, and only the second is a judgement call:
+**Decision (maintainer, 2026-10-15):** the cap is a compute budget the user owns. Users raise
+`n_trees` when they see bags hit it, so the fit must say so: a multiclass fit now records the same
+boosting report as a regression or binary fit (rounds kept and stop reason per bag), and the
+model report's existing warning ("k of n bag(s) reached n_trees without early stopping; the model
+may be under-fitted") fires for multiclass too. The default stays 4,000.
+
+The original analysis:
 
 1. **Nobody is told.** A multiclass fit has no boosting report (`n_trees_per_bag_` and
    `stopping_reason_` are `None`), so a fit cut short by the cap looks like any other. At the
@@ -821,11 +841,12 @@ Two things are wrong today, and only the second is a judgement call:
    time or size budget), or raise the learning rate when the cap binds (not measured). The
    fit-time cost is the price.
 
-## Order of work (suggested)
+## Remaining work (in scope)
 
-1. PF-01, PF-02 and PF-04's doc fixes: no cost, ready, byte-identical apart from the exclusion.
-2. PF-09, PF-10, PF-14: small bugs.
-3. PF-05: the serve-map leak, which affects default fits.
-4. PF-03: decide on the per-bag check, fixing its four defects first.
-5. PF-06 and PF-07 together (both are multiclass strength problems), then PF-08, PF-11, PF-12,
-   PF-13.
+1. The validation coverage pass in PF-15 (correctness of PF-03 and PF-05 under Tweedie, squared
+   error, weights with exposure, panel data, `eval_set` and `cell_refit_base`).
+2. Decide whether PF-03 stays: it is the one shipped change made for accuracy alone, and it adds
+   about 500 lines and 17–45% multiclass fit time. Reverting `3365ecf` returns to the slice check.
+3. PF-13, if readability of the banded tables matters enough to look into it.
+
+Parked (accuracy only): PF-06, PF-07, PF-08, PF-11, PF-12, PF-16.
