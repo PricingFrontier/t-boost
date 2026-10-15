@@ -1277,6 +1277,16 @@ def structure_section(est: "_BaseTBoost", banks: dict[str, Any]) -> dict[str, An
     return {"deployed_tables": est._deployed_table_count(), "banks": out_banks}
 
 
+def _shown_smoothing(report: dict[str, Any]) -> dict[tuple[str, ...], Any]:
+    """Each graduated table's strength by its features, for the bank the summaries show: the
+    first class's on a multiclass model, whose classes can choose different strengths."""
+    rows = report["fit"]["graduation_tables"]["value"] or []
+    if report["model"]["multiclass"]:
+        shown = next(iter(report["tables"]), None)
+        rows = [g for g in rows if g.get("class") == shown]
+    return {tuple(g["features"]): g["alpha"] for g in rows}
+
+
 def features_section(report: dict[str, Any], th: dict[str, float | None]) -> list[dict[str, Any]]:
     """One row per raw feature: importance split into its own one-way table and its share
     through interactions, and the one-way table's effect range, thin cells, missing-value level
@@ -1287,8 +1297,7 @@ def features_section(report: dict[str, Any], th: dict[str, float | None]) -> lis
     n_banks = max(len(banks), 1)
     tables = report["tables"]
     first_bank = next(iter(tables.values())) if m["multiclass"] else tables
-    grad = report["fit"]["graduation_tables"]["value"] or []
-    smoothing = {tuple(g["features"]): g["alpha"] for g in grad}
+    smoothing = _shown_smoothing(report)
     thin_mass = th.get("thin_cell_mass") or 0.0
     datasets = [d for d in report["datasets"] if not d.get("error")]
     out = []
@@ -1356,8 +1365,7 @@ def interactions_section(report: dict[str, Any]) -> list[dict[str, Any]]:
     link = m["link"]
     tables = report["tables"]
     bank = next(iter(tables.values())) if m["multiclass"] else tables
-    grad = {tuple(g["features"]): g["alpha"]
-            for g in report["fit"]["graduation_tables"]["value"] or []}
+    grad = _shown_smoothing(report)
     out = []
     for t in bank.get("tables", []):
         names = list(t["feature_names"])

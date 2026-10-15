@@ -93,6 +93,54 @@ pub fn axes_for_raw(provenance: &[AxisProvenance], raw: FeatureId) -> Vec<usize>
         .collect()
 }
 
+/// The fit rows' training-time bins on every single-channel categorical axis whose levels share
+/// bins, for [`crate::engine::Model::fit_cat_bins`] (read by [`crate::prune::fit_rows_matrix`]).
+/// With more levels than bins a level joins the bin its full-data target statistic ranks it
+/// into, and a small level's statistic is mostly its own rows' targets, so the serve map places
+/// a training row partly by its own target; the rows were fitted at their out-of-fold bins, which
+/// `train` holds. Where every level keeps its own bin, a row's serve cell is just its level, which
+/// reads no target, and the out-of-fold placements would only add noise (measured 2026-10-15,
+/// specs/roadmap/post-fit-stages.md, PF-05). A multi-channel categorical scores through
+/// per-level joint cells and stays on the serve map too.
+///
+/// # Errors
+/// [`crate::error::PbError::Internal`] if a categorical axis names an encoder absent from
+/// `encoders`, or its column is missing from `train`.
+pub fn training_categorical_bins(
+    train: &BinnedMatrix,
+    encoders: &crate::cat::CatEncoderStore,
+) -> Result<Vec<(u32, Vec<u8>)>, crate::error::PbError> {
+    let mut out = Vec::new();
+    for (axis, p) in train.provenance.iter().enumerate() {
+        let AxisKind::CategoricalTS { encoding } = p.kind else {
+            continue;
+        };
+        if axes_for_raw(&train.provenance, p.raw).len() != 1 {
+            continue;
+        }
+        let mut bins = std::collections::BTreeSet::new();
+        if encoders
+            .get(encoding, p.raw)?
+            .levels
+            .iter()
+            .all(|level| bins.insert(level.bin))
+        {
+            continue;
+        }
+        let column = train
+            .data
+            .get(axis)
+            .ok_or_else(|| crate::error::PbError::Internal {
+                what: format!("categorical axis {axis} is missing from the fit design"),
+            })?;
+        let axis = u32::try_from(axis).map_err(|_| crate::error::PbError::Internal {
+            what: "axis index exceeded u32".into(),
+        })?;
+        out.push((axis, column.clone()));
+    }
+    Ok(out)
+}
+
 /// One feature's border grid (spec §2.2/§03.2). Bin 0 is the reserved MISSING bin.
 ///
 /// **Canonical cardinality (R-BINS).** `borders[k]` is the upper border of data bin

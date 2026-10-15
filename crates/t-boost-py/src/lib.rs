@@ -7910,52 +7910,6 @@ where
     }
 }
 
-/// The fit rows' training-time bins on every single-channel categorical axis whose levels share
-/// bins and whose rows were binned by out-of-fold (cross-fit) statistics, for
-/// [`Model::fit_cat_bins`]. With more levels than bins (254) a level joins the bin its full-data
-/// statistic ranks it into, and a small level's statistic is mostly its own rows' targets: the
-/// serve map then places a training row partly by its own target. Where every level keeps its
-/// own bin, a row's serve cell is just its level, which reads no target, and the out-of-fold
-/// placements would only add noise (measured 2026-10-15, specs/roadmap/post-fit-stages.md,
-/// PF-05). A multi-channel categorical scores through per-level joint cells and stays on the
-/// serve map too.
-fn cross_fit_cat_bins(
-    train: &BinnedMatrix,
-    serve: &BinnedMatrix,
-    encoders: &t_boost_core::cat::CatEncoderStore,
-) -> Result<Vec<(u32, Vec<u8>)>, PbError> {
-    let mut out = Vec::new();
-    for (axis, p) in train.provenance.iter().enumerate() {
-        let AxisKind::CategoricalTS { encoding } = p.kind else {
-            continue;
-        };
-        if t_boost_core::data::axes_for_raw(&train.provenance, p.raw).len() != 1 {
-            continue;
-        }
-        let mut bins = std::collections::BTreeSet::new();
-        if encoders
-            .get(encoding, p.raw)?
-            .levels
-            .iter()
-            .all(|level| bins.insert(level.bin))
-        {
-            continue;
-        }
-        let (Some(t), Some(v)) = (train.data.get(axis), serve.data.get(axis)) else {
-            return Err(PbError::Internal {
-                what: format!("categorical axis {axis} is missing from the fit design"),
-            });
-        };
-        if t != v {
-            let axis = u32::try_from(axis).map_err(|_| PbError::Internal {
-                what: "axis index exceeded u32".into(),
-            })?;
-            out.push((axis, t.clone()));
-        }
-    }
-    Ok(out)
-}
-
 /// Fit a single-output [`Model`] on the **ambient** rayon pool (no pool of its own): bin the
 /// design (numeric grids, or native-categorical grids+encoders), run the booster, then stamp
 /// feature names / class labels and validate. The caller owns the thread budget — either
@@ -8152,16 +8106,12 @@ fn fit_model_ambient_bagged(
                 state.seed,
                 honest_holdout.as_deref(),
             )?;
-            let fit_cat_bins =
-                cross_fit_cat_bins(&fitted.train.0, &fitted.serve.0, &fitted.cat_encoders)?;
-            let mut model = Booster::with_config(state.config.clone()).fit_train(
+            Booster::with_config(state.config.clone()).fit_train(
                 &fitted.train,
                 y,
                 &cat_spec,
                 fitted.cat_encoders,
-            )?;
-            model.fit_cat_bins = Some(fit_cat_bins);
-            model
+            )?
         }
     };
     if let Some(names) = feature_names {
@@ -8415,9 +8365,7 @@ fn fit_multiclass_owned_bagged(
                     state.seed,
                     honest_holdout.as_deref(),
                 )?;
-                let fit_cat_bins =
-                    cross_fit_cat_bins(&fitted.train.0, &fitted.serve.0, &fitted.cat_encoders)?;
-                let mut model = Booster::with_config(state.config.clone()).fit_multiclass_train(
+                let model = Booster::with_config(state.config.clone()).fit_multiclass_train(
                     &fitted.train,
                     &y,
                     n_classes,
@@ -8425,9 +8373,6 @@ fn fit_multiclass_owned_bagged(
                     &cat_spec,
                     fitted.cat_encoders,
                 )?;
-                for class in &mut model.classes {
-                    class.fit_cat_bins = Some(fit_cat_bins.clone());
-                }
                 Ok((model, Some(cat_axes_per_raw)))
             }
         }

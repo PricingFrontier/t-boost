@@ -225,6 +225,12 @@ fn coord_map(axis: &AxisId, merged: usize) -> Result<Vec<usize>, PbError> {
         .collect()
 }
 
+/// The number of lines through a factored effect's partner cells (the product of `dims`), or
+/// `None` when it overflows a `usize`.
+fn line_count(dims: &[usize]) -> Option<usize> {
+    dims.iter().try_fold(1usize, |acc, &d| acc.checked_mul(d))
+}
+
 /// Row-major strides of `shape`.
 fn strides(shape: &[usize]) -> Vec<usize> {
     let mut out = vec![1usize; shape.len()];
@@ -424,13 +430,16 @@ fn factored_steps(
         maps.push((0..n).collect::<Vec<usize>>());
         dims.push(n);
     }
-    let n_lines: usize = dims.iter().product();
     let boxes = u64::try_from(fe.n_boxes()).unwrap_or(u64::MAX).max(1);
-    let work = (fam.nb as u64)
-        .saturating_mul(n_lines as u64)
-        .saturating_mul(boxes)
-        .saturating_mul(2);
-    if work <= cap {
+    // A line count that does not even fit a `usize` is past any cap: take the per-box bound.
+    let n_lines = line_count(&dims);
+    let work = n_lines.map_or(u64::MAX, |n| {
+        (fam.nb as u64)
+            .saturating_mul(u64::try_from(n).unwrap_or(u64::MAX))
+            .saturating_mul(boxes)
+            .saturating_mul(2)
+    });
+    if let Some(n_lines) = n_lines.filter(|_| work <= cap) {
         let n_raw = bank.merged_grids.len();
         let mut x = vec![0u32; n_raw];
         let mut steps = vec![0.0_f64; fam.nb.saturating_mul(n_lines)];
@@ -1761,5 +1770,14 @@ mod tests {
         let (_, rep) = repair_bank(&bank, &[sign(2, true)], &rows).unwrap();
         assert!(rep.certified);
         assert!(rep.features[0].tables.is_empty());
+    }
+
+    #[test]
+    fn a_line_count_past_usize_takes_the_bounded_path() {
+        // An order-eight effect with seven 1,024-cell partners: 2^70 lines. The product used to
+        // overflow (a trap in every profile) before the cost check could pick the per-box bound.
+        assert_eq!(line_count(&[1024; 7]), None);
+        assert_eq!(line_count(&[3, 4, 5]), Some(60));
+        assert_eq!(line_count(&[]), Some(1));
     }
 }

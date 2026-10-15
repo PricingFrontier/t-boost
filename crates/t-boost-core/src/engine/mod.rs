@@ -890,8 +890,10 @@ pub struct Model {
     /// `(axis, bins)`: the cells the trees saw. The serve map bins a training row by a
     /// full-data statistic that contains the row's own target, so the post-fit stages that
     /// judge or refit the tables against the fit rows' targets score them here instead (see
-    /// [`crate::prune::fit_rows_matrix`]). `Some(empty)` when no axis needs it; `None` on loaded
-    /// models and constructions that are not fits. Excluded from `PartialEq`.
+    /// [`crate::prune::fit_rows_matrix`]). Recorded by [`Booster::fit_train`] and
+    /// [`Booster::fit_multiclass_train`] ([`crate::data::training_categorical_bins`]):
+    /// `Some(empty)` when no axis needs it. `None` on loaded models, numeric-only fits (which
+    /// need none) and constructions that are not fits. Excluded from `PartialEq`.
     #[serde(skip)]
     pub fit_cat_bins: Option<Vec<(u32, Vec<u8>)>>,
     /// Runtime-only report from the [`Config::max_delta_step_gated`] rate-collapse detector
@@ -2449,8 +2451,11 @@ impl Booster {
         // Thread the encoders into the fit so every model built — including each OuterBag /
         // GreedySelect member validated inside `soup_models` — carries them, not just the
         // single-fit result (R-CATSERVE: the souped/member models also serve via these).
-        let model = boost::fit(&self.config, &x.0, y, spec, &cat_encoders)?;
+        let mut model = boost::fit(&self.config, &x.0, y, spec, &cat_encoders)?;
         model.validate()?;
+        // A fresh fit records where its rows sat in training, which the post-fit stages score
+        // them at (`prune::fit_rows_matrix`). After `validate`, which reports a missing encoder.
+        model.fit_cat_bins = Some(crate::data::training_categorical_bins(&x.0, &cat_encoders)?);
         Ok(model)
     }
 
@@ -2477,7 +2482,7 @@ impl Booster {
         spec: &FitSpec,
         cat_encoders: CatEncoderStore,
     ) -> Result<MultiClassModel, PbError> {
-        let model = boost::fit_multiclass(
+        let mut model = boost::fit_multiclass(
             &self.config,
             &x.0,
             y,
@@ -2487,6 +2492,11 @@ impl Booster {
             &cat_encoders,
         )?;
         model.validate()?;
+        // As `fit_train`: every class records where the fit rows sat in training.
+        let bins = crate::data::training_categorical_bins(&x.0, &cat_encoders)?;
+        for class in &mut model.classes {
+            class.fit_cat_bins = Some(bins.clone());
+        }
         Ok(model)
     }
 

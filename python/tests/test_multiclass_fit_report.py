@@ -76,3 +76,20 @@ def test_an_unpruned_or_single_bag_multiclass_fit_reports_too(three_class) -> No
     assert unpruned.stopping_reason_per_bag_ == ["max_trees", "max_trees"]
     single = TBoostClassifier(n_trees=5, n_bags=1, seed=0, n_jobs=2).fit(x, y)
     assert single.n_trees_per_bag_ == [5] and single.stopping_reason_ == "max_trees"
+
+
+def test_the_summaries_show_the_first_class_smoothing(three_class) -> None:
+    # The feature and interaction summaries describe the first class's bank, but they looked
+    # the strengths up by features alone across every class, so the last class's won (a review
+    # found interaction smoothing 0 shown for a class that used 30000).
+    x, y = three_class
+    est = TBoostClassifier(n_trees=200, n_bags=2, seed=0, n_jobs=2).fit(x, y)
+    rows = [dict(r) for r in est.graduation_report_]
+    for r in rows:
+        r["alpha"] = 1000.0 * (r["class"] + 1)  # class k: 1000 (k + 1)
+    est.graduation_report_ = rows
+    report = est.pricing_report(x, y)
+    shown = [f["smoothing"] for f in report["features"] if f.get("smoothing") is not None]
+    shown += [i["smoothing"] for i in report["interactions"] if i.get("smoothing") is not None]
+    assert any(i.get("smoothing") is not None for i in report["interactions"])
+    assert shown and set(shown) == {1000.0}
