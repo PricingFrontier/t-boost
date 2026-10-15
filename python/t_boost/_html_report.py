@@ -1100,9 +1100,10 @@ def bank_chart(r: dict[str, Any], w: float, h: float) -> str:
 def training_chart(r: dict[str, Any], w: float, h: float) -> str:
     """Each bag's deviance by boosting round on the rows it set aside for early stopping, the
     round it kept and the band of those rounds; with callbacks, each bag's training rows too.
-    The scale runs from 0 to the starting loss. Each bag sets aside its own rows, so the curves
-    sit at different levels: an average over the bags still running would jump whenever one
-    finished, so every bag is drawn."""
+    The curves fill the top half: the scale runs from the starting loss down to as far again
+    below the lowest loss. Each bag sets aside its own rows, so the curves sit at different
+    levels: an average over the bags still running would jump whenever one finished, so every
+    bag is drawn."""
     fit = r["fit"]
     hist = fit["evals_result"]
     if not hist["available"]:
@@ -1120,9 +1121,12 @@ def training_chart(r: dict[str, Any], w: float, h: float) -> str:
     rounds = max(c[-1][0] for c in curves)
     left, right, top, bottom = 58.0, w - 14, 24.0, h - 22
     xs = _Lin(1.0, float(rounds), left, right, pad=0.0, n=5)
-    # From 0 to the starting loss (the highest first-round deviance of any bag), so each curve
-    # shows how much of its loss the boosting removed.
-    ys = _Lin(0.0, max(c[0][1] for c in curves), bottom, top, pad=0.04, zero=True, n=4)
+    # The starting loss (the highest first-round deviance of any bag) at the top and the lowest
+    # loss at mid-height: the drop is mirrored below it (deviance never goes below 0), so the
+    # curves fill the top half and the fall reads at a glance.
+    start = max(c[0][1] for c in curves)
+    lowest = min(v for c in curves for _, v in c)
+    ys = _Lin(max(2 * lowest - start, 0.0), start, bottom, top, pad=0.04, n=4)
 
     def dev_fmt(v: float) -> str:
         return _num(v, 4)

@@ -722,11 +722,13 @@ def test_a_live_fit_draws_its_training_curve(poisson):
     assert "early-stopping rows" in svg and "training rows" not in svg
     assert svg.count('class="dfaded"') == len(curves) and 'class="faded"' not in svg
     assert svg.count('class="ddot"') == len(curves)
-    # The scale runs from 0 to the starting loss, so every curve is drawn whole.
-    assert 'text-anchor="end">0</text>' in svg
-    ys = [float(v) for v in re.findall(r'<path class="dfaded" d="M[\d.]+,([\d.]+)', svg)]
-    assert len(ys) == len(curves)
+    # The starting loss is at the top and the lowest loss at mid-height (the drop is mirrored
+    # below it), so the curves fill the top half of the plot (y from 24 to 218 px).
+    paths = re.findall(r'<path class="dfaded" d="([^"]+)"', svg)
+    assert len(paths) == len(curves)
+    ys = [float(y) for d in paths for y in re.findall(r"[ML][\d.]+,([\d.]+)", d)]
     assert min(ys) >= 24.0 - 1e-9, "no curve starts above the plot"
+    assert max(ys) == pytest.approx((24.0 + 218.0) / 2, abs=1.0)
 
 
 def test_callbacks_add_each_bags_training_curve():
