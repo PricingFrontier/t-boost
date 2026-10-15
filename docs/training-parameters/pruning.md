@@ -189,12 +189,19 @@ int
 #### Description
 
 After tables are dropped, re-solve the values of the remaining tables for the smaller structure
-(one ridge IRLS step, followed by purification). The new values are kept only if they lower the
-held-out deviance. Tables on a categorical feature encoded by several channels (see
-[`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
-two-way interaction is re-solved. For multiclassification each class's tables are re-solved,
-and a single step size, chosen on the held-out deviance of all classes together, decides how much
-of the change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
+(one ridge IRLS step, followed by purification). The new values are kept only if they do not
+raise the held-out deviance. Tables on a categorical feature encoded by several channels (see
+[`cat_channels`](categorical.md#cat_channels)), or on one with more levels than
+[`cat_direct_max_levels`](categorical.md#cat_direct_max_levels), keep their values; every other
+main effect and two-way interaction is re-solved. For multiclassification each class's tables are
+re-solved, and a single step size, chosen on the held-out deviance of all classes together, decides
+how much of the change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
+
+A categorical feature with more levels than `cat_direct_max_levels` is fitted on cross-fitted
+target statistics, but after the fit the training objects are binned by statistics computed on
+all of them, and its levels share cells. A training object's own target then helps choose its
+cell, so a re-solve fitted to the training objects would learn that leak, and no held-out part of
+the training objects can detect it.
 
 `False` deploys the remaining tables with their values unchanged.
 

@@ -446,7 +446,9 @@ pub struct RebalanceReport {
     /// The kept main and pair tables the re-solve spans.
     pub supports: u64,
     /// Kept main and pair tables left as fitted: each touches a categorical encoded by more
-    /// than one channel, which the cell correction cannot address as a single axis.
+    /// than one channel, which the cell correction cannot address as a single axis, or one
+    /// whose levels share cells by a cross-fit target statistic, which places each training
+    /// row by its own target (see `cell_reads_own_target`).
     pub excluded: Vec<FeatureSet>,
     /// Rows held out of the re-solve to judge it.
     pub holdout_rows: u64,
@@ -2382,7 +2384,8 @@ fn rebalance_kept_cells(
 ) -> Result<(TableBank, RebalanceReport), PbError> {
     // (0) The correctable survivors: kept main + pair supports (order ≤ 2), as model axes.
     //     The §G1 cell-basis correction spans mains + pairs; kept triples ride along unchanged.
-    let (supports, excluded) = rebalance_supports(&model.provenance, keep);
+    let (supports, excluded) =
+        rebalance_supports(&model.provenance, &model.schema.cat_encoders, keep);
     let mut report = RebalanceReport {
         supports: supports.len() as u64,
         excluded,
@@ -2528,21 +2531,27 @@ fn rebalance_kept_cells(
 }
 
 /// The kept main and pair tables the rebalance re-solves, as sorted MODEL AXIS ids (what
-/// `correction_scaffold` reads), and the ones it leaves as fitted. A raw feature owns one axis
-/// unless it is a categorical encoded by several channels; a table touching such a feature is
-/// excluded, since no single axis carries it. Axis ids differ from raw ids once any earlier
-/// feature owns several axes (bug #5: reading raw ids as axis ids re-solved the wrong column).
+/// `correction_scaffold` reads), and the ones it leaves as fitted. A table is left as fitted
+/// when it touches a categorical the re-solve cannot address, or cannot fit honestly:
+///   * one encoded by several channels, since no single axis carries it. Axis ids differ from
+///     raw ids once any earlier feature owns several axes (bug #5: reading raw ids as axis ids
+///     re-solved the wrong column);
+///   * one whose training rows sit in cells chosen by their own targets (see
+///     [`cell_reads_own_target`]).
 fn rebalance_supports(
     provenance: &[crate::data::AxisProvenance],
+    encoders: &crate::cat::CatEncoderStore,
     keep: &[FeatureSet],
 ) -> (Vec<Vec<u32>>, Vec<FeatureSet>) {
-    // raw id -> its axis, or None once a second axis claims the same raw feature
+    // raw id -> its axis, or None once a second axis claims the same raw feature or its one
+    // axis cannot be re-solved honestly
     let mut axis_of: BTreeMap<u32, Option<u32>> = BTreeMap::new();
     for (axis, p) in (0_u32..).zip(provenance) {
+        let honest = !cell_reads_own_target(encoders, p);
         axis_of
             .entry(p.raw.0)
             .and_modify(|a| *a = None)
-            .or_insert(Some(axis));
+            .or_insert(honest.then_some(axis));
     }
     let mut supports = Vec::new();
     let mut excluded = Vec::new();
@@ -2560,6 +2569,37 @@ fn rebalance_supports(
         }
     }
     (supports, excluded)
+}
+
+/// Whether a training row's serve-time cell on axis `p` depends on the row's own target.
+///
+/// A categorical with more levels than the direct bypass takes (`cat_direct_max_levels`) is fitted
+/// on cross-fit target statistics, but the post-fit stages bin the training rows through the
+/// frozen full-data map, whose statistic for a level contains its rows' own targets: a level
+/// whose rows happen to sit high is binned high. A re-solve fitted to the training residual on
+/// such cells learns that leak, and no slice of the training rows can catch it, out of bag or
+/// not, because every row's own target placed it. On the pg17 instalment set (979 and 16,303
+/// levels) re-solving these tables cut the training deviance 1.1% and raised the test deviance
+/// 0.2-0.4%. A direct-bypass or binary categorical gives each level its own cell, and a count
+/// channel reads no target, so their cells are honest.
+fn cell_reads_own_target(
+    encoders: &crate::cat::CatEncoderStore,
+    p: &crate::data::AxisProvenance,
+) -> bool {
+    let crate::data::AxisKind::CategoricalTS { encoding } = p.kind else {
+        return false;
+    };
+    // An axis without its encoder cannot be judged; leave its tables as fitted.
+    let Some(enc) = encoders
+        .encoders()
+        .iter()
+        .find(|e| e.raw == p.raw && e.id == encoding)
+    else {
+        return true;
+    };
+    let levels = enc.levels.len();
+    let own_cell_per_level = levels <= 2 || levels <= enc.config.direct_max_levels as usize;
+    enc.config.target != crate::cat::CatTarget::Count && !own_cell_per_level
 }
 
 /// Per-class corrections a multiclass rebalance deploys: each class's purified correction bank
@@ -2599,7 +2639,8 @@ fn rebalance_multiclass_cells(
     let mut excluded: std::collections::BTreeSet<FeatureSet> = std::collections::BTreeSet::new();
     for bank in banks_kept {
         let carried: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
-        let (axes, left) = rebalance_supports(&first.provenance, &carried);
+        let (axes, left) =
+            rebalance_supports(&first.provenance, &first.schema.cat_encoders, &carried);
         resolved.extend(
             carried
                 .iter()
@@ -5022,7 +5063,8 @@ mod tests {
     #[test]
     fn rebalance_resolves_each_raw_feature_to_its_own_axis() {
         use crate::data::{AxisKind, AxisProvenance, FeatureId};
-        let mut provenance = fixture_multichannel_model().provenance;
+        let model = fixture_multichannel_model();
+        let mut provenance = model.provenance.clone();
         for raw in [1, 2] {
             provenance.push(AxisProvenance {
                 raw: FeatureId(raw),
@@ -5038,9 +5080,92 @@ mod tests {
             fs(&[1, 2]),
             fs(&[0, 1, 2]),
         ];
-        let (supports, excluded) = rebalance_supports(&provenance, &keep);
+        let (supports, excluded) =
+            rebalance_supports(&provenance, &model.schema.cat_encoders, &keep);
         assert_eq!(supports, vec![vec![2], vec![3], vec![2, 3]]);
         assert_eq!(excluded, vec![fs(&[0]), fs(&[0, 1])]);
+    }
+
+    /// A categorical whose levels share cells by a cross-fit target statistic is left as
+    /// fitted: on the training rows its cells are chosen by the rows' own targets. A level that
+    /// owns its cell (direct bypass, binary) or a target-free count channel is re-solved, and
+    /// switching the bypass off turns a five-level feature into a cross-fit one.
+    #[test]
+    fn rebalance_leaves_tables_on_a_cross_fit_categorical_as_fitted() {
+        use crate::cat::{
+            CatEncoder, CatEncoderStore, CatLevel, CatTarget, TsConfig, TsEncodingId,
+        };
+        use crate::data::{AxisKind, AxisProvenance, FeatureId};
+        let encoder = |raw: u32, levels: usize, config: TsConfig| CatEncoder {
+            raw: FeatureId(raw),
+            id: TsEncodingId(0),
+            levels: (0..levels)
+                .map(|i| CatLevel {
+                    label: format!("L{i}"),
+                    members: vec![format!("L{i}")],
+                    encoding: i as f32,
+                    bin: u8::try_from(i % 200).unwrap() + 1,
+                    weight: 1.0,
+                })
+                .collect(),
+            base: 0.0,
+            config,
+        };
+        let axis = |raw: u32| AxisProvenance {
+            raw: FeatureId(raw),
+            kind: AxisKind::CategoricalTS {
+                encoding: TsEncodingId(0),
+            },
+        };
+        let provenance = vec![
+            AxisProvenance {
+                raw: FeatureId(0),
+                kind: AxisKind::Numeric,
+            },
+            axis(1), // 40 levels: cross-fit
+            axis(2), // 5 levels: direct bypass
+            axis(3), // binary
+            axis(4), // 40 levels, but a count channel
+        ];
+        let count = TsConfig {
+            target: CatTarget::Count,
+            ..TsConfig::default()
+        };
+        let fs = |ids: &[u32]| FeatureSet::new(ids);
+        let keep = [
+            fs(&[0]),
+            fs(&[1]),
+            fs(&[2]),
+            fs(&[3]),
+            fs(&[4]),
+            fs(&[0, 1]),
+            fs(&[0, 2]),
+            fs(&[2, 3]),
+        ];
+        let store = |direct_max_levels: u32| {
+            let config = TsConfig {
+                direct_max_levels,
+                ..TsConfig::default()
+            };
+            CatEncoderStore::from_encoders(vec![
+                encoder(1, 40, config.clone()),
+                encoder(2, 5, config.clone()),
+                encoder(3, 2, config),
+                encoder(4, 40, count.clone()),
+            ])
+        };
+        let (supports, excluded) = rebalance_supports(&provenance, &store(16), &keep);
+        assert_eq!(
+            supports,
+            vec![vec![0], vec![2], vec![3], vec![4], vec![0, 2], vec![2, 3]]
+        );
+        assert_eq!(excluded, vec![fs(&[1]), fs(&[0, 1])]);
+        let (supports, excluded) = rebalance_supports(&provenance, &store(0), &keep);
+        assert_eq!(supports, vec![vec![0], vec![3], vec![4]]);
+        assert_eq!(
+            excluded,
+            vec![fs(&[1]), fs(&[2]), fs(&[0, 1]), fs(&[0, 2]), fs(&[2, 3])]
+        );
     }
 
     /// A fit-time cell correction is folded into the deployed bank, so the rebalance composes

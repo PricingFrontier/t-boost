@@ -4,6 +4,9 @@ It used to return the pruned bank untouched, without a word, whenever the fit ca
 correction or any categorical was encoded by more than one channel. Now it re-solves every kept
 main and pair it can address, leaves the tables on a multi-channel categorical as fitted, and
 records the outcome in `pruning_report_["rebalance"]`.
+
+Tables on a categorical binned by cross-fit target statistics are left as fitted too: after the
+fit, the training rows are binned by full-data statistics that contain their own targets.
 """
 
 from __future__ import annotations
@@ -39,14 +42,30 @@ def _fit(data, **kw) -> TBoostRegressor:
 def test_a_pruned_fit_reports_its_rebalance(data) -> None:
     rep = _fit(data).pruning_report_["rebalance"]
     assert set(rep) == KEYS
-    assert rep["supports"] > 0 and rep["excluded"] == []
+    assert rep["supports"] > 0
     assert rep["holdout_rows"] > 0
     assert _fit(data, prune_rebalance=False).pruning_report_.get("rebalance") is None
 
 
+def test_tables_on_a_target_encoded_categorical_are_left_as_fitted(data) -> None:
+    # "c" (raw 2) has 40 levels: more than `cat_direct_max_levels`, so it is binned by
+    # cross-fit target statistics and its tables keep their values. Let it bin each level on
+    # its own and they are re-solved like any other.
+    est = _fit(data)
+    rep = est.pruning_report_["rebalance"]
+    kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
+    assert rep["excluded"] == [u for u in kept if 2 in u] != []
+    assert rep["supports"] == len(kept) - len(rep["excluded"]) > 0
+    direct = _fit(data, cat_direct_max_levels=64)
+    rep = direct.pruning_report_["rebalance"]
+    kept = [u for u in direct.pruning_report_["kept"] if len(u) <= 2]
+    assert rep["excluded"] == [] and rep["supports"] == len(kept)
+
+
 def test_tables_on_a_multichannel_categorical_are_left_as_fitted(data) -> None:
-    # 40 levels clears `cat_count_min_levels`, so "c" (raw 2) gets a count channel too.
-    est = _fit(data, cat_channels=["mean", "count"])
+    # 40 levels clears `cat_count_min_levels`, so "c" (raw 2) gets a count channel too; its
+    # mean channel bins each level on its own, so the channels are the only reason.
+    est = _fit(data, cat_channels=["mean", "count"], cat_direct_max_levels=64)
     rep = est.pruning_report_["rebalance"]
     kept = [u for u in est.pruning_report_["kept"] if len(u) <= 2]
     assert rep["excluded"] == [u for u in kept if 2 in u] != []
