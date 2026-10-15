@@ -12,7 +12,7 @@ day (see "Fixed" below); PF-03, PF-05 to PF-08 and PF-11 to PF-13 remain open.
 | PF-04 | `87c48a9` | Docs: multiclass graduation is supported; the 1% check is a brake, not an accuracy test. The `w_scale` comment is corrected (PF-08). |
 | PF-09 | `ed25646` | Graduation's log-link re-anchor honours the resolved `reanchor`. The `reanchor` docs also understated the default (it is on for poisson, gamma, tweedie and logistic) and `reanchor_slope`'s default was described as the same. |
 | PF-10 | `b7e7717` | Every graduation path records `skipped` and `candidate_count`. |
-| PF-14 | `ae23d59` | The test now asserts the documented contract: a truthy callback stops every bag after its current round, so the other bag stops at or before round 5. The fitted model therefore depends on bag timing when a callback stops the fit; making that deterministic would change the public callback contract and is left as a decision. |
+| PF-14 | `ae23d59`, `5831d31` | A truthy callback used to stop every bag after whatever round each had reached, so the fitted model depended on thread timing (the flaky test was this). On the maintainer's decision the contract changed: a truthy return stops the bag it was called for, as early stopping stops each bag at its own round, and a callback that decides from its dict alone gives a byte-identical model on every run and at any `n_jobs`. Return truthy for every bag to stop the whole fit; an exception still stops it. Haute does not pass t-boost callbacks. |
 | PF-15 | `e6fb8b0` | The multiclass rebalance re-anchors each trial step on every row before scoring it, so the check judges the model it deploys (the single-output check already did). Same steps on pg17_instal and pg16_fleet. |
 
 Looked at and left as they are:
