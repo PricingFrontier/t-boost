@@ -1,0 +1,2 @@
+{"dataset": "pg16_fleet", "split": 0, "fit_s": 94.63, "test": 0.9671148976722823, "cells": 35723, "cells_by_order": {"1": 223, "2": 6444, "3": 29056}, "tables": 619, "tables_by_order": {"1": 40, "2": 226, "3": 353}}
+{"dataset": "fr_instal", "split": 0, "fit_s": 103.23, "test": 0.8445752821920968, "cells": 259003, "cells_by_order": {"1": 1003, "2": 65862, "3": 192138}, "tables": 1662, "tables_by_order": {"1": 72, "2": 537, "3": 1053}}

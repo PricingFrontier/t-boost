@@ -470,9 +470,11 @@ Supported formats for setting the value of this parameter:
 
 !!! note
 
-    A model with monotonic constraints keeps its full set of tables: pruning, banding and
-    graduation are skipped, and `prune_main_effects`, `prune_table_budget` and
-    `prune_box_budget` cannot be used with it.
+    Monotonic constraints apply to numeric features only; a constraint on a categorical feature
+    raises an error. The trees enforce the constraints. Pruning, banding and graduation run as
+    for any other model, and the deployed tables are then projected back onto the constraints,
+    changing as little as possible. The `pruning_report_["monotone"]` attribute
+    records what changed.
 
 **Type**
 
@@ -532,8 +534,11 @@ bool
 
 None. Depends on the objective:
 
-- `gamma`, `tweedie`: True
+- `poisson`, `gamma`, `tweedie`, `logistic`: True
 - other objectives: False
+
+An explicit value also applies to the intercept re-solve that follows an adopted
+[graduation](graduation.md).
 
 ## reanchor_slope {#reanchor_slope}
 
@@ -546,8 +551,7 @@ ranking of the objects or the decomposition into rating tables.
 
 The recalibration is shrunk toward the identity and only applied when its improvement on the
 validation objects clears a penalty, so a small validation set leaves the model unchanged. It
-has no effect when `validation_fraction` is `None`. Setting it to `True` together with an
-`eval_set` raises an error.
+has no effect when `validation_fraction` is `None`.
 
 Not supported for multiclassification: setting it explicitly raises an error.
 
@@ -557,4 +561,7 @@ bool
 
 **Default value**
 
-None (the same as [`reanchor`](#reanchor))
+None. Depends on the objective:
+
+- `poisson`, `gamma`, `tweedie`: True
+- other objectives: False

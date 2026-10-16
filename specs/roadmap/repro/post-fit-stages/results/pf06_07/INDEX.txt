@@ -1,0 +1,61 @@
+PF-06 / PF-07 investigation (multiclass banding and graduation), 2026-10-15
+Worktree build: report-0.9.1 @ b3accbb plus the experiment-only hooks in exp_hooks.diff (never committed).
+Run every script with the worktree interpreter:
+  /home/ralph/suite/t-boost/.claude/worktrees/agent-aa9f4791fc8a2b51d/.venv/bin/python <script>
+Datasets and splits come from the team harness (team_bench.py): test rows = default_rng(split).uniform() >= 0.8.
+
+Experiment-only hooks (exp_hooks.diff; hook_mcband_exp.rs.txt is the first version of the banding part)
+  TBOOST_EXP_MCBAND_DUMP=<dir>   multiclass banding writes preband.bin (the pre-banding table model),
+                                 meta.json (per-class sigma, hs, dev_mean), bagscores_<k>.f64 (every bag's
+                                 kept-bank class-k score per row) and inbag.u8 (bag membership)
+  TBOOST_EXP_BAGTABLES=1         also bagtables_<k>.json (every bag's order-1/2 kept tables)
+  TBOOST_EXP_MCBAND_MODE         banding budget mode (mass, capx<f>, sigx<f>, nosig), see mc_band_apply
+  _MultiClassTableModel.exp_band re-bands a model with given sigmas and mode (no refit)
+  TBOOST_EXP_GRAD_SLACK          overrides the multiclass graduation 1% brake (to get ungated candidates)
+
+Scripts
+  common.py         shared helpers (harness import, CE, census); PF_PROTO=1 selects the target/proto build
+  exp_lib.py        Stage: one fit per (dataset, split, n_bags[, tag]) cached under dumps/, then U (unbanded),
+                    B (shipped banded), re-banding, logits cache, second-order decomposition of a move
+  band_exp.py       banding variants on a stage -> band_exp.jsonl (first-order, joint and diagonal
+                    second-order terms on train and test, per class; budgets; cells; noise structure)
+  grad_lib.py       graduation with the per-table GCV curves exposed (shipped rule reproduced), pooled-alpha
+                    rules, null-space refusal rule, native candidate with the brake lifted
+  grad_exp.py       graduation rules on a stage's banks (U, B, stored re-bandings, graduate-first)
+                    -> grad_exp.jsonl (ungated test change, training ratio the brake judges, per class,
+                    ceiling vs below-ceiling, decomposition)
+  centre_lib.py, centre_exp.py   softmax-centred graduation (union-grid common component) -> grad_exp.jsonl
+  gcv_noise.py      GCV's implied cell noise vs the between-bag noise; Mallows Cp at the bag noise scale
+                    -> gcv_noise.jsonl (needs a TBOOST_EXP_BAGTABLES dump: dumps/fr_instal_s0_b8_bt)
+  per_table.py      each graduated table applied alone -> per_table.jsonl
+  order_split.py    banding's held-out first-order term split by table order -> order_split.jsonl
+  oob_first.py      out-of-bag estimate of banding's first-order term -> oob_first.jsonl
+  csig_exp.py       banding with the softmax-centred bag noise -> band_exp.jsonl (variant csig)
+  null_single.py    null-space refusal rule on single-output fits, as shipped -> null_single.jsonl
+  ovr_check.py, es_check.py, time_probe.py   convergence and timing probes
+  paired_se.py      row-level paired SEs of banding comparisons -> paired_se.jsonl
+  csig_watch.py     runs csig_exp + graduation on the csig bank + paired_se on each new stage
+                    (log: csig_watch.log); csig_grad.sh did the same for the first stages
+  capx05_grad.sh    graduation on fr_instal's half-cap banks (capx05_grad.log)
+  null_jobs.sh, null_final.sh   the null-space refusal rule on stored banks (null_jobs.log,
+                    null_final.log). Note: the prudential s1 null-rule run came from null_final.sh;
+                    an in-place edit of jobs_C3.txt did not reach the already-running queue.
+  pooled_stats.py   pooled first-order share and joint/diagonal ratios -> pooled_stats.txt
+  queue.sh, jobs_*.txt, light_jobs.sh   the run queues (A, C were stopped at job boundaries and
+                    resumed as A2/A3, C2/C3 with trimmed lists); queue_*.log hold [mc-es] lines
+  summarize.py      tables: facts | conv | band | dec | budgets | grad | side | all <file>
+  summary.md        THE GENERATED REPORT (python summarize.py all summary.md)
+
+Caches: dumps/<dataset>_s<split>_b<bags>[_tag]/ hold est.bin (the fitted estimator), preband.bin,
+band_*.bin / gfirst_*.bin (stored re-bandings), meta.json, pruning_report.json. They are
+regenerable (refit with the hook build) and are NOT git-ignored: about 1.2 GB, do not commit.
+The bag-level inputs (bagscores, bagtables, inbag) were deleted after their analyses finished.
+
+Build state: the worktree's .venv extension was built WITH the hooks (exp_hooks.diff); its sources
+are back at b3accbb, so `uv sync --reinstall-package t-boost` in the worktree restores a clean
+build. target/proto/ in the worktree holds a second hook build (used for the bag-table dump).
+
+Units: test/train deviance = weighted mean multiclass cross-entropy (NLL); changes in % of the reference.
+"first", "joint2", "diag2" are the second-order decomposition of a move a -> b in NLL units:
+  first = mean (p - y).delta, joint2 = 1/2 mean [sum p delta^2 - (sum p delta)^2], diag2 = 1/2 mean sum p(1-p) delta^2.
+Cells = deployed_census dense cells (factored tables are not counted, so unbanded banks undercount).

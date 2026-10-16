@@ -2,9 +2,9 @@
 
 Early stopping ends the training of each bag when the deviance of the objective on a
 validation dataset stops improving, and keeps the trees up to the iteration with the best
-deviance. By default the validation dataset is a fraction of the training objects
-([`validation_fraction`](#validation_fraction)). Pass `eval_set` to `fit` to use a separate
-dataset instead. See [Early stopping](../algorithm/early-stopping.md) for details.
+deviance. The validation dataset is a fraction of the training objects
+([`validation_fraction`](#validation_fraction)). See
+[Early stopping](../algorithm/early-stopping.md) for details.
 
 ## validation_fraction {#validation_fraction}
 
@@ -18,7 +18,7 @@ The validation objects are stratified for classification (by class) and for the 
 groups are set aside instead of single objects, once, and the bags share them.
 
 `None` turns early stopping off, so every bag builds [`n_trees`](common.md#n_trees)
-trees. The value is ignored when an `eval_set` is passed to `fit`.
+trees.
 
 **Type**
 

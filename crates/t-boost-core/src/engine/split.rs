@@ -4234,6 +4234,7 @@ mod tests {
             bag_spans: None,
             bag_intercepts: None,
             bag_in_bag: None,
+            fit_cat_bins: None,
             delta_step_gate: None,
             fit_report: None,
         }

@@ -1,0 +1,13 @@
+[mc-es] trained_rounds=10646 best_round=10146 kept_rounds=10146
+[mc-es] trained_rounds=11331 best_round=10831 kept_rounds=10831
+[mc-es] trained_rounds=12000 best_round=11948 kept_rounds=11948
+[mc-es] trained_rounds=12000 best_round=11964 kept_rounds=11964
+[mc-es] trained_rounds=12000 best_round=11857 kept_rounds=11857
+[mc-es] trained_rounds=12000 best_round=11979 kept_rounds=11979
+[mc-es] trained_rounds=12000 best_round=11996 kept_rounds=11996
+[mc-es] trained_rounds=12000 best_round=11988 kept_rounds=11988
+[mc-prune] deploy_fit 169.36s
+[mc-prune] banding 227.46s
+fr_instal s0 b8       unbanded: test 0.804539 (+0.000% vs U, -0.265% vs ship) cells 108608 first +0.000 joint 0.000 diag 0.000
+fr_instal s0 b8        shipped: test 0.806680 (+0.266% vs U, +0.000% vs ship) cells 723021 first +0.195 joint 0.071 diag 0.065
+noise {'dataset': 'fr_instal', 'split': 0, 'n_bags': 8, 'variant': '_noise', 'tag': 'nt12k', 'sigma_shipped': [0.09927185031749228, 0.09178235963010233, 0.2711013615864334, 0.16575638894871664], 'sigma_raw': [0.099271850317492, 0.09178235963010202, 0.271101361586434, 0.16575638894871708], 'sigma_centred': [0.08038988084576247, 0.06726123398839853, 0.22740008269113193, 0.140921580939844], 'joint_over_diag_noise': 0.9082345197435675}

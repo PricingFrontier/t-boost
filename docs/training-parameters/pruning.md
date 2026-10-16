@@ -15,9 +15,8 @@ Two selectors are available (see [`prune_selector`](#prune_selector)):
   Its parameters are listed in [Fold vote pruning settings](pruning-fold-vote.md).
 
 The ranked path needs out-of-bag objects: `n_bags` of at least 2, and at least
-[`prune_guard_min_rows`](#prune_guard_min_rows) objects that are out of bag for some bag. For
-regression and binary classification, a fit without them falls back to `fold_vote`. For
-multiclassification, it keeps the full set of tables.
+[`prune_guard_min_rows`](#prune_guard_min_rows) objects that are out of bag for some bag. A fit
+without them falls back to `fold_vote`.
 
 The selection is recorded in the `pruning_report_` attribute.
 
@@ -27,9 +26,10 @@ The selection is recorded in the `pruning_report_` attribute.
 
 Select the tables to deploy after the training, and deploy the smaller set.
 
-`False` deploys the full, unpruned set of tables: faster to train, but a much larger model.
-Either way the model is stored as rating tables. [Banding](banding.md) and
-[graduation](graduation.md) are only applied to a pruned model.
+`False` keeps the full set of tables: faster to train, but more tables. Only the selection is
+skipped: [banding](banding.md), [graduation](graduation.md) and the monotone repair run either
+way, and the model is always stored as rating tables. `band_tolerance=None, graduate=False`
+keeps the full set exactly as the trees fitted it.
 
 **Type**
 
@@ -56,7 +56,7 @@ that contains it, and the path starts from the intercept-only model instead of t
 model. [`prune_path_fraction`](#prune_path_fraction) is then measured from the intercept-only
 model, which can change the interactions that are kept as well.
 
-Requires `prune=True` and cannot be combined with `monotone_constraints`.
+Requires `prune=True`.
 
 **Type**
 
@@ -142,8 +142,8 @@ can still sit before the cutoff. This floor removes such tables. For example, `1
 tables that explain less than 0.01% of the variance. The shares are those of the
 [pruning report](../model-analysis/model-report.md#build). Main effects are
 subject to the floor only when [`prune_main_effects`](#prune_main_effects) is set. 0 turns the
-floor off. A fit without the out-of-bag objects the path needs keeps the full set of tables, and
-the floor does not run either.
+floor off. A fit without the out-of-bag objects the path needs falls back to `fold_vote`, which
+does not apply the floor.
 The value must be in the range $[0; 1)$. Used only by the `ranked_path` selector.
 
 **Type**
@@ -173,11 +173,8 @@ int
 
 #### Description
 
-The minimum number of objects with honest evidence needed to judge the tables on.
-
-For the `ranked_path` selector, these are the objects that are out of bag for at least one bag:
-with fewer, the ranked path is not used. For the `fold_vote` selector, it is the minimum number
-of evidence objects for its [no-harm guard](pruning-fold-vote.md#prune_guard) to act.
+The minimum number of objects that are out of bag for at least one bag, needed to score the
+prefixes of the `ranked_path` selector. With fewer, the ranked path is not used.
 
 **Type**
 
@@ -192,9 +189,15 @@ int
 #### Description
 
 After tables are dropped, re-solve the values of the remaining tables for the smaller structure
-(one ridge IRLS step, followed by purification). The new values are kept only if they lower the
-held-out deviance. Models with multi-channel categorical features (see
-[`cat_channels`](categorical.md#cat_channels)) are not rebalanced.
+(one ridge IRLS step, followed by purification). The new values are kept only if they do not
+raise the held-out deviance. Tables on a categorical feature encoded by several channels (see
+[`cat_channels`](categorical.md#cat_channels)) keep their values; every other main effect and
+two-way interaction is re-solved. For multiclassification each class's tables are re-solved, and a
+single step size, chosen on the held-out deviance of all classes together, decides how much of the
+change is kept. The outcome is recorded in `pruning_report_["rebalance"]`.
+
+The re-solve places the training objects of a categorical feature with more levels than bins as
+the trees saw them (see [Categorical features](../algorithm/categorical-features.md)).
 
 `False` deploys the remaining tables with their values unchanged.
 

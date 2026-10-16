@@ -4,6 +4,7 @@ import json
 import warnings
 
 import numpy as np
+import polars as pl
 import pytest
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
@@ -170,12 +171,13 @@ def test_stale_pruning_and_graduation_reports_cleared_on_set_params_and_refit() 
     assert not hasattr(est, "pruning_report_")
     assert not hasattr(est, "graduation_report_")
 
-    # A direct refit with prune/graduate turned off must not leave the PREVIOUS fit's reports.
+    # A direct refit with prune/graduate turned off must not leave the PREVIOUS fit's reports:
+    # the unpruned fit records its own (no selection), and no graduation report at all.
     est2 = TBoostRegressor(**common).fit(xn, yn)
     assert hasattr(est2, "pruning_report_") and hasattr(est2, "graduation_report_")
     est2.set_params(prune=False, graduate=False)
     est2.fit(xn, yn)
-    assert not hasattr(est2, "pruning_report_")
+    assert est2.pruning_report_["selector"] == "none"
     assert not hasattr(est2, "graduation_report_")
 
 
@@ -454,34 +456,35 @@ def test_wh_graduation_never_smooths_the_populated_missing_bin() -> None:
     assert not np.allclose(out2[1:, :], v2_arr[1:, :]), "2-D: the real rows must actually smooth"
 
 
-def test_graduate_without_prune_raises_but_auto_default_stays_silent() -> None:
+def test_graduation_runs_on_unpruned_fits_too() -> None:
+    # 2026-10-14: an unpruned fit skips the selection and nothing else, so graduate=True (and
+    # the default None, which resolves to on) graduate its full table bank.
     x, y = regression_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect without prune=True"):
-        small_regressor(graduate=True, prune=False).fit(x, y)
-
-    # The auto-default (graduate=None, resolves to True for poisson/gamma) must NOT raise when
-    # prune is off -- the whole resolution block lives inside the pruned path, so it truthfully
-    # never engages (not a special-cased silence).
-    est = small_regressor(
-        objective="poisson", graduate=None, prune=False
-    ).fit(x.astype(np.float32), np.abs(y))
-    assert not hasattr(est, "graduation_report_")
-    # Explicit False must never raise either, prune or not.
-    small_regressor(graduate=False, prune=False).fit(x, y)
-    small_regressor(graduate=False, prune=True).fit(x, y)
+    for graduate in (True, None):
+        est = small_regressor(
+            objective="poisson", graduate=graduate, prune=False
+        ).fit(x.astype(np.float32), np.abs(y))
+        assert hasattr(est, "graduation_report_")
+        assert est.graduation_validation_.get("skipped") != "disabled"
+        assert "candidate_count" in est.graduation_validation_
+    # Explicit False never graduates, prune or not.
+    for prune in (False, True):
+        est = small_regressor(graduate=False, prune=prune).fit(x, y)
+        assert not hasattr(est, "graduation_report_")
+        assert est.graduation_validation_["skipped"] == "disabled"
 
     # Binary classifier (K=2) routes through the same _fit_model, so the same rule applies.
     xc, yc = classifier_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect without prune=True"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xc, yc)
+    est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xc, yc)
+    assert hasattr(est, "graduation_report_")
 
-    # Multiclass (K>=3): graduate=True always raises, prune or not -- there is no graduation
-    # path for the multiclass per-class banks at all.
+    # Multiclass (K>=3) graduates every class bank, pruned or not.
     xm, ym = multiclass_fixture()
-    with pytest.raises(ValueError, match="graduate=True has no effect for multiclass"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=False).fit(xm, ym)
-    with pytest.raises(ValueError, match="graduate=True has no effect for multiclass"):
-        TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=True).fit(xm, ym)
+    for prune in (False, True):
+        est = TBoostClassifier(n_trees=10, seed=0, graduate=True, prune=prune).fit(xm, ym)
+        assert est.graduation_validation_.get("skipped") != "disabled"
+        assert "candidate_count" in est.graduation_validation_
+        assert all("class" in entry for entry in est.graduation_report_)
 
 
 def test_graduated_table_variance_reflects_post_smoothing_values() -> None:
@@ -807,6 +810,35 @@ def test_reanchor_defaults_on_for_log_link_only() -> None:
         objective="squared_error", reanchor=False, **common
     ).fit(x, y).predict(x)
     np.testing.assert_array_equal(s_def, s_off)
+
+
+def test_graduation_says_why_when_nothing_is_smoothed() -> None:
+    # Only categorical features: no ordinal axis to smooth along, so no table is eligible. The
+    # early return used to leave `graduation_validation_` with `adopted: False` and no reason.
+    rng = np.random.default_rng(0)
+    n = 2000
+    a, b = rng.choice(list("pqrst"), n), rng.choice(list("uvw"), n)
+    y = rng.poisson(np.exp(0.3 * (a == "p") - 0.2 * (b == "u"))).astype(np.float32)
+    X = pl.DataFrame({"a": a, "b": b})
+    est = TBoostRegressor(objective="poisson", n_trees=40, seed=0, n_jobs=2).fit(X, y)
+    gv = est.graduation_validation_
+    assert gv["adopted"] is False and gv["candidate_count"] == 0
+    assert gv["skipped"] == "no eligible smoothing updates"
+
+
+def test_graduation_keeps_the_intercept_as_fitted_under_reanchor_false() -> None:
+    # An adopted log-link graduation restores the portfolio total on the intercept, as the
+    # fit's own re-anchor does. It used to do so whatever `reanchor` said, so an explicit
+    # `reanchor=False` predicted exactly like the default once graduation was adopted.
+    rng = np.random.RandomState(0)
+    x = rng.rand(4000, 3).astype(np.float32)
+    y = rng.gamma(4.0, np.exp(0.3 + 0.8 * x[:, 0] - 0.4 * x[:, 1]) / 4.0).astype(np.float32)
+    common = dict(n_trees=60, max_bin=32, seed=0, prune=False, n_jobs=2)
+    on = TBoostRegressor(objective="gamma", **common).fit(x, y)
+    off = TBoostRegressor(objective="gamma", reanchor=False, **common).fit(x, y)
+    assert on.graduation_validation_["adopted"] and off.graduation_validation_["adopted"]
+    np.testing.assert_allclose(on.predict(x).mean(), y.mean(), rtol=1e-6)
+    assert abs(off.predict(x).mean() / y.mean() - 1.0) > 1e-3
 
 
 def multiclass_fixture() -> tuple[np.ndarray, np.ndarray]:

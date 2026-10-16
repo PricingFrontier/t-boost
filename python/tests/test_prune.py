@@ -116,7 +116,7 @@ def test_se_rule_is_honored_on_the_multiclass_path() -> None:
 
 def test_prune_default_on_deploys_table_model() -> None:
     # 2026-07-15 benchmark parity: prune defaults ON (every insur-arena cell deployed the
-    # CV-pruned tables-only artifact); prune=False deploys the full, unpruned table bank.
+    # CV-pruned tables-only artifact); prune=False keeps the full table bank.
     x, y = _noisy_poisson(n=1000)
     est = TBoostRegressor(objective="poisson", n_trees=100, n_bags=1, seed=0).fit(x, y)
     assert isinstance(est._model, _TableModel)
@@ -127,7 +127,37 @@ def test_prune_default_on_deploys_table_model() -> None:
     ).fit(x, y)
     assert isinstance(off._model, _TableModel)
     assert off._model.deployed_table_count() >= est._model.deployed_table_count()
-    assert not hasattr(off, "pruning_report_")
+    # No selection ran: every table is kept, and the report says so.
+    assert off.pruning_report_["selector"] == "none"
+    assert off.pruning_report_["kept"] == off.pruning_report_["deployed"]
+    assert "table_scores" not in off.pruning_report_
+
+
+def test_an_unpruned_multiclass_fit_is_banded() -> None:
+    # Only the selection is skipped on an unpruned fit (2026-10-14): every class bank is banded,
+    # against the spread of the bags' full banks, as a pruned fit's are.
+    rng = np.random.default_rng(5)
+    n = 3000
+    x = rng.normal(size=(n, 3)).astype(np.float32)
+    logits = np.stack([np.zeros(n), x[:, 0] + 0.5 * x[:, 0] * x[:, 1], -x[:, 1]], axis=1)
+    p = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+    y = (rng.uniform(size=(n, 1)) > np.cumsum(p, axis=1)).sum(axis=1)
+    kw = dict(n_trees=60, n_bags=4, seed=0, n_jobs=2, prune=False)
+    # (explicit tolerance: this module pins `band_tolerance=None`, see the fixture at its end)
+    banded = TBoostClassifier(**kw, band_tolerance=0.75).fit(x, y)
+    lossless = TBoostClassifier(**kw, band_tolerance=None).fit(x, y)
+    rep = banded.pruning_report_
+    assert rep["selector"] == "none"
+    assert len(rep["banding"]) == 3
+    assert "banding" not in lossless.pruning_report_
+
+    def cells(est: TBoostClassifier) -> int:
+        return sum(est._multi_model.deployed_census()["cells"].values())
+
+    assert cells(banded) < cells(lossless)
+    np.testing.assert_allclose(banded.predict_proba(x).sum(axis=1), 1.0, rtol=1e-5)
+    restored = TBoostClassifier.from_bytes(banded.to_bytes())
+    np.testing.assert_array_equal(restored.predict_proba(x), banded.predict_proba(x))
 
 
 def test_scalar_prune_accepts_sklearn_all_core_n_jobs() -> None:
@@ -232,17 +262,16 @@ def test_native_multiclass_fit_prune_matches_two_call_path() -> None:
     )
     # The SELECTION contract is unchanged: the keep-set is chosen on a complement fit's
     # held-out slice, so the report must match the manual two-call path exactly. Compared as
-    # PARSED JSON, minus the `guard` block: `fit_multiclass_pruned` always emits the K>=3
-    # set-level guard's outcome (here `{"enabled": false}` — the guard is opt-in), which the
-    # two-call `prune_to_tables` path has no equivalent of, and re-serializing through
-    # `serde_json::Value` to attach it also normalizes key order. Neither is a selection change.
+    # PARSED JSON: re-serializing through `serde_json::Value` to attach the selector fields
+    # below also normalizes key order, which is not a selection change.
     actual_doc = json.loads(actual_report)
-    assert actual_doc.pop("guard") == {"enabled": False, "fired": False}
     # The binding also names the selection regime it ran (`sel_rows` given, no `fold_of`),
     # and whether main effects were pruning candidates (the default keeps them all).
     assert actual_doc.pop("selector") == "single_split_walk"
     assert actual_doc.pop("cv_folds") == 0
     assert actual_doc.pop("main_effect_policy") == "sticky"
+    # ...and the deployed fit's per-bag boosting report, which the estimator lifts out.
+    assert [r["reason"] for r in actual_doc.pop("fit_report")] != []
     assert actual_doc == json.loads(expected_report)
     # The DEPLOYED model contract changed (2026-07-14): the keep-set is applied to a fit on
     # ALL rows (the old design withheld the sel slice from the deployed model), so the table
@@ -328,8 +357,6 @@ def test_exposed_prune_internals_are_bit_identical_at_their_hardcoded_defaults()
         prune_fold_min_rows=125,
         prune_fold_es_patience=None,
         prune_guard_min_rows=500,
-        prune_slope_eps=0.01,
-        prune_slope_min_z=3.0,
     ).fit(x, y)
     np.testing.assert_array_equal(bare.predict(x), explicit.predict(x))
     assert bare.pruning_report_["kept"] == explicit.pruning_report_["kept"]
@@ -409,8 +436,6 @@ def test_aggregator_knobs_are_live_under_multiclass_cv_and_raise_on_the_legacy_s
         (dict(prune_fold_min_rows=0), "prune_fold_min_rows"),
         (dict(prune_fold_es_patience=0), "prune_fold_es_patience"),
         (dict(prune_guard_min_rows=0), "prune_guard_min_rows"),
-        (dict(prune_slope_eps=-0.1), "prune_slope_eps"),
-        (dict(prune_slope_min_z=float("nan")), "prune_slope_min_z"),
     ],
 )
 def test_exposed_prune_internals_reject_out_of_range_values(kwargs, match) -> None:
@@ -843,338 +868,8 @@ def test_recipe_tuned_grouped_deploy_fit_is_finite() -> None:
     assert np.isfinite(np.asarray(est.predict(x), np.float64)).all()
 
 
-def _guard_fixture(n: int = 8000, seed: int = 0):
-    import pandas as pd
-
-    rng = np.random.default_rng(seed)
-    x = np.column_stack([rng.uniform(0, 1, n), rng.uniform(0, 1, n)]).astype(np.float32)
-    cat = rng.choice([f"L{i}" for i in range(8)], size=n)
-    mu = np.exp(0.3 * np.sin(6 * x[:, 0]) + 0.2 * (x[:, 1] > 0.5) + 0.15 * (cat == "L3"))
-    y = rng.poisson(mu).astype(np.float32)
-    X = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "c": cat})
-    return X, y
-
-
-def test_prune_guard_silent_is_identical() -> None:
-    # Healthy fixture: the selected bank sits within tol of the full bank on the OOB evidence
-    # rows, the guard stays silent, and the deployed model is EXACTLY the unguarded one — to
-    # the byte, not just to the prediction. No size gate any more: an 8k-row ungrouped fit
-    # runs the guard, where av33 would have reported it skipped.
-    X, y = _guard_fixture()
-    kw = dict(objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-              categorical_features=["c"])
-    on = TBoostRegressor(graduate=False, **kw).fit(X, y)
-    off = TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y)
-    g = on.pruning_report_["guard"]
-    assert g["enabled"] is True and g["fired"] is False and "skipped" not in g
-    assert g["evidence"] == "oob"
-    assert g["holdout_rows"] >= 500 and g["oob_rows"] == g["holdout_rows"]
-    assert g["oob_mean_jury"] > 1.0 and g["oob_rows_uncovered"] > 0
-    # The un-reanchored bank comparison is level-neutral (purified tables are reference-
-    # measure centered), which is what makes skipping the deploy re-anchor sound.
-    assert abs(g["level_shift"]) < 1e-2 * abs(g["dev_full"])
-    assert off.pruning_report_["guard"]["enabled"] is False
-    assert off.pruning_report_["guard"]["fired"] is False
-    assert off.pruning_report_["guard"]["selection_independent"] is False
-    assert model_bytes(on) == model_bytes(off)
-
-
-def test_prune_guard_ungrouped_fit_never_carves_and_is_the_guard_off_fit(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The whole point of the OOB evidence path: the FIT is untouched. An ungrouped pruned fit
-    # must not build a shared ES carve at all (av33 did, above 100k rows, and paid ~10% of the
-    # training data for it), so every bag keeps its own internal validation slice and the
-    # pre-prune model is bit-for-bit the guard-off one at EVERY size.
-    import t_boost.sklearn as tbs
-
-    def _boom(*a, **k):  # any carve on an ungrouped path is a regression
-        raise AssertionError("ungrouped pruned fits must not carve a shared ES holdout")
-
-    monkeypatch.setattr(tbs, "_carve_group_holdout", _boom)
-    X, y = _guard_fixture()
-    kw = dict(objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-              categorical_features=["c"])
-    on = TBoostRegressor(graduate=False, **kw).fit(X, y)
-    assert on.pruning_report_["guard"]["evidence"] == "oob"
-    # Same fit, guard off: the deploy booster.fit call sees the same (absent) holdout, so the
-    # pruned artifacts coincide exactly while the guard is silent.
-    off = TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y)
-    assert model_bytes(on) == model_bytes(off)
-
-
-def test_prune_guard_forced_fire_relaxes_keepset_and_improves_holdout() -> None:
-    # tol < 0 makes any selected bank a "breach": the guard must re-admit dropped tables in
-    # ranked order, grow the keep-set, refresh the report to the shipped artifact, and move
-    # the selected bank's evidence deviance toward the full bank's.
-    X, y = _guard_fixture()
-    # `prune_guard_z=0.0` pins the pre-av37 fixed-tolerance breach test: this test is about the
-    # ladder's mechanics, and under the SE-aware default a negative tolerance is simply
-    # overridden by `z * SE` (which is what av37 exists to do — covered separately below).
-    est = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-                            categorical_features=["c"], prune_guard_tol=-0.5,
-                            prune_guard_z=0.0).fit(X, y)
-    g = est.pruning_report_["guard"]
-    assert g["fired"] is True and g["steps"] >= 1 and g["evidence"] == "oob"
-    assert g["kept_final"] > g["kept_initial"]
-    assert g["dev_selected_final"] <= g["dev_selected_initial"]
-    # Re-admitting EVERY dropped table must land exactly on the full bank (the ladder's last
-    # rung is the full support set — the arms are the same banks scored the same way).
-    assert g["dev_selected_final"] == pytest.approx(g["dev_full"], rel=1e-9)
-    # the report's kept-set is the RELAXED one (deployed-bank reconstruction contract)
-    assert len(est.pruning_report_["kept"]) == g["kept_final"]
-    p = np.asarray(est.predict(X), np.float64)
-    assert np.isfinite(p).all()
-    # Binary dropping is preserved: the guard only ever GROWS the keep-set, never re-weights.
-    silent = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-                               categorical_features=["c"]).fit(X, y)
-    kept_silent = {tuple(u) for u in silent.pruning_report_["kept"]}
-    kept_fired = {tuple(u) for u in est.pruning_report_["kept"]}
-    assert kept_silent < kept_fired
-
-
-def test_prune_guard_fires_on_a_tight_tolerance_and_stops_at_the_first_clean_rung() -> None:
-    # A constructed breach at a POSITIVE tolerance (not the degenerate tol<0 forcing): the
-    # selected bank costs a little held-out deviance, a tolerance below that cost is a breach,
-    # and the ladder must stop at the FIRST rung that clears it rather than re-admitting
-    # everything. Both arms come from the same evidence pass, so the rung deviances are
-    # directly comparable.
-    X, y = _guard_fixture()
-    # Fixed-tolerance semantics throughout (see the note in the forced-fire test above), and
-    # `prune_guard_z_dn=0.0` likewise pins the av39 DOWNWARD bar off — this test derives its
-    # tolerances from the measured gap and must not have them re-floated underneath it.
-    kw = dict(objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-              categorical_features=["c"], prune_guard_z=0.0, prune_guard_z_dn=0.0)
-    base = TBoostRegressor(graduate=False, **kw).fit(X, y)
-    g0 = base.pruning_report_["guard"]
-    cost = g0["dev_selected_initial"] / g0["dev_full"] - 1.0
-    assert cost > 0.0, "fixture must actually cost something to prune"
-    tight = TBoostRegressor(graduate=False, **kw, prune_guard_tol=cost / 2.0).fit(X, y)
-    g = tight.pruning_report_["guard"]
-    assert g["fired"] is True and g["steps"] >= 1
-    assert g["dev_selected_final"] <= g["dev_full"] * (1.0 + cost / 2.0)
-    assert g["kept_final"] > g["kept_initial"]
-    # A tolerance ABOVE the cost stays silent and ships the unguarded artifact.
-    loose = TBoostRegressor(graduate=False, **kw, prune_guard_tol=cost * 2.0 + 1e-6).fit(X, y)
-    assert loose.pruning_report_["guard"]["fired"] is False
-    assert model_bytes(loose) == model_bytes(base)
-
-
-def test_prune_guard_single_bag_fit_has_no_oob_rows_and_is_skipped() -> None:
-    # n_bags=1 draws no subsample, so no row is out of bag for anything: there is no honest
-    # evidence to be had and the guard must SAY so rather than score in-sample. That is the
-    # pre-av33 behavior for such fits, and the model is the guard-off one.
-    X, y = _guard_fixture(n=3000)
-    kw = dict(objective="poisson", n_trees=100, n_bags=1, seed=0, prune=True,
-              categorical_features=["c"])
-    on = TBoostRegressor(graduate=False, **kw).fit(X, y)
-    off = TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y)
-    g = on.pruning_report_["guard"]
-    assert g["fired"] is False
-    assert g["skipped"] == "no out-of-bag evidence (single-bag fit)"
-    # The guard ASKS the model rather than catching an error, so the predicate itself must be
-    # false here (a caught error would be indistinguishable from a real failure).
-    unpruned = ensemble_fit(TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=1,
-                                            seed=0, prune=False, categorical_features=["c"]), X, y)
-    assert unpruned._model.bag_oob_available() is False
-    bagged = ensemble_fit(TBoostRegressor(graduate=False, objective="poisson", n_trees=50, n_bags=2,
-                                          seed=0, prune=False, categorical_features=["c"]), X, y)
-    assert bagged._model.bag_oob_available() is True
-    assert model_bytes(on) == model_bytes(off)
-
-
-def test_prune_guard_falls_back_to_the_carve_when_oob_is_unavailable() -> None:
-    # A PANEL fit holds its shared group-honest ES carve out of the fit whatever the bag count,
-    # so when the bags cannot supply OOB evidence (n_bags=1) the carve is still there and is
-    # strictly better than no guard at all. Before this fallback the OOB branch short-circuited
-    # and the guard vanished. (This test used a SINGLETON grouping until av35 routed those down
-    # the ungrouped path — see the companion assertion below for what they do now.)
-    X, y = _guard_fixture(n=8000)
-    panel = np.arange(8000) // 2  # 4000 groups of 2 rows: a real, if minimal, panel
-    est = TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=1, seed=0, prune=True,
-                            categorical_features=["c"]).fit(X, y, groups=panel)
-    g = est.pruning_report_["guard"]
-    assert g["evidence"] == "carve" and "skipped" not in g and g["holdout_rows"] >= 500
-    # av35: a singleton grouping is no grouping, so there is no carve to fall back TO — such a
-    # fit IS the ungrouped single-bag fit, guard included (skipped for want of evidence rows).
-    sing = TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=1, seed=0, prune=True,
-                             categorical_features=["c"]).fit(X, y, groups=np.arange(8000))
-    plain = TBoostRegressor(graduate=False, objective="poisson", n_trees=120, n_bags=1, seed=0, prune=True,
-                              categorical_features=["c"]).fit(X, y)
-    assert sing.pruning_report_["guard"]["skipped"] == "no out-of-bag evidence (single-bag fit)"
-    assert model_bytes(sing) == model_bytes(plain)
-
-
-def test_prune_guard_tiny_dataset_is_skipped_for_want_of_evidence_rows() -> None:
-    # Below _PRUNE_GUARD_MIN_ROWS out-of-bag rows the deviance ratio is noise; the guard must
-    # report itself skipped rather than act on it.
-    X, y = _guard_fixture(n=700)
-    kw = dict(objective="poisson", n_trees=80, n_bags=2, seed=0, prune=True,
-              categorical_features=["c"])
-    est = TBoostRegressor(graduate=False, **kw).fit(X, y)
-    g = est.pruning_report_["guard"]
-    assert g["fired"] is False and "skipped" in g
-    assert "out-of-bag rows" in g["skipped"] or "no out-of-bag evidence" in g["skipped"]
-
-
-def test_prune_guard_panel_fit_reads_honest_out_of_bag_rows_from_group_aware_bags() -> None:
-    # Since 2026-09-07 a panel fit draws its outer bags at GROUP granularity, so an out-of-bag
-    # row's panel-mates are out of bag with it and the deploy soup's own out-of-bag rows are
-    # honest generalization evidence — the guard reads them instead of falling back to the
-    # ~validation_fraction group carve, which covered far fewer rows.
-    import pandas as pd
-
-    rng = np.random.default_rng(7)
-    n, n_groups = 6000, 1200
-    gid = rng.integers(0, n_groups, size=n)
-    x = rng.normal(size=(n, 3)).astype(np.float32)
-    mu = np.exp(0.3 * x[:, 0] + 0.2 * (x[:, 1] > 0) + 0.15 * (gid % 5 == 0))
-    y = rng.poisson(mu).astype(np.float32)
-    X = pd.DataFrame({"a": x[:, 0], "b": x[:, 1], "c": x[:, 2]})
-    est = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0,
-                            prune=True).fit(X, y, groups=gid)
-    g = est.pruning_report_["guard"]
-    assert g["evidence"] == "oob", g
-    assert g["oob_rows"] >= 500
-
-    # DEGENERATE grouping (every group a singleton — an anonymised per-row policy id, which is
-    # what euhealth's `id_anon` is) cannot straddle the in-bag/out-of-bag boundary, so those
-    # fits take the OOB path: same honesty, ~2x the evidence rows. Since av35 the FIT goes with
-    # it — a singleton grouping is normalized to None at ingest, so the artifact is the
-    # UNGROUPED fit exactly (no shared ES carve at all), not merely a carved fit with different
-    # guard evidence. Both identities are pinned: vs guard-off (the guard stays silent here)
-    # and vs no groups at all (the av35 routing claim).
-    singleton = np.arange(n)
-    on = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0,
-                           prune=True).fit(X, y, groups=singleton)
-    g2 = on.pruning_report_["guard"]
-    assert g2["evidence"] == "oob" and g2["oob_rows"] > g["holdout_rows"]
-    off = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-                            prune_guard=False).fit(X, y, groups=singleton)
-    assert model_bytes(on) == model_bytes(off)
-    ungrouped = TBoostRegressor(graduate=False, objective="poisson", n_trees=150, n_bags=2, seed=0,
-                                  prune=True).fit(X, y)
-    assert model_bytes(on) == model_bytes(ungrouped)
-
-
-def test_prune_guard_evidence_is_the_raw_bank_and_biases_toward_firing() -> None:
-    """Lock the documented bias DIRECTION of the OOB evidence.
-
-    The guard scores its selected arm as the raw keep-restricted bank — no deploy re-anchor,
-    no `prune_rebalance` re-solve, no `graduate` smoothing — while the artifact that actually
-    ships carries all three, and all three improve the SELECTED arm only. So the number the
-    guard tests against `prune_guard_tol` is a PESSIMISTIC stand-in for the shipped model: the
-    guard can be over-eager (fire when the assembled deploy would have passed) but never
-    under-eager (stay silent when the assembled deploy would have breached). This test pins
-    both halves of that:
-
-      1. `dev_selected_initial` reproduces, to floating point, the deviance of the raw
-         mean-over-jury bank score — so if anyone ever re-points the evidence at the assembled
-         artifact, this breaks rather than silently changing the guard's bias.
-      2. the assembled deployed artifact scores at least as well on the very same rows.
-
-    Numeric-only fixture so the estimator's design matrix is exactly `X` (no cat_x split to
-    mirror), and `prune=False` under identical params/seed to recover the deploy fit's own
-    seeded bag membership.
-    """
-    from t_boost.sklearn import _guard_mean_deviance, _guard_reanchor
-
-    rng = np.random.default_rng(19)
-    n = 9000
-    x = np.column_stack([
-        rng.uniform(0, 1, n), rng.uniform(0, 1, n), rng.uniform(0, 1, n), rng.normal(size=n),
-    ]).astype(np.float32)
-    mu = np.exp(0.45 * np.sin(6 * x[:, 0]) + 0.3 * (x[:, 1] > 0.5) + 0.2 * x[:, 0] * x[:, 1])
-    y = rng.poisson(mu).astype(np.float32)
-    # `prune_guard_z=0.0`: this test constructs a tolerance in a narrow band between two
-    # measured gaps to pin the guard's EVIDENCE (raw bank, not assembled artifact). The
-    # SE-aware av37 bar would float that threshold away from the constructed band, which is a
-    # different property, tested on its own below.
-    kw = dict(objective="poisson", n_trees=200, n_bags=4, seed=0, prune_guard_z=0.0,
-              prune_guard_z_dn=0.0)
-
-    est = TBoostRegressor(graduate=False, **kw, prune=True).fit(x, y)
-    g = est.pruning_report_["guard"]
-    assert g["evidence"] == "oob" and g["fired"] is False
-    keep = [list(u) for u in est.pruning_report_["kept"]]
-    assert 0 < len(keep), "fixture must keep something"
-
-    # The unpruned twin: same params, same seed => the same seeded bag draw, so its recorded
-    # membership IS the deploy fit's. If that ever stopped holding, assertion (1) below would
-    # fail loudly rather than quietly measure the wrong rows.
-    twin = ensemble_fit(TBoostRegressor(graduate=False, **kw, prune=False), x, y)
-    m = twin._model
-    assert isinstance(m, _Model)
-    xc = np.ascontiguousarray(x)
-    # The guard builds its banks under the estimator's fit-time measure and per-row mass
-    # (2026-09-06); the twin must ask for the same ledger or it scores a different function.
-    full_sum, f0_sum, group_sums, counts = m.bag_oob_group_raw(
-        xc, [keep], weight=np.ones(n, dtype=np.float32), **est._measure_kwargs()
-    )
-    counts = np.asarray(counts, dtype=np.int64)
-    ev = counts > 0
-    assert int(ev.sum()) == g["oob_rows"], "the twin must reproduce the guard's evidence rows"
-    cnt = counts[ev].astype(np.float64)
-    yv = np.asarray(y, dtype=np.float64)[ev]
-    wv = np.ones_like(yv)
-    raw_full = np.asarray(full_sum, np.float64)[ev] / cnt
-    raw_sel = (np.asarray(f0_sum, np.float64)[ev] + np.asarray(group_sums, np.float64)[0][ev]) / cnt
-    # Both arms carry the deploy re-anchor before measurement — see `_guard_reanchor`. Poisson
-    # resolves `reanchor=True`, so leaving this out would reproduce neither reported number.
-    raw_full = _guard_reanchor("poisson", raw_full, yv, wv, True)
-    raw_sel = _guard_reanchor("poisson", raw_sel, yv, wv, True)
-    dev_full = _guard_mean_deviance("poisson", yv, raw_full, wv, None)
-    dev_sel = _guard_mean_deviance("poisson", yv, raw_sel, wv, None)
-
-    # (1) the guard's arms ARE the raw banks — not the assembled artifact.
-    assert dev_full == pytest.approx(g["dev_full"], rel=1e-9)
-    assert dev_sel == pytest.approx(g["dev_selected_initial"], rel=1e-9)
-
-    # (2) the shipped artifact — re-anchored, rebalanced, graduated — does at least as well on
-    #     those same rows, so the gap the guard tests is an upper bound on the shipped gap.
-    raw_deployed = np.asarray(
-        est._model.predict_raw(np.ascontiguousarray(x[ev])), dtype=np.float64
-    )
-    dev_deployed = _guard_mean_deviance("poisson", yv, raw_deployed, wv, None)
-    assert dev_deployed <= dev_sel, (
-        f"guard's raw-bank selected arm {dev_sel:.6f} must not be OPTIMISTIC versus the "
-        f"assembled deploy {dev_deployed:.6f} — the documented bias is toward firing"
-    )
-
-    # (3) the consequence, as a constructed case: a tolerance placed strictly BETWEEN the
-    #     assembled deploy's gap and the raw-bank gap must make the guard FIRE, even though the
-    #     artifact that would have shipped clears that same tolerance. This is the over-eager
-    #     direction; the reverse (silent while the shipped artifact breaches) is what cannot
-    #     happen, because (2) bounds the shipped gap by the measured one.
-    raw_gap = dev_sel / dev_full - 1.0
-    deployed_gap = dev_deployed / dev_full - 1.0
-    assert raw_gap > deployed_gap, "the two arms must differ for the case to be constructible"
-    between = 0.5 * (raw_gap + deployed_gap)
-    assert deployed_gap < between < raw_gap
-    tight = TBoostRegressor(graduate=False, **kw, prune=True, prune_guard_tol=between).fit(x, y)
-    gt = tight.pruning_report_["guard"]
-    assert gt["fired"] is True, (
-        f"raw-bank gap {raw_gap:.6f} breaches tol {between:.6f} while the assembled deploy's "
-        f"gap {deployed_gap:.6f} would have passed — the guard must act on the RAW gap"
-    )
-    assert gt["kept_final"] > gt["kept_initial"]
-    # ...and a tolerance above the raw gap stays silent, so the fire above is the tolerance
-    # crossing that gap and nothing else.
-    loose = TBoostRegressor(graduate=False, **kw, prune=True, prune_guard_tol=raw_gap + 1e-3).fit(x, y)
-    assert loose.pruning_report_["guard"]["fired"] is False
-    assert model_bytes(loose) == model_bytes(est)
-
-
-def test_prune_guard_params_roundtrip() -> None:
-    est = TBoostRegressor(graduate=False, prune_guard=False, prune_guard_tol=0.1)
-    params = est.get_params()
-    assert params["prune_guard"] is False and params["prune_guard_tol"] == 0.1
-    est2 = TBoostRegressor(graduate=False, ).set_params(prune_guard=False, prune_guard_tol=0.1)
-    assert est2.prune_guard is False and est2.prune_guard_tol == 0.1
-
-
 def test_bag_membership_and_oob_scorer_are_thread_and_layout_deterministic() -> None:
-    # The native primitives behind the guard's evidence: the recorded membership, the per-bag
+    # The native primitives behind the ranked path's evidence: the recorded membership, the per-bag
     # keep-restricted raw scorer, and the one-pass OOB group accumulator.
     rng = np.random.default_rng(11)
     n = 4000
@@ -1314,257 +1009,15 @@ def test_evidence_gate_is_deterministic_across_thread_counts() -> None:
     assert model_bytes(a) == model_bytes(b)
 
 
-def test_guard_z_silences_a_within_noise_breach_but_not_a_real_one() -> None:
-    # The guard's own bar is now max(tol, z*SE) on the SAME evidence. A tolerance placed just
-    # under the measured gap fires under av36 semantics (z=0); the same tolerance with a z that
-    # puts z*SE above the gap must stay silent, and the shipped model must then be the
-    # unguarded one to the byte. A tolerance far below the gap still fires at any z.
-    X, y = _guard_fixture()
-    # Both bars pinned off: this test is about the UPWARD one alone (the av39 downward bar has
-    # its own tests below, and would otherwise re-float the constructed tolerances).
-    kw = dict(objective="poisson", n_trees=150, n_bags=2, seed=0, prune=True,
-              categorical_features=["c"], prune_guard_z_dn=0.0)
-    base = TBoostRegressor(graduate=False, **kw, prune_guard_z=0.0).fit(X, y)
-    g0 = base.pruning_report_["guard"]
-    gap = g0["dev_selected_initial"] / g0["dev_full"] - 1.0
-    se = g0["gap_se"]
-    assert gap > 0.0 and se is not None and se > 0.0
-    tol = gap / 2.0
-    fires = TBoostRegressor(graduate=False, **kw, prune_guard_tol=tol, prune_guard_z=0.0).fit(X, y)
-    assert fires.pruning_report_["guard"]["fired"] is True
-    z_silent = 2.0 * gap / se          # z*se comfortably above the measured gap
-    quiet = TBoostRegressor(graduate=False, **kw, prune_guard_tol=tol, prune_guard_z=z_silent).fit(X, y)
-    gq = quiet.pruning_report_["guard"]
-    assert gq["fired"] is False
-    assert gq["tol_effective"] == pytest.approx(z_silent * se, rel=1e-9)
-    assert model_bytes(quiet) == model_bytes(TBoostRegressor(graduate=False, **kw, prune_guard=False).fit(X, y))
-    # ...and a gap far beyond the noise still breaches at the shipped z.
-    loud = TBoostRegressor(graduate=False, **kw, prune_guard_tol=-0.5, prune_guard_z=1e-9).fit(X, y)
-    assert loud.pruning_report_["guard"]["fired"] is True
-
-
 def test_evidence_gate_params_roundtrip() -> None:
-    est = TBoostRegressor(graduate=False, prune_drop_z=2.5, prune_keep_budget=41, prune_guard_z=1.25)
+    est = TBoostRegressor(graduate=False, prune_drop_z=2.5, prune_keep_budget=41)
     p = est.get_params()
-    assert (p["prune_drop_z"], p["prune_keep_budget"], p["prune_guard_z"]) == (2.5, 41, 1.25)
-    est2 = TBoostRegressor(graduate=False, ).set_params(prune_drop_z=None, prune_keep_budget=7,
-                                          prune_guard_z=0.0)
+    assert (p["prune_drop_z"], p["prune_keep_budget"]) == (2.5, 41)
+    est2 = TBoostRegressor(graduate=False, ).set_params(prune_drop_z=None, prune_keep_budget=7)
     assert est2.prune_drop_z is None and est2.prune_keep_budget == 7
-    assert est2.prune_guard_z == 0.0
-    clf = TBoostClassifier(prune_drop_z=0.5, prune_keep_budget=9, prune_guard_z=2.0)
+    clf = TBoostClassifier(prune_drop_z=0.5, prune_keep_budget=9)
     assert clf.get_params()["prune_drop_z"] == 0.5
     assert clf.get_params()["prune_keep_budget"] == 9
-    assert clf.get_params()["prune_guard_z"] == 2.0
-
-
-def test_guard_gap_se_measures_the_paired_difference_not_the_deviance_level() -> None:
-    # Regression for the ohlsson_pp split-6 failure (see `_guard_gap_se`): a heavy-tailed
-    # deviance LEVEL must not inflate the bar. Here the two arms differ by a tight 2% on every
-    # row while the level itself spans four orders of magnitude — the paired SE must reflect the
-    # former, so the guard can still see a real gap on a tweedie portfolio.
-    from t_boost.sklearn import _guard_gap_se
-
-    rng = np.random.default_rng(11)
-    n = 20000
-    dev_full = rng.lognormal(mean=0.0, sigma=3.0, size=n)   # CV ~ 90x
-    dev_sel = dev_full * (1.02 + rng.normal(0.0, 0.002, size=n))
-    w = np.ones(n)
-    se = _guard_gap_se(dev_sel, dev_full, w)
-    gap = float((w * (dev_sel - dev_full)).sum() / (w * dev_full).sum())
-    assert gap == pytest.approx(0.02, abs=5e-3)
-    # The level's own relative SE — what the retired ratio delta method dragged in.
-    level_se = float(np.std(dev_full, ddof=1) / math.sqrt(n) / dev_full.mean())
-    assert level_se > 0.01, "fixture must have a level SE big enough to swamp a real gap"
-    assert se < 0.2 * gap, (
-        f"paired gap SE {se:.5f} must sit well inside the {gap:.4f} gap it has to resolve "
-        f"(the level's own SE is {level_se:.5f})"
-    )
-    assert se < 0.5 * level_se
-
-
-# --- av39: the DOWNWARD SE recalibration of the guard's bar ------------------------------------
-#
-# `prune_guard_z` (av37) raises the bar; it shipped OFF because a zero-inflated compound target's
-# row-level SE cannot resolve a real set-level detonation. The homesite_conv forensic found the
-# mirror-image failure and found it to be that dataset's whole deficit: where the jury IS sharp
-# (paired-difference SE 0.21%-0.27% of the full-bank level), the fixed 5% tolerance is a ~20-SE
-# bar that licenses ~0.0075 log-loss of perfectly measurable damage — silently on one split, and
-# by stopping the ladder one rung in at a 4.48% residual on another. `prune_guard_z_dn` /
-# `prune_guard_tol_floor` tighten the bar to `min(tol, max(tol_floor, z_dn * SE))`, which can only
-# ever make the guard fire MORE. See `_PRUNE_GUARD_Z_DN_DEFAULT`.
-
-
-def _zdn_fixture(n: int = 12000, seed: int = 5, k: int = 3):
-    """A COLLINEAR FAMILY: `k` near-duplicate copies of the one feature that carries the signal.
-
-    This is the failure shape the set-level guard exists for. Each copy's leave-one-out drop-gain
-    is ~0 because its siblings absorb the signal, so the per-table selection is free to drop the
-    whole family, and only a SET-level comparison can see the cost. The resulting gap here is
-    real but small — a fraction of an SE — which is exactly the regime where the bar's calibration,
-    not its existence, decides the outcome.
-    """
-    import pandas as pd
-
-    rng = np.random.default_rng(seed)
-    base = rng.uniform(0, 1, n).astype(np.float32)
-    cols = {f"d{i}": (base + rng.normal(0, 0.01, n)).astype(np.float32) for i in range(k)}
-    for i in range(3):
-        cols[f"n{i}"] = rng.uniform(0, 1, n).astype(np.float32)
-    cat = rng.choice([f"L{i}" for i in range(10)], size=n)
-    cols["c"] = cat
-    lp = 1.2 * np.sin(6 * base) + 0.3 * (cols["n0"] > 0.5) + 0.25 * (cat == "L3")
-    y = rng.poisson(np.exp(lp)).astype(np.float32)
-    return pd.DataFrame(cols), y
-
-
-# Pinned to the pre-2026-09-06 reference measure: this fixture's ladder calibration (a gap of
-# a fraction of an SE, two rungs on offer) was tuned under it, and under the exposure measure
-# the first rung already closes the gap, which is a different fixture, not a different guard.
-_ZDN_KW = dict(objective="poisson", n_trees=250, n_bags=4, seed=0, prune=True,
-               categorical_features=["c"], n_jobs=2, ref_measure="product_marginals")
-
-
-def test_guard_tol_effective_envelope() -> None:
-    # The bar itself, in isolation: `min(tol, max(tol_floor, z_dn*se))` applied to the av37
-    # `max(tol, z_up*se)`. The anchors are the two datasets that define the envelope's ends.
-    from t_boost.sklearn import _guard_tol_effective as f
-
-    tol, floor = 0.05, 0.005
-    # z_dn = 0 is the identity, whatever the evidence says.
-    for se in (1e-9, 0.0025, 0.0956, float("inf"), float("nan")):
-        assert f(tol, se, 0.0, 0.0, floor) == tol
-    # No measurable SE => no correction in either direction.
-    assert f(tol, float("inf"), 3.0, 2.0, floor) == tol
-    assert f(tol, float("nan"), 3.0, 2.0, floor) == tol
-    # BLUNT jury (ohlsson_pp: SE 9.56%) — `min` pins the bar back at `tol`, so the knob is inert
-    # exactly where the upward bar was falsified. This is the neutrality guarantee.
-    assert f(tol, 0.0956, 0.0, 2.0, floor) == pytest.approx(tol)
-    assert f(tol, 0.0956, 0.0, 100.0, floor) == pytest.approx(tol)
-    # SHARP jury (homesite_conv: SE 0.21%-0.27%) — the bar tightens by an order of magnitude.
-    assert f(tol, 0.0027, 0.0, 2.0, floor) == pytest.approx(0.0054)
-    assert f(tol, 0.0021, 0.0, 2.0, floor) == pytest.approx(floor)   # floor binds
-    # ...and an arbitrarily sharp jury cannot drive the bar to zero.
-    assert f(tol, 1e-12, 0.0, 2.0, floor) == pytest.approx(floor)
-    # Monotone NON-DECREASING in an armed z_dn (a bigger multiplier is a looser bar), never
-    # above `tol`, never below `tol_floor`. z_dn = 0 is the off switch, not the limit of the
-    # sequence: it returns `tol`, which is the loosest bar of all.
-    bars = [f(tol, 0.01, 0.0, z, floor) for z in (1.0, 2.0, 4.0, 20.0)]
-    assert bars == sorted(bars) and max(bars) <= tol and min(bars) >= floor
-    # (z_dn = 20 already saturates: 20*0.01 = 0.2 is above `tol`, so the `min` returns `tol`.)
-    assert f(tol, 0.01, 0.0, 0.0, floor) == tol >= max(bars)
-    assert f(tol, 0.01, 0.0, 1.0, floor) < tol
-    assert f(tol, 0.01, 0.0, 2.0, floor) == pytest.approx(0.02)
-    # Composition with the upward bar: the downward step is applied to the upward step's output.
-    assert f(tol, 0.03, 3.0, 0.0, floor) == pytest.approx(0.09)
-    assert f(tol, 0.03, 3.0, 2.0, floor) == pytest.approx(0.06)
-    # A negative tolerance (the tests' forced-fire device) survives both corrections.
-    assert f(-0.5, 0.0027, 0.0, 2.0, floor) == pytest.approx(-0.5)
-
-
-def test_guard_z_dn_zero_is_the_pre_av39_guard_to_the_byte() -> None:
-    # The identity claim: with `prune_guard_z_dn = 0` the floor is inert, `tol_effective` is the
-    # fixed tolerance, and the artifact is the av37/av38 one — byte for byte, at any floor.
-    X, y = _zdn_fixture()
-    ref = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=0.0).fit(X, y)
-    g = ref.pruning_report_["guard"]
-    assert g["evidence"] == "oob" and g["tol_effective"] == g["tol"] == 0.05
-    assert g["guard_z_dn"] == 0.0 and g["gap_se"] is not None and g["gap_se"] > 0.0
-    for floor in (0.0, 0.005, 0.5):
-        same = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=0.0,
-                                 prune_guard_tol_floor=floor).fit(X, y)
-        assert model_bytes(same) == model_bytes(ref)
-    # This fixture's gap is real but sits INSIDE one SE, so the fixed 5% bar is silent and the
-    # deployed model is the unguarded one — the state the tightened bar has to change.
-    gap = g["dev_selected_initial"] / g["dev_full"] - 1.0
-    assert gap > 0.0 and gap < g["gap_se"]
-    assert g["fired"] is False
-    assert model_bytes(ref) == model_bytes(TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard=False).fit(X, y))
-
-
-def test_guard_z_dn_fires_on_a_sharp_jury_and_the_min_still_protects_a_blunt_one() -> None:
-    # TRIGGER half of the fix. The same fit, the same 5% tolerance, the same evidence: a bar
-    # placed below the measured gap must breach where the fixed one stayed silent — and a bar
-    # the `min` pins back at `tol` must stay exactly as silent as before.
-    X, y = _zdn_fixture()
-    ctrl = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=0.0).fit(X, y)
-    g0 = ctrl.pruning_report_["guard"]
-    gap, se = g0["dev_selected_initial"] / g0["dev_full"] - 1.0, g0["gap_se"]
-    assert gap > 0.0 and se > 0.0
-
-    z_fire = 0.5 * gap / se                     # z_dn*se = gap/2 => the bar sits under the gap
-    fired = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=z_fire,
-                              prune_guard_tol_floor=1e-9).fit(X, y)
-    gf = fired.pruning_report_["guard"]
-    assert gf["fired"] is True and gf["steps"] >= 1
-    assert gf["tol_effective"] == pytest.approx(gap / 2.0, rel=1e-6)
-    assert gf["tol_effective"] < gf["tol"]
-    assert gf["kept_final"] > gf["kept_initial"] == g0["kept_initial"]
-    assert gf["dev_selected_final"] <= gf["dev_selected_initial"]
-    assert model_bytes(fired) != model_bytes(ctrl)
-
-    # The floor is a real clamp: the SAME z_dn with a floor above the gap goes silent again.
-    floored = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=z_fire,
-                                prune_guard_tol_floor=2.0 * gap).fit(X, y)
-    assert floored.pruning_report_["guard"]["fired"] is False
-    assert model_bytes(floored) == model_bytes(ctrl)
-
-    # And the neutrality guarantee in situ: a z_dn whose z*SE exceeds `tol` is pinned by the
-    # `min` back onto the fixed tolerance — the blunt-jury (ohlsson_pp) case, bit-identical.
-    blunt = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0,
-                              prune_guard_z_dn=2.0 * g0["tol"] / se).fit(X, y)
-    assert blunt.pruning_report_["guard"]["tol_effective"] == pytest.approx(g0["tol"])
-    assert model_bytes(blunt) == model_bytes(ctrl)
-
-
-def test_guard_z_dn_governs_the_ladder_stopping_rule_too() -> None:
-    # STOPPING-RULE half of the fix, and the half the forensic says matters as much: homesite's
-    # tuned split 0 DID breach under the fixed bar, climbed exactly one rung, and stopped at a
-    # 4.48% residual that was still ~17 SE of real damage. The ladder's `while` must read the
-    # SAME tightened bar as the trigger, so a lower bar climbs at least as far and the fit it
-    # ships is the one whose residual the bar actually admits.
-    X, y = _zdn_fixture()
-    ctrl = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=0.0).fit(X, y)
-    g0 = ctrl.pruning_report_["guard"]
-    gap, se, n_chunks = g0["dev_selected_initial"] / g0["dev_full"] - 1.0, g0["gap_se"], \
-        g0["n_chunks"]
-    assert n_chunks >= 2, "fixture must offer the ladder more than one rung to stop at"
-
-    runs = []
-    for z in (0.5 * gap / se, 0.05 * gap / se, 1e-12 * gap / se):
-        m = TBoostRegressor(graduate=False, **_ZDN_KW, prune_guard_z=0.0, prune_guard_z_dn=z,
-                              prune_guard_tol_floor=1e-12).fit(X, y)
-        g = m.pruning_report_["guard"]
-        assert g["fired"] is True
-        runs.append(g)
-        # The ladder's contract: it stops only once the residual is inside the SAME bar the
-        # trigger used, or once it has run out of rungs.
-        resid = g["dev_selected_final"] / g["dev_full"] - 1.0
-        assert resid <= g["tol_effective"] or g["steps"] == n_chunks
-
-    # Lower bar => at least as many rungs and at least as large a shipped bank, monotonically.
-    assert [r["tol_effective"] for r in runs] == sorted(
-        [r["tol_effective"] for r in runs], reverse=True
-    )
-    assert [r["steps"] for r in runs] == sorted([r["steps"] for r in runs])
-    assert [r["kept_final"] for r in runs] == sorted([r["kept_final"] for r in runs])
-    # A bar at (effectively) zero cannot stop before the top rung — the whole bank comes back.
-    assert runs[-1]["steps"] == n_chunks
-    assert runs[-1]["kept_final"] > runs[0]["kept_final"]
-
-
-def test_guard_z_dn_params_roundtrip() -> None:
-    est = TBoostRegressor(prune_guard_z_dn=1.5, prune_guard_tol_floor=0.01)
-    p = est.get_params()
-    assert (p["prune_guard_z_dn"], p["prune_guard_tol_floor"]) == (1.5, 0.01)
-    est2 = TBoostRegressor().set_params(prune_guard_z_dn=0.0, prune_guard_tol_floor=0.02)
-    assert est2.prune_guard_z_dn == 0.0 and est2.prune_guard_tol_floor == 0.02
-    clf = TBoostClassifier(prune_guard_z_dn=3.0, prune_guard_tol_floor=0.001)
-    assert clf.get_params()["prune_guard_z_dn"] == 3.0
-    assert clf.get_params()["prune_guard_tol_floor"] == 0.001
-    # The shipped defaults, asserted where a change to them has to be deliberate.
-    d = TBoostRegressor().get_params()
-    assert (d["prune_guard_z_dn"], d["prune_guard_tol_floor"]) == (2.0, 0.005)
-    assert (d["prune_guard_z"], d["prune_guard_tol"]) == (0.0, 0.05)
 
 
 # --- PINNED-BANK FOLD FIDELITY (`prune_fold_fidelity`) ---------------------------------------
@@ -1649,7 +1102,7 @@ def test_fold_fidelity_is_deterministic_under_thread_count() -> None:
 
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
+    """This module pins the fold-vote selector (its evidence gate and vote machinery) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R

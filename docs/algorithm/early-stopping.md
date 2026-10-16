@@ -22,27 +22,27 @@ where $r$ is [`early_stopping_adaptive`](../training-parameters/early-stopping.m
 [`early_stopping_rounds`](../training-parameters/early-stopping.md#early_stopping_rounds).
 When the training stops, the trees built after the best iteration are discarded.
 
-With bagging, every bag stops on its own and keeps its trees up to its own best iteration. Each bag sets aside its own validation objects, unless `groups` or an `eval_set` is
-given: the bags then share one validation dataset.
+With bagging, every bag stops on its own and keeps its trees up to its own best iteration. Each
+bag sets aside its own validation objects, unless `groups` is given: the bags then share one
+validation dataset.
 
 ## Validation dataset {#validation-dataset}
 
-The validation dataset is one of the following:
+The validation dataset is a fraction of each bag's training objects,
+[`validation_fraction`](../training-parameters/early-stopping.md#validation_fraction)
+(10% by default). It is stratified by class for classification and by zero versus non-zero
+target for the `poisson` and `tweedie` objectives. When `groups` is passed to `fit`, whole
+groups are set aside (once, shared by the bags), so near-duplicate objects of the same entity
+cannot fall on both sides.
 
-- A fraction of each bag's training objects,
-  [`validation_fraction`](../training-parameters/early-stopping.md#validation_fraction)
-  (10% by default). It is stratified by class for classification and by zero versus non-zero
-  target for the `poisson` and `tweedie` objectives. When `groups` is passed to `fit`, whole
-  groups are set aside (once, shared by the bags), so near-duplicate objects of the same entity
-  cannot fall on both sides.
-- The `eval_set` passed to `fit`. No objects are set aside from the training dataset, and the
-  evaluation objects are used only by early stopping: they never reach the training,
-  the tables or pruning.
+There is no separate validation dataset for `fit`: the bags already stop and prune on objects
+they hold back. To measure the model on data it never saw, pass that data to the
+[model report](../model-analysis/model-report.md).
 
 ## Results {#results}
 
-After a regression or binary classification fit, the following attributes describe the
-boosting (before pruning):
+After a fit, the following attributes describe the boosting (before pruning). For
+multiclassification the counts are boosting rounds, each of which grows one tree per class:
 
 `n_trees_per_bag_`
 :   The number of trees each bag kept.
@@ -55,7 +55,13 @@ boosting (before pruning):
 :   The largest number of trees, and one summary of the reasons.
 
 `evals_result_`
-:   With an `eval_set` or `callbacks`, the deviance of every iteration of every bag.
+:   The deviance of every iteration of every bag on its validation objects (and on its training
+    objects when `callbacks` are given). It is kept on the trained model only, not saved.
 
-A function passed in `callbacks` is called after every iteration and can stop the training by
-returning a true value. See [fit](../python-reference/tboostregressor/fit.md).
+A bag that stopped at `"max_trees"` was still improving on its validation objects when it reached
+the `n_trees` limit, so the model may be under-fitted; the
+[model report](../model-analysis/model-report.md) warns about it. Raise `n_trees` to let early
+stopping end the training.
+
+A function passed in `callbacks` is called after every iteration of every bag and can stop that
+bag by returning a true value. See [fit](../python-reference/tboostregressor/fit.md).

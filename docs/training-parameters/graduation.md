@@ -6,8 +6,8 @@ smoother for rating factors. Each table picks its own strength by generalized cr
 it. The outcome is recorded in the `graduation_report_` attribute. See
 [Pruning, banding and graduation](../algorithm/readable-tables.md) for details.
 
-Graduation is skipped for models with `monotone_constraints` and is not supported for
-multiclassification.
+For multiclassification, every class's tables are graduated, the class intercepts are
+re-anchored, and the 1% check below reads the multinomial deviance.
 
 ## graduate {#graduate}
 
@@ -16,9 +16,11 @@ multiclassification.
 Smooth the deployed tables with Whittaker-Henderson graduation.
 
 `None` and `True` turn graduation on, and `False` turns it off (the `graduation_report_`
-attribute is then not set). An explicit `True` requires `prune=True`, and raises an error for
-multiclassification. Whether a smoothed table is what you want to deploy is a modelling
-decision: graduation has no accuracy gate.
+attribute is then not set). Whether a smoothed table is what you want to deploy is a modelling
+decision: graduation is not tested on held-out data. It is kept only if it raises the training
+deviance by at most 1%; otherwise every table is kept as fitted, and `graduation_validation_`
+records `"adopted": False` and why. The 1% limit is a brake on heavy smoothing, not a test of
+accuracy: smoothing raises the training deviance whether it removes noise or real shape.
 
 **Type**
 
@@ -35,6 +37,11 @@ None (on)
 A fixed smoothing strength for every table, instead of the strength each table picks by
 generalized cross-validation. 0 turns off the smoothing of the dense tables, which is useful
 together with [`graduation_high_order_alpha`](#graduation_high_order_alpha).
+
+A strength that raises the training deviance by more than 1% is declined, and every table is kept
+as fitted: the fit warns, `binding_report_` lists `graduation_alpha` as INERT and
+`check_bindings()` raises. Use a smaller strength. The scale depends on the data: the penalty is
+weighed against each cell's exposure.
 
 **Type**
 
@@ -57,8 +64,7 @@ non-missing values are not smoothed. Effects with more than 1 024 stored boxes, 
 add more than 4 096 boxes in total or 2 000 000 cells, are skipped; the details are in
 `graduation_report_`.
 
-0 turns it off. Requires `prune=True` and graduation turned on; not supported with
-`monotone_constraints` or for multiclassification.
+0 turns it off. Requires graduation turned on.
 
 **Type**
 

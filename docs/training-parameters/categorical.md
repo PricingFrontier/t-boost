@@ -49,8 +49,7 @@ Possible values:
   `decision_function`, `predict_contributions`, `tables`, `cell_indices`,
   `actual_vs_expected`) raises `ValueError`, naming the feature and up to five unseen values.
 
-The objects of an `eval_set` follow the same rule. A missing value is never unseen: it is scored
-in the missing level.
+A missing value is never unseen: it is scored in the missing level.
 
 **Type**
 

@@ -1,0 +1,8 @@
+grad prudential 0 8 B,U shipped,null_refuse
+band fr_instal 0 1 capx0.5,capx0.25,mass
+band fr_instal 1 1 capx0.5,capx0.25,mass
+band fr_instal 2 1 capx0.5,capx0.25,mass
+band pg17_cover 0 1 capx0.5,capx0.25,mass
+band pg17_cover 1 1 capx0.5,capx0.25,mass
+band pg17_cover 2 1 capx0.5,capx0.25,mass
+band prudential 0 1 capx0.5,capx0.25,mass

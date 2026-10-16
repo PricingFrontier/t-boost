@@ -70,7 +70,7 @@ THRESHOLD_DESCRIPTIONS: dict[str, str] = {
     "thin_cell_mass": "one-way table cells under this share of the table's exposure count as thin",
     "psi_warn": "PSI per feature above value: warning",
     "psi_critical": "PSI per feature above value: critical",
-    "train_gap": "drop in deviance explained from train to validation, and to test",
+    "train_gap": "drop in deviance explained from train to each later dataset",
     "unseen_mass": "mass share of unseen categorical values in a dataset",
 }
 
@@ -79,6 +79,7 @@ _LORENZ_POINTS = 101
 _PSI_BINS = 10
 _PSI_FLOOR = 1e-4
 _PERCENTILES = (1, 5, 25, 50, 75, 95, 99)
+_HISTOGRAM_BINS = 40
 # The spread of each level's Shapley value across policies, and of an interaction's effect
 # across exposure.
 _SHAP_QUANTILES = (0.1, 0.9)
@@ -117,18 +118,24 @@ def resolve_thresholds(thresholds: dict[str, Any] | None) -> dict[str, float | N
     return out
 
 
-DATASET_ROLES = ("train", "validation", "test")
+def dataset_roles(n: int) -> tuple[str, ...]:
+    """The role of each of ``n`` datasets: train, then test (two datasets), or train,
+    validation and test (three). t-boost's bags early-stop and prune on rows they hold back, so
+    a separate validation dataset is the exception, not the default."""
+    return ("train", "test") if n == 2 else ("train", "validation", "test")[:n]
 
 
 def resolve_labels(labels: Any, n: int) -> list[str]:
-    """The names of the ``n`` datasets: the first ``n`` of ``labels`` (by role: train,
-    validation, test), which must be distinct non-empty strings."""
+    """The names of the ``n`` datasets: ``labels`` (the first ``n``), which must be distinct
+    non-empty strings, or by default their roles (`dataset_roles`)."""
+    if labels is None:
+        return list(dataset_roles(n))
     if (not isinstance(labels, (tuple, list)) or len(labels) < n
             or not all(isinstance(v, str) and v.strip() for v in labels[:n])
             or len(set(labels[:n])) != n):
         raise ValueError(
             f"labels must give {n} distinct non-empty strings, one per dataset, e.g. "
-            "('train', 'validation', 'test')"
+            f"{dataset_roles(n)!r}"
         )
     return [str(v) for v in labels[:n]]
 
@@ -136,7 +143,7 @@ def resolve_labels(labels: Any, n: int) -> list[str]:
 def resolve_eval_sets(eval_set: Any, weights: Any, exposures: Any, offsets: Any
                       ) -> list[tuple[Any, Any, Any, Any, Any]]:
     """``eval_set`` as ``(X, y, sample_weight, exposure, offset)`` per dataset: one ``(X, y)``
-    pair (the ``fit`` convention) with single vectors, or a list of up to two pairs
+    pair (the test data, by default) with single vectors, or a list of up to two pairs
     (validation, then test) with the ``eval_*`` vectors as lists of the same length."""
     if eval_set is None:
         if any(v is not None for v in (weights, exposures, offsets)):
@@ -149,7 +156,7 @@ def resolve_eval_sets(eval_set: Any, weights: Any, exposures: Any, offsets: Any
     if not isinstance(eval_set, list) or not 1 <= len(eval_set) <= 2 or not all(
             isinstance(pair, tuple) and len(pair) == 2 for pair in eval_set):
         raise ValueError(
-            "eval_set must be a pair (X, y) or a list of up to two pairs: "
+            "eval_set must be a pair (X_test, y_test) or a list of up to two pairs: "
             "[(X_validation, y_validation), (X_test, y_test)]"
         )
     n = len(eval_set)
@@ -380,6 +387,91 @@ def table_measure(est: "_BaseTBoost", X: Any, sample_weight: Any | None, exposur
             "weight": weight32, "exposure": exposure32}
 
 
+def interaction_ae(report: dict[str, Any], prepared: list[Prepared], obj: str,
+                   rho: float) -> None:
+    """For each interaction table the page draws, the A/E by band of its first feature (the
+    factor check's bands) within each band of its partner (the chart's bands of equal exposure),
+    per dataset (``interactions[k]["ae"]``), with each pair's mass, z and the standard deviation
+    ``sd`` of its A/E; and, by level of the first feature within each partner band, the actual,
+    expected and mass (``levels``) behind the actual and expected rates. One native pass per
+    dataset sums every table. A multiclass model's first class, one-vs-rest, as the page draws."""
+    from ._html_report import _INTERACTION_ROWS, _classes, _table_cells, interaction_layout
+
+    cls = _classes(report)[0]
+    plans = []
+    for inter in (report.get("interactions") or [])[:_INTERACTION_ROWS]:
+        lay = interaction_layout(report, inter, cls)
+        if lay is None or not lay["bands"]:
+            continue
+        xe, be = lay["entries"][lay["xf"]], lay["entries"][lay["by"]]
+        x_bands = [[int(c) for c in b["cells"]] for b in xe.get("bands") or []]
+        if not x_bands:
+            continue
+        x_band = np.full(len(xe["mass"]), -1, dtype=np.int64)
+        for i, cells in enumerate(x_bands):
+            x_band[cells] = i
+        band_of = {tc: i for i, band in enumerate(lay["bands"]) for tc in band}
+        by_band = np.array([-1 if tc is None else band_of.get(tc, -1)
+                            for tc in _table_cells(be["axis"], lay["t"]["axes"][lay["iby"]])],
+                           dtype=np.int64)
+        plans.append((inter, int(xe["raw"]), int(be["raw"]), x_band, by_band,
+                      [str(b["label"]) for b in xe["bands"]], lay))
+    if not plans:
+        return
+    per_ds: list[list[dict[str, Any]]] = [[] for _ in plans]
+    for p, d in zip(prepared, report["datasets"]):
+        if p.error is not None or not d.get("actual_vs_expected"):
+            continue
+        row_cells = p.cells[0]
+        # Two columns per table: (x band, partner band), then (x level, partner band).
+        codes = np.empty((row_cells.shape[0], 2 * len(plans)), dtype=np.uint32)
+        n_cells = []
+        for j, (_, rx, rb, x_band, by_band, x_labels, lay) in enumerate(plans):
+            nb, size = len(lay["bands"]), len(x_labels) * len(lay["bands"])
+            cx = np.minimum(row_cells[:, rx], len(x_band) - 1)
+            pb = by_band[np.minimum(row_cells[:, rb], len(by_band) - 1)]
+            xb = x_band[cx]
+            codes[:, 2 * j] = np.where((xb >= 0) & (pb >= 0), xb * nb + pb, size)  # last: neither
+            levels = len(x_band) * nb
+            codes[:, 2 * j + 1] = np.where(pb >= 0, cx * nb + pb, levels)
+            n_cells += [size + 1, levels + 1]
+        if p.proba is not None and p.codes is not None:
+            pk = p.proba[:, 0]
+            actual, expected, var = (p.codes == 0).astype(np.float64), pk, pk * (1.0 - pk)
+        else:
+            assert p.pred is not None
+            actual, expected = p.y, p.pred
+            var = dispersion(obj, p.y, p.pred, p.w, rho) * _variance(obj, p.pred, rho)
+        sums = _report_cell_sums(np.ascontiguousarray(codes), n_cells, _f64(actual),
+                                 _f64(expected), _f64(p.w), _f64(p.e), _f64(var))
+        for j, (_, _, _, x_band, _, x_labels, lay) in enumerate(plans):
+            (a, e, m, _, v), (la, le, lm, _, _) = sums[2 * j], sums[2 * j + 1]
+            nb = len(lay["bands"])
+
+            def grid(values: list[float | None]) -> list[list[float | None]]:
+                return [values[i * nb:(i + 1) * nb] for i in range(len(x_labels))]
+
+            size = len(x_labels) * nb
+            per_ds[j].append({
+                "label": d["label"],
+                "ae": grid([_ratio(a[c], e[c]) if e[c] > 0 else None for c in range(size)]),
+                "mass": grid([float(m[c]) for c in range(size)]),
+                "z": grid([float((a[c] - e[c]) / math.sqrt(v[c])) if v[c] > 0 else None
+                           for c in range(size)]),
+                "sd": grid([float(math.sqrt(v[c]) / e[c]) if v[c] > 0 and e[c] > 0 else None
+                            for c in range(size)]),
+                "levels": {key: [[float(arr[c * nb + b]) for b in range(nb)]
+                                 for c in range(len(x_band))]
+                           for key, arr in (("actual", la), ("expected", le), ("mass", lm))},
+            })
+    for (inter, _, _, _, _, x_labels, lay), datasets in zip(plans, per_ds):
+        inter["ae"] = {"x": lay["xf"], "by": lay["by"], "x_labels": x_labels,
+                       "x_bands": [[int(c) for c in b["cells"]]
+                                   for b in lay["entries"][lay["xf"]]["bands"]],
+                       "by_bands": lay["bands"], "by_labels": lay["band_labels"],
+                       "datasets": datasets}
+
+
 def shap_by_cell(est: "_BaseTBoost", p: Prepared,
                  measure: dict[str, Any]) -> list[list[dict[str, Any]]]:
     """Per class bank and raw feature: each merged-grid cell's exposure-weighted mean and 10th
@@ -551,6 +643,34 @@ def _ranking(link: str, p: Prepared, pred: np.ndarray, y: np.ndarray,
         if kept.size else None
     )
     return out
+
+
+def prediction_histograms(est: "_BaseTBoost", prepared: list[Prepared],
+                          datasets: list[dict[str, Any]]) -> None:
+    """Each scored single-output dataset's mass by predicted rate, on bins every dataset shares
+    (``metrics["predicted_rate_histogram"]``): from the first dataset's 0.5th to 99.5th
+    percentile, log-spaced when the rates are positive and span more than a factor of 3, with
+    rates beyond in the end bins."""
+    parts = []
+    for p, d in zip(prepared, datasets):
+        if p.error is None and p.pred is not None and d.get("metrics"):
+            rate, _, mass, keep = _rate_and_mass(est.link, p, p.pred, p.y)
+            parts.append((d, rate[keep], mass[keep]))
+    if not parts or parts[0][0] is not datasets[0] or not parts[0][1].size:
+        return
+    first = parts[0][1]
+    lo, hi = (float(v) for v in np.quantile(first, [0.005, 0.995]))
+    if hi <= lo:
+        lo, hi = float(np.min(first)), float(np.max(first))
+    if hi <= lo:  # constant predictions: one narrow range
+        hi = lo + (abs(lo) * 0.1 or 1.0)
+    log = lo > 0 and hi / lo > 3
+    edges = (np.geomspace(lo, hi, _HISTOGRAM_BINS + 1) if log
+             else np.linspace(lo, hi, _HISTOGRAM_BINS + 1))
+    for d, rate, mass in parts:
+        counts, _ = np.histogram(np.clip(rate, edges[0], edges[-1]), bins=edges, weights=mass)
+        d["metrics"]["predicted_rate_histogram"] = {
+            "edges": edges.tolist(), "mass": counts.tolist(), "log": bool(log)}
 
 
 def single_output_metrics(est: "_BaseTBoost", p: Prepared) -> dict[str, Any]:
@@ -741,9 +861,10 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
     flags: list[dict[str, Any]] = []
     datasets = report["datasets"]
     multiclass = report["model"]["multiclass"]
+    roles = dataset_roles(len(datasets))
     for i, ds in enumerate(datasets):
         label = ds["label"]
-        tol = th[f"ae_{DATASET_ROLES[i]}"]
+        tol = th[f"ae_{roles[i]}"]
         if ds.get("error"):
             flags.append(_flag("scoring", "critical", ds["error"], dataset=label))
             continue
@@ -790,6 +911,9 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                                    f"no predicted-rate decile off by more than {dtol:g}"
                                    + (f" and {fz:g} standard deviations" if fz is not None else ""),
                                    threshold=dtol, dataset=label))
+        for factor in ds["actual_vs_expected"]:  # a fresh verdict on every band
+            for b in factor.get("bands") or []:
+                b.pop("flag", None)
         if ftol is not None:
             flagged = len(flags)
             covered, total_mass = 0.0, 0.0
@@ -805,6 +929,11 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                 near = [b for b in eligible if b not in bad and nz is not None and out_of_sample
                         and b["ae"] is not None and abs(b["ae"] - 1.0) > ftol
                         and b["z"] is not None and abs(b["z"]) >= nz]
+                # The verdict on the band itself, for the page's charts.
+                for b in bad:
+                    b["flag"] = "warning"
+                for b in near:
+                    b["flag"] = "near_miss"
                 for b in near:
                     flags.append(_flag(
                         "factor_ae", "info",
@@ -845,19 +974,11 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                     value=share, threshold=th["unseen_mass"], dataset=label, feature=feature))
     if len(datasets) == 1:
         flags.append(_flag("holdout_data", "info",
-                           "train data only: every metric is in-sample. Pass validation and test "
-                           "data as eval_set for out-of-sample evidence",
+                           "train data only: every metric is in-sample. Pass test data as "
+                           "eval_set for out-of-sample evidence",
                            dataset=datasets[0]["label"]))
-    elif len(datasets) == 2:
-        flags.append(_flag("holdout_data", "info",
-                           f"no test data: {datasets[1]['label']} is the only out-of-sample "
-                           "evidence", dataset=datasets[1]["label"]))
-    if len(datasets) > 1 and report["fit"]["early_stopping"]["eval_set"]:
-        flags.append(_flag(
-            "holdout_data", "info",
-            "the fit early-stopped on an eval_set: if that was the validation data, its metrics "
-            "are not fully out-of-sample; the test data are the independent estimate",
-            dataset=datasets[1]["label"]))
+    # Train and test need no note: the bags early-stop and prune on rows they hold back, so
+    # the fit never sees the test data.
     train = datasets[0]
     first = None if train.get("error") else train["metrics"]["deviance_explained"]
     for ds in datasets[1:]:
@@ -936,6 +1057,13 @@ def review(est: "_BaseTBoost", report: dict[str, Any], th: dict[str, float | Non
                     feature=f["feature"]))
     grad = report["fit"]["graduation"]["value"] or {}
     grad_tables = report["fit"]["graduation_tables"]["value"] or []
+    # A declined fixed `graduation_alpha` is a binding finding (below); a declined GCV choice
+    # is reported here.
+    if (grad.get("candidate_count") == 1 and grad.get("adopted") is False
+            and getattr(est, "graduation_alpha", None) is None):
+        flags.append(_flag(
+            "graduation", "info",
+            "graduation was not applied: " + str(grad.get("rejected") or "it was declined")))
     if grad and grad.get("adopted") and grad.get("evidence") == "none":
         smoothed = [g for g in grad_tables if (g.get("alpha") or 0) > 0 and not g.get("rejected")]
         plain = [g["features"][0] for g in grad_tables
@@ -1062,35 +1190,43 @@ def _available(value: Any, reason: str) -> dict[str, Any]:
 
 
 def _graduation_tables(est: "_BaseTBoost", names: list[str]) -> list[dict[str, Any]] | None:
-    """Per smoothed-candidate table: its features, the strength chosen (0 = left as fitted) and
-    whether the holdout rejected it, from ``graduation_report_``."""
+    """Per smoothed-candidate table: its features, the strength chosen (0 = left as fitted),
+    whether the training-deviance check rejected it and, on a multiclass fit, its class, from
+    ``graduation_report_``."""
     rows = getattr(est, "graduation_report_", None)
     if not rows:
         return None
+    labels = getattr(est, "classes_", None)
+    classes = [] if labels is None else [str(c) for c in labels]
     out = []
     for g in rows:
         ids = g.get("features") or g.get("u") or []
+        k = g.get("class")
         out.append({
             "features": [names[i] if isinstance(i, int) and 0 <= i < len(names) else str(i)
                          for i in ids],
             "alpha": _display(g.get("alpha")),
             "rejected": bool(g.get("rejected", False)),
             "method": _display(g.get("method")),
+            "class": (classes[k] if isinstance(k, int) and 0 <= k < len(classes)
+                      else None if k is None else str(k)),
         })
     return out
 
 
 def fit_section(est: "_BaseTBoost", multiclass: bool,
                 names: list[str] | None = None) -> dict[str, Any]:
-    loaded_or_multi = ("not recorded: a multiclass fit has no per-bag boosting report"
+    loaded_or_multi = ("not recorded with this model (a multiclass model saved before 0.9.1)"
                        if multiclass else "not recorded with this model (saved before 0.7.0)")
     history = getattr(est, "evals_result_", None)
-    pruning = getattr(est, "pruning_report_", None)
-    if pruning is None:
-        why = ("prune=False: no table selection ran" if not getattr(est, "prune", False)
-               else "the pruning report was not stored with this model (saved before it was)")
+    if getattr(est, "validation_fraction", None) is None:
+        no_history = ("early stopping was off (validation_fraction=None), so no per-round "
+                      "deviance was recorded")
     else:
-        why = ""
+        no_history = "the per-round history is kept on the live fit only, not saved with the model"
+    pruning = getattr(est, "pruning_report_", None)
+    why = ("" if pruning is not None
+           else "the pruning report was not stored with this model (saved before it was)")
     try:
         binding = est.binding_report_
     except Exception as exc:  # pragma: no cover - defensive
@@ -1103,9 +1239,7 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
         "stopping_reason": _available(getattr(est, "stopping_reason_", None), loaded_or_multi),
         "stopping_reason_per_bag": _available(
             getattr(est, "stopping_reason_per_bag_", None), loaded_or_multi),
-        "evals_result": _available(
-            history, "the per-round history is recorded only on a live fit with eval_set or "
-            "callbacks, and is not saved with the model"),
+        "evals_result": _available(history, no_history),
         "pruning": _available(pruning, why),
         "graduation": _available(getattr(est, "graduation_validation_", None),
                                  "no graduation diagnostics recorded"),
@@ -1115,7 +1249,6 @@ def fit_section(est: "_BaseTBoost", multiclass: bool,
             "stored)"),
         "binding_report": _available(binding, why_b),
         "early_stopping": {
-            "eval_set": bool(getattr(est, "_fit_eval_set_", False)),
             "validation_fraction": _display(getattr(est, "validation_fraction", None)),
             "early_stopping_rounds": _display(getattr(est, "early_stopping_rounds", None)),
         },
@@ -1144,6 +1277,16 @@ def structure_section(est: "_BaseTBoost", banks: dict[str, Any]) -> dict[str, An
     return {"deployed_tables": est._deployed_table_count(), "banks": out_banks}
 
 
+def _shown_smoothing(report: dict[str, Any]) -> dict[tuple[str, ...], Any]:
+    """Each graduated table's strength by its features, for the bank the summaries show: the
+    first class's on a multiclass model, whose classes can choose different strengths."""
+    rows = report["fit"]["graduation_tables"]["value"] or []
+    if report["model"]["multiclass"]:
+        shown = next(iter(report["tables"]), None)
+        rows = [g for g in rows if g.get("class") == shown]
+    return {tuple(g["features"]): g["alpha"] for g in rows}
+
+
 def features_section(report: dict[str, Any], th: dict[str, float | None]) -> list[dict[str, Any]]:
     """One row per raw feature: importance split into its own one-way table and its share
     through interactions, and the one-way table's effect range, thin cells, missing-value level
@@ -1154,8 +1297,7 @@ def features_section(report: dict[str, Any], th: dict[str, float | None]) -> lis
     n_banks = max(len(banks), 1)
     tables = report["tables"]
     first_bank = next(iter(tables.values())) if m["multiclass"] else tables
-    grad = report["fit"]["graduation_tables"]["value"] or []
-    smoothing = {tuple(g["features"]): g["alpha"] for g in grad}
+    smoothing = _shown_smoothing(report)
     thin_mass = th.get("thin_cell_mass") or 0.0
     datasets = [d for d in report["datasets"] if not d.get("error")]
     out = []
@@ -1223,8 +1365,7 @@ def interactions_section(report: dict[str, Any]) -> list[dict[str, Any]]:
     link = m["link"]
     tables = report["tables"]
     bank = next(iter(tables.values())) if m["multiclass"] else tables
-    grad = {tuple(g["features"]): g["alpha"]
-            for g in report["fit"]["graduation_tables"]["value"] or []}
+    grad = _shown_smoothing(report)
     out = []
     for t in bank.get("tables", []):
         names = list(t["feature_names"])
@@ -1328,6 +1469,8 @@ def build_report(
                 for f in entry["actual_vs_expected"][: len(p.names)]
             ]
         datasets.append(entry)
+    if not multiclass:
+        prediction_histograms(est, prepared, datasets)
 
     # Factor bands: at most `_PSI_BINS` per feature, from the first dataset's mass, applied to
     # every dataset, so the factor check and the level summary read the same groups everywhere.
@@ -1401,6 +1544,7 @@ def build_report(
     report["structure"] = structure_section(est, banks)
     report["features"] = features_section(report, th)
     report["interactions"] = interactions_section(report)
+    interaction_ae(report, prepared, obj, rho)
     report["review"] = review(est, report, th)
     report["summary_metrics"] = summary_metrics(report)
     return json_safe(report)  # type: ignore[no-any-return]

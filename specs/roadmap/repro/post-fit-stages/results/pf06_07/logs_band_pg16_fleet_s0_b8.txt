@@ -1,0 +1,9 @@
+pg16_fleet s0 b8       unbanded: test 0.965547 (+0.000% vs U, -0.162% vs ship) cells 7460 first +0.000 joint 0.000 diag 0.000
+pg16_fleet s0 b8        shipped: test 0.967115 (+0.162% vs U, +0.000% vs ship) cells 35723 first +0.132 joint 0.030 diag 0.028
+noise {'dataset': 'pg16_fleet', 'split': 0, 'n_bags': 8, 'variant': '_noise', 'sigma_shipped': [0.039349802282933145, 0.044471458694056554, 0.04423928390382455], 'sigma_raw': [0.03934980228293339, 0.04447145869405636, 0.04423928390382432], 'sigma_centred': [0.029142442491971086, 0.036441370248202765, 0.03216360605915892], 'joint_over_diag_noise': 0.8412906821617617}
+base reproduces shipped bytes: True
+pg16_fleet s0 b8           base: test 0.967115 (+0.162% vs U, +0.000% vs ship) cells 35723 first +0.132 joint 0.030 diag 0.028
+pg16_fleet s0 b8        capx0.5: test 0.967115 (+0.162% vs U, +0.000% vs ship) cells 35723 first +0.132 joint 0.030 diag 0.028
+pg16_fleet s0 b8       capx0.25: test 0.966977 (+0.148% vs U, -0.014% vs ship) cells 37806 first +0.124 joint 0.024 diag 0.023
+pg16_fleet s0 b8           mass: test 0.967115 (+0.162% vs U, +0.000% vs ship) cells 35723 first +0.132 joint 0.030 diag 0.028
+pg16_fleet s0 b8          nosig: test 0.968989 (+0.356% vs U, +0.194% vs ship) cells 25543 first +0.266 joint 0.090 diag 0.081

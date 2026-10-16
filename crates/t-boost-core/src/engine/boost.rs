@@ -443,7 +443,7 @@ const INCREMENTAL_MU_REFRESH_ROUNDS: u32 = 64;
 
 /// Class solves the K>=3 cell refit runs at once (see `attach_multiclass_cell_correction`): each
 /// holds one `supports x fit_rows` design, so this caps the designs live together.
-const MC_REFIT_CLASS_WAVE: usize = 8;
+pub(crate) const MC_REFIT_CLASS_WAVE: usize = 8;
 
 /// Best-round restore state for early-stop truncation (see the `best_snapshot` comment in
 /// `fit_single`): the cheap `Alphas` form suffices when only alphas can be mutated after the
@@ -881,13 +881,11 @@ fn fit_single(
         .as_ref()
         .map(|(y_sub, w_sub)| (y_sub.as_slice(), w_sub.as_slice()));
 
-    // Run-time controls (R2/R3): the per-round history and observer read deviances only, so a
-    // fit without them takes none of the branches below and stays bit-identical. The stopping
-    // deviance is computed for early stopping anyway; the training deviance is an extra O(n)
-    // pass per round (~10-20% of a fit), so only an observer pays for it.
+    // Run-time controls (R2/R3): the per-round history and the observer read deviances only, so
+    // they never change the model. The stopping deviance is computed for early stopping anyway,
+    // so its history is always kept; the training deviance is an extra pass over the training
+    // rows every round (+5-11% of a fit, measured 2026-10-15), so only an observer pays for it.
     let control = &config.fit_control;
-    let track_rounds = control.record_history || control.observer.is_some();
-    let track_train = control.observer.is_some();
     let mut history_train: Vec<f64> = Vec::new();
     let mut history_eval: Vec<f64> = Vec::new();
     let (mut tr_y_sub, mut tr_raw_sub, mut tr_weight_sub) = (Vec::new(), Vec::new(), Vec::new());
@@ -901,14 +899,12 @@ fn fit_single(
             .sum::<f64>()
             .max(f64::MIN_POSITIVE)
     };
-    let (train_mass, eval_mass) = if track_rounds {
-        (
-            mass_of(&train_rows_usize),
-            validation_rows.as_deref().map_or(1.0, mass_of),
-        )
+    let train_mass = if control.observer.is_some() {
+        mass_of(&train_rows_usize)
     } else {
-        (1.0, 1.0)
+        1.0
     };
+    let eval_mass = validation_rows.as_deref().map_or(1.0, mass_of);
 
     prof::reset();
     for t in 0..config.n_trees {
@@ -1300,40 +1296,30 @@ fn fit_single(
                         patience_spent = true;
                     }
                 }
-                if track_rounds {
-                    let train_deviance = if track_train {
-                        deviance_for_rows_scratch(
-                            spec.loss,
-                            y,
-                            &raw,
-                            weight,
-                            &train_rows_usize,
-                            &mut tr_y_sub,
-                            &mut tr_raw_sub,
-                            &mut tr_weight_sub,
-                        )? / train_mass
-                    } else {
-                        f64::NAN
+                let eval_deviance = eval_deviance.map(|d| d / eval_mass);
+                history_eval.extend(eval_deviance);
+                if let Some(observer) = &control.observer {
+                    let train_deviance = deviance_for_rows_scratch(
+                        spec.loss,
+                        y,
+                        &raw,
+                        weight,
+                        &train_rows_usize,
+                        &mut tr_y_sub,
+                        &mut tr_raw_sub,
+                        &mut tr_weight_sub,
+                    )? / train_mass;
+                    history_train.push(train_deviance);
+                    let event = RoundEvent {
+                        bag: control.bag,
+                        round: rounds_trained,
+                        n_trees: config.n_trees,
+                        train_deviance,
+                        eval_deviance,
                     };
-                    let eval_deviance = eval_deviance.map(|d| d / eval_mass);
-                    if control.record_history {
-                        if track_train {
-                            history_train.push(train_deviance);
-                        }
-                        history_eval.extend(eval_deviance);
-                    }
-                    if let Some(observer) = &control.observer {
-                        let event = RoundEvent {
-                            bag: control.bag,
-                            round: rounds_trained,
-                            n_trees: config.n_trees,
-                            train_deviance,
-                            eval_deviance,
-                        };
-                        if (observer.0)(&event) {
-                            stop_reason = StopReason::Callback;
-                            break;
-                        }
+                    if (observer.0)(&event) {
+                        stop_reason = StopReason::Callback;
+                        break;
                     }
                 }
                 if patience_spent {
@@ -1397,8 +1383,7 @@ fn fit_single(
     }
 
     let mut f0_eff = f64::from(f0_f32);
-    // An external evaluation holdout only scores early stopping: it never fits the slope.
-    if config.boosters.reanchor_slope && !control.external_holdout {
+    if config.boosters.reanchor_slope {
         if let Some(val_rows) = validation_rows.as_deref() {
             if let Some((a, b)) =
                 fit_affine_reanchor(spec.loss, y, &raw, weight, offset.as_deref(), val_rows)?
@@ -1440,14 +1425,7 @@ fn fit_single(
         }
     }
     let f0_model = {
-        let shifted = if config.boosters.reanchor && control.external_holdout {
-            // The intercept re-anchors on the training rows only: an external evaluation
-            // holdout's targets must not reach the model.
-            let train_y = gather_rows(y, &train_rows)?;
-            let train_w = gather_rows(weight, &train_rows)?;
-            let train_raw = gather_rows(&raw, &train_rows)?;
-            f0_eff + reanchor_delta(spec.loss.link(), &train_y, &train_w, &train_raw, None)?
-        } else if config.boosters.reanchor {
+        let shifted = if config.boosters.reanchor {
             f0_eff + reanchor_delta(spec.loss.link(), y, weight, &raw, None)?
         } else {
             f0_eff
@@ -1485,6 +1463,7 @@ fn fit_single(
         bag_spans: None,
         bag_intercepts: None,
         bag_in_bag: None,
+        fit_cat_bins: None,
         delta_step_gate: gate_state.report(),
         fit_report: Some(vec![BagFitReport {
             trees_kept: u32::try_from(trees_kept).unwrap_or(u32::MAX),
@@ -1839,6 +1818,11 @@ fn fit_multiclass_bagged(
     Ok(out)
 }
 
+/// The step sizes a K-class decoupled cell correction is scored at on held-out rows: halvings
+/// from the Newton step (1) down to declining it (0), finer below 0.25 because the decoupled
+/// direction's known failure is overshoot (see [`attach_multiclass_cell_correction`]).
+pub(crate) const MC_CORRECTION_STEPS: [f32; 8] = [0.0, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0];
+
 /// The K-class §G1 cell-basis correction: K decoupled diagonal-Hessian cell solves on the
 /// out-of-bag softmax working residual, accepted or shrunk by ONE JOINT BACKTRACK on the true
 /// multinomial loss. The multiclass analogue of [`attach_cell_correction`].
@@ -2081,8 +2065,7 @@ fn attach_multiclass_cell_correction(
         let mut cand: Vec<Vec<f32>> = vec![vec![0.0_f32; hrows.len()]; n_classes];
         let mut best_dev = f64::INFINITY;
         let mut best = 0.0_f32;
-        const LAMBDAS: [f32; 8] = [0.0, 0.0625, 0.125, 0.25, 0.375, 0.5, 0.75, 1.0];
-        for &lam in &LAMBDAS {
+        for &lam in &MC_CORRECTION_STEPS {
             for k in 0..n_classes {
                 for i in 0..hrows.len() {
                     cand[k][i] = hraw[k][i] + lam * hd[k][i];
@@ -2095,7 +2078,7 @@ fn attach_multiclass_cell_correction(
             }
         }
         // "Rejected" = every trial step the joint loss refused, i.e. the halvings walked past.
-        n_rejected = LAMBDAS.iter().filter(|&&l| l > best).count();
+        n_rejected = MC_CORRECTION_STEPS.iter().filter(|&&l| l > best).count();
         lambda = best;
     }
     if lambda <= 0.0 {
@@ -2334,6 +2317,15 @@ fn fit_multiclass_single(
     let mut best_counts: Vec<usize> = vec![0; n_classes];
     let mut best_round_seen = 0u32;
     let mut interaction_gain_references: Vec<Option<f64>> = vec![None; n_classes];
+    // The bag's boosting report (the K>=3 twin of `fit_single`'s): rounds trained, rounds kept
+    // after early stopping, and why the loop ended. A round grows one tree per class, so rounds
+    // are what `n_trees` caps.
+    let mut rounds_trained = 0u32;
+    let mut rounds_kept = 0u32;
+    let mut stop_reason = StopReason::MaxTrees;
+    // The early-stopping deviance of every round, which the stopping rule computes anyway: as
+    // the multinomial deviance (twice the mean cross-entropy), the scale the report uses.
+    let mut history_eval: Vec<f64> = Vec::new();
 
     for t in 0..config.n_trees {
         let mut round_cfg = grow_cfg.clone();
@@ -2471,7 +2463,12 @@ fn fit_multiclass_single(
         let any_grew = grew_by_class.into_iter().any(|grew| grew);
         // No class could split (converged / constant) — stop with what we have.
         if !any_grew {
+            stop_reason = StopReason::NoSplit;
             break;
+        }
+        rounds_trained = t + 1;
+        if validation_rows.is_none() {
+            rounds_kept = rounds_trained;
         }
         if let Some(val) = validation_rows.as_deref() {
             let dev = prof::timed("mc_earlystop_eval", || {
@@ -2483,6 +2480,7 @@ fn fit_multiclass_single(
                     &mut deviance_scratch,
                 )
             })?;
+            history_eval.push(2.0 * dev);
             let improved = match best_deviance {
                 Some(b) => config.is_material_improvement(b, dev),
                 None => true,
@@ -2495,9 +2493,11 @@ fn fit_multiclass_single(
                     })? = tk.len();
                 }
                 best_round_seen = t;
+                rounds_kept = t + 1;
             } else if (t as usize).saturating_sub(best_round_seen as usize)
                 >= config.effective_patience(best_round_seen as usize)
             {
+                stop_reason = StopReason::EarlyStopping;
                 break;
             }
         }
@@ -2553,8 +2553,17 @@ fn fit_multiclass_single(
             bag_spans: None,
             bag_intercepts: None,
             bag_in_bag: None,
+            fit_cat_bins: None,
             delta_step_gate: None,
-            fit_report: None,
+            // Every class of the bag shares its rounds, so each carries the same report; the
+            // per-class soup gathers the bags' reports in bag order.
+            fit_report: Some(vec![BagFitReport {
+                trees_kept: rounds_kept,
+                rounds_trained,
+                reason: stop_reason,
+                train_deviance: Vec::new(),
+                eval_deviance: history_eval.clone(),
+            }]),
         };
         model.schema_version = model.required_schema_version();
         model.validate()?;
@@ -2602,7 +2611,7 @@ fn multiclass_init(labels: &[u32], weight: &[f32], n_classes: usize) -> Result<V
 /// Fill `probs` with the row-major `n × K` softmax probabilities from the K raw columns (reuses
 /// the stable [`softmax_in_place`]). `probs` is resized in place (a no-op at steady `n,K`), so the
 /// caller reuses one buffer across rounds with no per-round allocation. Deterministic per-row.
-fn multiclass_softmax(
+pub(crate) fn multiclass_softmax(
     raw: &[Vec<f32>],
     n_classes: usize,
     n: usize,
@@ -2653,7 +2662,7 @@ fn multiclass_softmax(
 
 /// Fill `out` with class-`k` softmax `(g, h)` from the precomputed `n x K` probabilities:
 /// `g = w(p_k - 1[y=k])`, `h = (w * p_k(1-p_k)).max(1e-16)`. Deterministic row map.
-fn fill_grad_hess_from_probs(
+pub(crate) fn fill_grad_hess_from_probs(
     probs: &[f32],
     labels: &[u32],
     weight: &[f32],
@@ -4625,6 +4634,7 @@ fn soup_models(members: &[WeightedModel]) -> Result<Model, PbError> {
         bag_intercepts: Some(members.iter().map(|m| m.model.f0).collect()),
         // Filled in by `fit_outer_bag` (the only caller with a row partition to record).
         bag_in_bag: None,
+        fit_cat_bins: None,
         // Each bag ran its own independent gate (its own bootstrap/subagged rows ⇒ its own
         // collapse behavior), so the soup's report is the fold of the members': engaged if ANY
         // bag engaged, earliest engaging round, and the extreme rate ratio over all of them.

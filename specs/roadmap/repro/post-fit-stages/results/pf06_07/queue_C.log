@@ -1,0 +1,19 @@
+=== 08:40:23 es lapse 0
+{"dataset": "lapse", "split": 0, "kwargs": {}, "fit_s": 6.12, "test": 0.36884352656810304, "n_trees_per_bag": [21, 39, 35, 24, 54, 12, 32, 114], "stop": ["early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping"]}
+=== 08:40:31 done 0
+=== 08:40:31 es surrender 0
+{"dataset": "surrender", "split": 0, "kwargs": {}, "fit_s": 11.69, "test": 0.5173742400709929, "n_trees_per_bag": [294, 225, 235, 323, 562, 242, 231, 543], "stop": ["early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping"]}
+=== 08:40:44 done 0
+=== 08:40:44 es swmc 0
+{"dataset": "swmc", "split": 0, "kwargs": {}, "fit_s": 7.32, "test": 0.09791163032784914, "n_trees_per_bag": [96, 32, 47, 34, 24, 49, 21, 35], "stop": ["early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping"]}
+=== 08:40:53 done 0
+=== 08:40:53 es ausbi 0
+{"dataset": "ausbi", "split": 0, "kwargs": {}, "fit_s": 6.09, "test": 1.267594511933903, "n_trees_per_bag": [208, 41, 175, 86, 127, 75, 58, 197], "stop": ["early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping", "early_stopping"]}
+=== 08:41:00 done 0
+=== 08:41:00 grad fr_instal 0 8 B,U shipped,shared_h nt12k
+fr_instal s0 b8      shipped    shipped: d_test +0.500% train x1.0135 smoothed 139 [40, 38, 26, 35] ceiling 11 per-class [0.07, 0.18, 0.163, 0.02]
+fr_instal s0 b8      shipped   shared_h: d_test +0.283% train x1.0093 smoothed 151 [38, 38, 37, 38] ceiling 4 per-class []
+fr_instal s0 b8     unbanded    shipped: d_test +0.293% train x1.0064 smoothed 56 [16, 19, 9, 12] ceiling 4 per-class [0.04, 0.119, 0.105, 0.004]
+fr_instal s0 b8     unbanded   shared_h: d_test +0.121% train x1.0039 smoothed 52 [13, 13, 13, 13] ceiling 0 per-class []
+=== 08:48:34 done 0
+=== 08:48:34 band pg16_fleet 0 8 "" nt12k '{"n_trees": 12000}'

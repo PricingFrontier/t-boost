@@ -7,8 +7,8 @@
 #![allow(unsafe_code)]
 
 use numpy::{
-    IntoPyArray, PyArray, PyArray1, PyArray2, PyArray3, PyArrayMethods, PyReadonlyArray1,
-    PyReadonlyArray2, PyReadwriteArray1, PyUntypedArrayMethods,
+    IntoPyArray, PyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadwriteArray1, PyUntypedArrayMethods,
 };
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyTypeError, PyValueError};
@@ -31,7 +31,7 @@ use t_boost_core::data::{
     bin, bin_columns, bin_serve_columns, bin_serve_columns_coded, bin_serve_columns_with,
     bin_train_columns_with_holdout, AxisKind, AxisProvenance, BinConfig, BinnedMatrix,
     CatServeMaps, CategoricalColumn, FeatureId, NumericColumn, ServeBinnedMatrix,
-    ServeCategoricalCodes, ServeCategoricalColumn, TrainBinnedMatrix,
+    ServeCategoricalCodes, ServeCategoricalColumn,
 };
 use t_boost_core::engine::{
     Booster, Config, FitSpec, GatedStepPolicy, HistPrecision, InteractionGainHurdleMode, Model,
@@ -47,12 +47,11 @@ use t_boost_core::loss::{
 };
 use t_boost_core::prune::{
     bag_banks_for_keepset, bag_oob_evidence_available, bag_oob_group_sums_with,
-    bag_raw_scores_for_rows, multiclass_bag_oob_evidence_available, multiclass_carve_arms,
-    multiclass_full_tables, multiclass_oob_arms, multiclass_prune_guard, multiclass_ranked_path,
+    bag_raw_scores_for_rows, multiclass_full_tables, multiclass_ranked_path,
     multiclass_realized_supports, prune_model_to_keepset, prune_model_to_tables,
     prune_model_to_tables_pinned, prune_multiclass_to_keepset,
-    prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, MulticlassGuardEvidence,
-    MulticlassGuardReport, PruneConfig, PruneReport, PruneTableScore, DEFAULT_TABLE_MIN_ARITY,
+    prune_multiclass_to_keepset_budgeted, prune_multiclass_to_tables, PruneConfig, PruneReport,
+    PruneTableScore, DEFAULT_TABLE_MIN_ARITY,
 };
 use t_boost_core::serialize::{
     decode_multiclass, decode_multiclass_json, encode_multiclass, encode_multiclass_json,
@@ -1264,6 +1263,60 @@ mod cat_channels_fit_path_tests {
         }
     }
 
+    /// A fit records the training-time bins of exactly the categoricals whose levels share
+    /// bins (more levels than the 254 bins) for the post-fit stages that score the fit rows:
+    /// a 300-level feature's rows are placed by their out-of-fold statistics, while a 40-level
+    /// feature (one bin per level) and a binary one stay on the serve map.
+    #[test]
+    fn a_fit_records_the_training_bins_of_categoricals_whose_levels_share_bins() {
+        let n = 1500;
+        let numeric: Vec<f32> = (0..n).map(|i| (i % 37) as f32).collect();
+        let shared: Vec<String> = (0..n).map(|i| format!("s{}", i % 300)).collect();
+        let own: Vec<String> = (0..n).map(|i| format!("o{}", i % 40)).collect();
+        let binary: Vec<String> = (0..n).map(|i| format!("b{}", i % 2)).collect();
+        let y: Vec<f32> = (0..n)
+            .map(|i| {
+                ((i % 300) as f32 * 0.01) + ((i % 40) as f32 * 0.05) + ((i * 7919) % 13) as f32
+            })
+            .collect();
+        let mut state = booster_with_count_channel_and_floor(1000, 1.0);
+        state.cat_channels = CatChannelPlan {
+            mean: true,
+            count: false,
+            class_freq: false,
+        };
+        let monotone_map = build_monotone_map(None, 4).unwrap();
+        let cat_x = vec![shared.clone(), own.clone(), binary.clone()];
+        let model = fit_model_ambient(
+            &state,
+            std::slice::from_ref(&numeric),
+            &y,
+            None,
+            None,
+            None,
+            None,
+            &monotone_map,
+            Some(&cat_x),
+            None,
+        )
+        .unwrap();
+        // Axes: numeric 0, then one mean channel per categorical (1, 2, 3).
+        let recorded = model.fit_cat_bins.as_ref().expect("a fit records its bins");
+        let axes: Vec<u32> = recorded.iter().map(|(axis, _)| *axis).collect();
+        assert_eq!(
+            axes,
+            vec![1],
+            "only the 300-level feature's levels share bins"
+        );
+        let serve = serve_binned_for_model(&model, &[numeric], Some(&cat_x)).unwrap();
+        let (_, bins) = &recorded[0];
+        assert_eq!(bins.len(), n);
+        assert_ne!(
+            bins, &serve.data[1],
+            "out-of-fold placements differ from the serve map"
+        );
+    }
+
     /// The team lead's exact regression scenario: a mix of a high-cardinality categorical
     /// (admitted for the count channel -> 2 axes) and a low-cardinality one (mean-only -> 1
     /// axis), fit with caller-supplied `feature_names` sized to the 3 INPUT columns (1
@@ -2035,16 +2088,10 @@ mod cat_channels_fit_path_tests {
     /// sklearn.py DEFAULT, `prune_rebalance=True`) -> predict -> tables -> serialize save ->
     /// load -> predict-after-load -> shap.
     ///
-    /// `rebalance: true` here (previously `false`, see the git history for that draft) now
-    /// exercises `rebalance_kept_cells`'s multi-channel SKIP (bug #5's follow-up fix): a
-    /// separate subsystem (`cell_refit::fit_cell_correction` -> `correction_scaffold`) has its
-    /// own independent row-to-cell representation with no notion of a joint axis, plus an
-    /// unrelated raw-id-vs-axis-id conflation bug only latent pre-P1 -- rather than growing
-    /// joint support through that whole ridge-regression pipeline (out of scope, a redesign,
-    /// per the team lead), `rebalance_kept_cells` now detects any multi-channel raw feature
-    /// ANYWHERE in the model and skips rebalance for the entire model, falling back to the
-    /// already-proven-lossless unrebalanced deploy — which is exactly what this test's
-    /// `rebalance: true` request now silently (and correctly) becomes.
+    /// The deploy runs twice: with `rebalance: true` (the sklearn default), which re-solves the
+    /// numeric feature's tables and leaves every table touching the multi-channel categorical
+    /// as fitted (`cell_refit`'s correction has no joint axis), and with `rebalance: false`,
+    /// whose lossless bank the later steps check against the ensemble.
     #[test]
     fn full_deploy_lifecycle_survives_a_nonseparable_overflowing_joint_axis() {
         let (numeric, cat_high, y) = overflow_fixture();
@@ -2128,8 +2175,7 @@ mod cat_channels_fit_path_tests {
         .expect("CV prune-select must succeed on the overflowing feature");
         assert!(reports.iter().any(Option::is_some));
 
-        // STEP 2: apply_keepset (deploy) -- keep every realized support, `rebalance: false`
-        // (see the KNOWN GAP doc above).
+        // STEP 2: apply_keepset (deploy) -- keep every realized support.
         let binned = serve_binned_for_model(
             &model,
             std::slice::from_ref(&numeric),
@@ -2153,6 +2199,40 @@ mod cat_channels_fit_path_tests {
 
         let keep: Vec<FeatureSet> = bank.tables.iter().map(|t| t.u.clone()).collect();
         let w = vec![1.0_f32; n2];
+        let (rebalanced, _, _, report) = t_boost_core::prune::prune_model_to_keepset_budgeted(
+            &model,
+            &serve,
+            &y,
+            &w,
+            None,
+            &SquaredError,
+            RefMeasure::Uniform,
+            false, // reanchor
+            &keep,
+            true, // rebalance
+            0,
+            0,
+            DEFAULT_TABLE_MIN_ARITY,
+            &BTreeMap::new(),
+        )
+        .expect("the rebalanced deploy must succeed on the overflowing feature");
+        rebalanced.validate().unwrap();
+        let report = report.unwrap();
+        let touches_cat = |u: &FeatureSet| u.0.iter().any(|f| f.0 == 1);
+        assert_eq!(
+            report.excluded,
+            keep.iter()
+                .filter(|u| u.order() <= 2 && touches_cat(u))
+                .cloned()
+                .collect::<Vec<_>>(),
+            "every main or pair on the multi-channel categorical is left as fitted"
+        );
+        assert_eq!(
+            report.supports,
+            keep.iter()
+                .filter(|u| u.order() <= 2 && !touches_cat(u))
+                .count() as u64
+        );
         let tm = t_boost_core::prune::prune_model_to_keepset(
             &model,
             &serve,
@@ -2163,7 +2243,7 @@ mod cat_channels_fit_path_tests {
             RefMeasure::Uniform,
             false, // reanchor
             &keep,
-            true, // rebalance -- exercises the multi-channel skip end to end (bug #5 follow-up)
+            false, // rebalance
         )
         .expect("apply_keepset (prune_model_to_keepset) must succeed on the overflowing feature");
         tm.validate().unwrap();
@@ -2246,16 +2326,15 @@ mod cat_channels_fit_path_tests {
         }
     }
 
-    /// Proves the multi-channel skip is correctly SCOPED: a single-channel (no `cat_channels`
-    /// at all) model with `rebalance: true` must still actually rebalance -- no regression to
-    /// the normal, pre-bug-#5 path. Fits a genuine `x0 * x1` interaction, then prunes down to
+    /// A single-channel (no `cat_channels` at all) model with `rebalance: true` actually
+    /// rebalances. Fits a genuine `x0 * x1` interaction, then prunes down to
     /// ONLY the two main-effect (order-1) tables, dropping the pair entirely -- this leaves a
     /// clear, consistent residual (the discarded interaction's own marginal projection) that a
     /// per-cell ridge correction can partially recover, so `rebalance: true`'s no-harm guard
     /// should adopt the correction and the deployed table VALUES must differ from the
     /// `rebalance: false` bank.
     #[test]
-    fn single_channel_rebalance_is_unaffected_by_the_multichannel_skip() {
+    fn rebalance_recovers_part_of_a_dropped_interaction() {
         let n = 200;
         let x0: Vec<f32> = (0..n).map(|i| (i % 10) as f32).collect();
         let x1: Vec<f32> = (0..n).map(|i| ((i / 10) % 10) as f32).collect();
@@ -2367,38 +2446,61 @@ mod cat_channels_fit_path_tests {
             .collect();
         assert_ne!(
             values_off, values_on,
-            "rebalance:true must actually change the deployed table values for a \
-             single-channel model (dropping a genuine interaction leaves recoverable residual \
-             structure) -- if these are equal, rebalance silently didn't run, which would be a \
-             regression from the multi-channel skip, not a correct no-harm rejection"
+            "rebalance:true must actually change the deployed table values (dropping a \
+             genuine interaction leaves recoverable residual structure) -- if these are equal, \
+             rebalance silently didn't run"
         );
     }
 
-    /// THE regression test for the green-spine bug the skip closes: a multi-channel raw
-    /// feature (raw 0, axes 0-1, mean+count admitted) FOLLOWED by another raw feature (raw 1,
-    /// axis 2 -- a single-channel categorical, deliberately kept low-cardinality so it is NOT
-    /// admitted for a count channel of its own). `fit_model_ambient` numbers numeric columns
-    /// before categorical ones, so with NO numeric columns here, `cat_x`'s ORDER alone
-    /// controls which categorical is raw 0 vs raw 1 -- `cat_high` (admitted) is passed first,
-    /// giving it axes 0-1, so `cat_low` (raw 1, not admitted) ends up at axis 2, strictly
-    /// AFTER the multi-channel feature -- exactly the green-spine failure mode. If
-    /// `correction_scaffold`'s raw-id-as-axis-id bug ever ran, it would resolve raw 1's
-    /// supposed "axis 1" as raw 0's OWN second (count) channel instead of raw 1's real axis
-    /// (2) -- silently building the correction against the wrong column entirely, which
-    /// cannot possibly reconstruct the ensemble's actual prediction. `rebalance: true` here
-    /// must be silently skipped (this model has a multi-channel raw feature, so the
-    /// WHOLE-MODEL skip applies) -- if it were not skipped, or skipped only by checking raw 0
-    /// itself rather than the whole model, this test would fail on the buggy path.
+    /// Deploy `keep` with and without the rebalance, returning both banks and the report.
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: a test helper over the keep-set call.
+    fn deploy_both_ways(
+        model: &Model,
+        serve: &ServeBinnedMatrix,
+        y: &[f32],
+        keep: &[FeatureSet],
+    ) -> (TableModel, TableModel, t_boost_core::prune::RebalanceReport) {
+        let w = vec![1.0_f32; y.len()];
+        let deploy = |rebalance: bool| {
+            t_boost_core::prune::prune_model_to_keepset_budgeted(
+                model,
+                serve,
+                y,
+                &w,
+                None,
+                &SquaredError,
+                RefMeasure::Uniform,
+                false,
+                keep,
+                rebalance,
+                0,
+                0,
+                DEFAULT_TABLE_MIN_ARITY,
+                &BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let (on, _, _, report) = deploy(true);
+        let (off, _, _, none) = deploy(false);
+        assert!(none.is_none(), "no rebalance, no report");
+        on.validate().unwrap();
+        (on, off, report.unwrap())
+    }
+
+    /// Bug #5, end to end: a multi-channel raw feature (raw 0, axes 0-1, mean+count admitted)
+    /// FOLLOWED by a single-channel one (raw 1, axis 2 -- kept low-cardinality so it is NOT
+    /// admitted for a count channel of its own). With no numeric columns, `cat_x`'s order alone
+    /// fixes which categorical is raw 0. Reading raw 1's id as an axis id would re-solve raw 0's
+    /// count channel; the rebalance must instead re-solve raw 1 on its own axis and leave
+    /// raw 0's table exactly as fitted.
     #[test]
-    fn rebalance_skip_prevents_the_green_spine_misscore_for_a_feature_after_multichannel() {
+    fn rebalance_resolves_a_feature_after_a_multichannel_one_to_its_own_axis() {
         let n = 80;
         let cat_high: Vec<String> = (0..n).map(|i| format!("h{}", i % 8)).collect();
         // 3 distinct levels -- below the admission threshold (5) below, so this stays
         // single-channel, at whatever axis it ends up positioned at.
         let cat_low: Vec<String> = (0..n).map(|i| format!("l{}", i % 3)).collect();
-        // y depends on BOTH raw features (so both survive pruning as their own order-1 kept
-        // support) but additively, so this is purely about the axis-id bug, not about an
-        // interaction rebalance might legitimately need to recover.
+        // y depends on BOTH raw features (so both survive as their own order-1 table), additively.
         const HIGH_TARGET: [f32; 8] = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0];
         const LOW_TARGET: [f32; 3] = [0.0, 10.0, 20.0];
         let y: Vec<f32> = (0..n)
@@ -2420,19 +2522,11 @@ mod cat_channels_fit_path_tests {
             None,
         )
         .unwrap();
-        // raw 0 = cat_high, mean+count (axes 0-1); raw 1 = cat_low, single-channel (axis 2) --
-        // confirm the actual layout matches what this test needs (a multi-channel raw feature
-        // strictly followed by another one) via the exact same check the fix's own skip uses.
-        assert!(
-            model.provenance.len() > t_boost_core::data::n_raw_features(&model.provenance),
-            "fixture must have a genuine multi-channel raw feature"
-        );
         assert_eq!(
             model.provenance.len(),
             3,
             "cat_high: 2 axes, cat_low: 1 axis"
         );
-
         let binned = serve_binned_for_model(&model, &[], Some(&[cat_high, cat_low])).unwrap();
         let serve = ServeBinnedMatrix(binned);
         let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
@@ -2442,78 +2536,38 @@ mod cat_channels_fit_path_tests {
             2,
             "both raw features must survive as their own order-1 effect"
         );
-        let w = vec![1.0_f32; n];
-        let tm = t_boost_core::prune::prune_model_to_keepset(
-            &model,
-            &serve,
-            &y,
-            &w,
-            None,
-            &SquaredError,
-            RefMeasure::Uniform,
-            false,
-            &keep,
-            true, // rebalance requested -- must be silently skipped, not silently wrong
-        )
-        .expect("must not crash");
 
-        let tol = t_boost_core::explain::ExactTol::for_model(&model).recon_tol;
-        let ensemble_preds = model.predict(&serve.0, None).unwrap();
-        let tm_preds = tm.predict_binned(&serve.0, None).unwrap();
-        for (e, t) in ensemble_preds.iter().zip(&tm_preds) {
-            assert!(
-                (f64::from(*e) - f64::from(*t)).abs() < tol,
-                "deployed predict must equal the ensemble ({e} vs {t}) -- it CANNOT if the \
-                 raw-id-as-axis-id bug ran and built a correction against the wrong axis"
-            );
-        }
+        let (on, off, report) = deploy_both_ways(&model, &serve, &y, &keep);
+        assert_eq!(report.supports, 1, "raw 1 is re-solved");
+        assert_eq!(report.excluded, vec![FeatureSet::new(&[0])]);
+        let table = |tm: &TableModel, raw: u32| {
+            tm.bank
+                .tables
+                .iter()
+                .find(|t| t.u == FeatureSet::new(&[raw]))
+                .map(|t| t.values.try_values().unwrap().into_owned())
+                .unwrap()
+        };
+        assert_eq!(
+            table(&on, 0),
+            table(&off, 0),
+            "raw 0 is left as fitted: a correction read off its count channel would move it"
+        );
     }
 
-    /// The PURELY SILENT variant of the test above, and the reason the fix checks the WHOLE
-    /// model rather than just `keep`'s own contents. With only 2 raw features (the test
-    /// above), the misinterpreted axis id always lands back on some part of the SAME
-    /// multi-channel feature (still joint, so the guard still fires loudly) -- confirmed by
-    /// temporarily disabling the fix and re-running that test with `keep` restricted to raw 1
-    /// alone: it STILL crashed via the guard, not a silent wrong number, because raw 1's id
-    /// (1) resolves to axis 1, which belongs to raw 0 (the multi-channel feature) either way.
-    /// A TRULY silent misscore (no crash, just a wrong number) needs the misinterpreted axis
-    /// to land on a DIFFERENT single-channel raw feature -- which needs a multi-channel
-    /// feature followed by at least TWO more single-channel features, only the LATER of which
-    /// is kept: raw 0 (numeric), raw 1 (multi-channel, axes 1-2), raw 2 (single-channel, axis
-    /// 3), raw 3 (single-channel, axis 4) -- with ONLY raw 3 kept (raw 1 never appears in
-    /// `supports` at all), raw 3's id (3) misinterpreted as axis 3 resolves to raw 2 --
-    /// single-channel, so the guard never fires.
-    ///
-    /// ORACLE, take 2: an earlier draft compared this `rebalance:true` bank directly against a
-    /// `rebalance:false` run on the same keep-set, expecting `assert_eq!`. That does NOT
-    /// reliably discriminate on this fixture: re-running it with the fix disabled and
-    /// `TBOOST_PROFILE=1` shows the misrouted correction (built against raw 2's REAL cells --
-    /// axis 3 really is raw 2's column in `serve`, so the ridge fit itself is internally
-    /// consistent, just aimed at the wrong raw feature) gets REJECTED by the no-harm guard on
-    /// its own merits: `base_dev=20407.55078 corr_dev=20415.32617 -> fall back`. So the two
-    /// banks come back identical EITHER WAY here -- the guard's independent data-dependent
-    /// adopt/reject decision can mask whether the whole-model skip fired at all, which makes a
-    /// plain value comparison meaningless (a prior version of this comment claimed the values
-    /// came back different under the same conditions; that was not reproducible and has been
-    /// corrected after re-verifying directly).
-    ///
-    /// So instead: `y`/`w` are passed ONE ROW LONGER than `serve`'s row count. With
-    /// `reanchor=false`, `prune_model_to_keepset` never reads `y`/`w` at all except inside
-    /// `rebalance_kept_cells` (reached only when `rebalance=true`) -- so if the whole-model
-    /// skip fires (returning `base` before `y`/`w` are ever touched), the mismatched length is
-    /// irrelevant and this succeeds. If the skip is missing, execution reaches
-    /// `loss.grad_hess(y, ..)`, whose OWN shape check (`y.len() != raw.len()`) turns that
-    /// reintroduction into an immediate, unconditional `ShapeMismatch` error: a hard failure
-    /// the no-harm guard's adoption dynamics cannot mask, unlike a plain value comparison.
+    /// The silent variant: a multi-channel feature followed by TWO single-channel ones, only
+    /// the later of which is kept -- raw 0 (numeric, axis 0), raw 1 (mean+count, axes 1-2),
+    /// raw 2 (axis 3), raw 3 (axis 4). Read as an axis id, raw 3's id resolves to raw 2's
+    /// column, a different single-channel feature, so nothing would crash. The rebalance must
+    /// re-solve raw 3 alone, and every deployed table must stay inside the keep-set (a
+    /// correction aimed at raw 2 would add a raw-2 table).
     #[test]
-    fn rebalance_skip_prevents_the_purely_silent_variant_two_features_after_multichannel() {
+    fn rebalance_resolves_a_feature_two_after_a_multichannel_one_to_its_own_axis() {
         let n = 288;
         let numeric: Vec<f32> = (0..n).map(|i| (i % 4) as f32).collect();
         let cat1: Vec<String> = (0..n).map(|i| format!("h{}", i % 8)).collect();
-        // cat2 cycles on `i % 3`, cat3 on `(i / 3) % 3` -- independent periods (not both `i %
-        // 3`, which would make them perfectly collinear and let the booster capture the
-        // whole target via cat2 alone, never touching cat3 at all -- the first draft's bug,
-        // confirmed empirically: raw 3 never appeared as a realized table).
+        // cat2 cycles on `i % 3`, cat3 on `(i / 3) % 3`: independent periods, so the booster
+        // needs both (both `i % 3` would let cat2 carry the whole target).
         let cat2: Vec<String> = (0..n).map(|i| format!("l{}", i % 3)).collect();
         let cat3: Vec<String> = (0..n).map(|i| format!("m{}", (i / 3) % 3)).collect();
         const CAT2_TARGET: [f32; 3] = [0.0, 1.0, 2.0];
@@ -2537,11 +2591,7 @@ mod cat_channels_fit_path_tests {
             None,
         )
         .unwrap();
-        // raw 0 = numeric (axis 0); raw 1 = cat1, mean+count (axes 1-2); raw 2 = cat2, single
-        // (axis 3); raw 3 = cat3, single (axis 4).
         assert_eq!(model.provenance.len(), 5);
-        assert!(model.provenance.len() > t_boost_core::data::n_raw_features(&model.provenance));
-
         let binned = serve_binned_for_model(
             &model,
             std::slice::from_ref(&numeric),
@@ -2550,10 +2600,7 @@ mod cat_channels_fit_path_tests {
         .unwrap();
         let serve = ServeBinnedMatrix(binned);
         let bank = model.explain(&serve, RefMeasure::Uniform).unwrap();
-        // Keep ONLY raw 3's own order-1 table -- raw 0, raw 1, and raw 2 are all pruned away,
-        // so raw 1 (the actual multi-channel feature) never appears in `supports` at all; if
-        // the fix checked only `keep`'s own contents for multi-channel-ness, this case would
-        // slip through the skip entirely.
+        // Keep ONLY raw 3's own order-1 table: the multi-channel raw 1 is not kept at all.
         let keep: Vec<FeatureSet> = bank
             .tables
             .iter()
@@ -2566,26 +2613,10 @@ mod cat_channels_fit_path_tests {
             "raw 3 must have survived as its own order-1 effect"
         );
 
-        // Tripwire: y/w one row longer than serve's row count -- see the doc comment above.
-        let bad_y = vec![0.0_f32; n + 1];
-        let bad_w = vec![1.0_f32; n + 1];
-        t_boost_core::prune::prune_model_to_keepset(
-            &model,
-            &serve,
-            &bad_y,
-            &bad_w,
-            None,
-            &SquaredError,
-            RefMeasure::Uniform,
-            false,
-            &keep,
-            true, // rebalance requested -- must be skipped (whole-model, not per-feature)
-                  // before bad_y/bad_w are ever read, since raw 1 alone isn't even in `keep`
-        )
-        .expect(
-            "multi-channel model: the whole-model skip must return before rebalance_kept_cells \
-             ever reads the mismatched-length y/w via grad_hess",
-        );
+        let (on, _, report) = deploy_both_ways(&model, &serve, &y, &keep);
+        assert_eq!(report.supports, 1);
+        assert!(report.excluded.is_empty());
+        assert!(on.bank.tables.iter().all(|t| keep.contains(&t.u)));
     }
 
     /// Shared body for the bug #6 test-coverage-gap fix: a poisson/gamma multi-channel
@@ -2714,6 +2745,7 @@ mod cat_channels_fit_path_tests {
             cat_x,
             updates,
             None,
+            true,
         )
         .expect("apply_graduation_updates must not crash on a joint categorical axis (bug #6)");
 
@@ -3526,7 +3558,7 @@ fn aggregate_prune_selection(
     // Candidate admissions the EVIDENCE gate wants but the legacy rule refuses. `(mean_gain,
     // ids, u)`: the budget below spends on the highest mean gain first, with the feature-set
     // ids as a total, seed-free tie-break, so the admitted prefix is a pure function of the
-    // fold scores. Same ranking the guard's re-admission ladder uses, for the same reason.
+    // fold scores.
     let mut evidence_extra: Vec<(f64, Vec<u32>, FeatureSet)> = Vec::new();
     let mut evidence_rows: Vec<serde_json::Value> = Vec::new();
     for fs in &full_supports_vec {
@@ -4206,7 +4238,7 @@ impl PyBooster {
         })
     }
 
-    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, eval_x=None, eval_y=None, eval_cat_x=None, eval_weight=None, eval_exposure=None, observer=None, record_history=false, eval_unseen_rare=false))]
+    #[pyo3(signature = (x, y, weight=None, exposure=None, feature_names=None, class_labels=None, monotone=None, cat_x=None, es_holdout=None, bag_groups=None, observer=None))]
     #[allow(clippy::too_many_arguments)]
     fn fit(
         &self,
@@ -4227,22 +4259,10 @@ impl PyBooster {
         // the engine's own row-level carve, byte-identical to before this argument existed.
         es_holdout: Option<Vec<bool>>,
         bag_groups: Option<PyReadonlyArray1<'_, u32>>,
-        // External evaluation set (R1): rows laid out like `x`/`cat_x` that only score early
-        // stopping. Binned on the fit rows' grids and encoders, never trained on.
-        eval_x: Option<PyReadonlyArray2<'_, f32>>,
-        eval_y: Option<PyReadonlyArray1<'_, f32>>,
-        eval_cat_x: Option<Vec<Vec<String>>>,
-        eval_weight: Option<PyReadonlyArray1<'_, f32>>,
-        eval_exposure: Option<PyReadonlyArray1<'_, f32>>,
         // `observer(bag, round, n_trees, train_deviance, eval_deviance) -> bool` after every
-        // boosting round, on this thread; truthy stops every bag. An exception stops the fit
+        // boosting round, on this thread; truthy stops that bag. An exception stops the fit
         // and propagates.
         observer: Option<Py<PyAny>>,
-        // Keep each bag's per-round deviances for `fit_report`.
-        record_history: bool,
-        // Score evaluation-set categorical labels the fit never saw as a level pooled into the
-        // rare bucket (`unknown_category="rare"`), as scoring will; `false` keeps the base value.
-        eval_unseen_rare: bool,
     ) -> PyResult<PyModel> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4257,28 +4277,7 @@ impl PyBooster {
         let y = array1_to_vec(y, "y")?;
         let weight = weight.map(|w| array1_to_vec(w, "weight")).transpose()?;
         let exposure = exposure.map(|e| array1_to_vec(e, "exposure")).transpose()?;
-        let eval = match (eval_x, eval_y) {
-            (Some(ex), Some(ey)) => Some(EvalRows {
-                columns: raw_columns_from_array(ex)?,
-                y: array1_to_vec(ey, "eval_y")?,
-                cat_x: eval_cat_x,
-                weight: eval_weight
-                    .map(|w| array1_to_vec(w, "eval_weight"))
-                    .transpose()?,
-                exposure: eval_exposure
-                    .map(|e| array1_to_vec(e, "eval_exposure"))
-                    .transpose()?,
-                unseen_rare: eval_unseen_rare,
-            }),
-            (None, None) => None,
-            _ => {
-                return Err(py_err(PbError::InvalidInput {
-                    what: "eval_x and eval_y must be given together".into(),
-                }))
-            }
-        };
-        let mut state = self.clone();
-        state.config.fit_control.record_history = record_history;
+        let state = self.clone();
         let run = move |state: PyBooster| {
             fit_owned(
                 state,
@@ -4292,7 +4291,6 @@ impl PyBooster {
                 cat_x,
                 es_holdout,
                 bag_groups,
-                eval,
             )
         };
         let model = match observer {
@@ -4362,7 +4360,7 @@ impl PyBooster {
     /// Fit native-softmax on the complement of `sel_rows`, then prune the per-class banks with a
     /// shared keep-set selected on those held-out rows. The full design crosses the Python boundary
     /// once; row gathering, fitting, full-data serving, and pruning run on one bounded Rayon pool.
-    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard=false, prune_guard_tol=0.05, prune_guard_min_rows=500, guard_oob_honest=true, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, guard_z=0.0, guard_floor=0.0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0))]
+    #[pyo3(signature = (x, y, n_classes, class_labels, sel_rows, weight=None, feature_names=None, monotone=None, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001, se_rule=0.0, lambda_boxes=0.0, n_folds=5, es_holdout=None, deploy_es_holdout=None, prune_guard_min_rows=500, sel_bags=1, box_budget=0, lambda_tables=0.0, table_budget=0, table_min_arity=3, fold_of=None, k_folds=0, fold_es_holdout=None, fold_es_patience=None, min_stability=0.5, min_mean_gain=0.0, drop_z=None, keep_budget=0, bag_groups=None, ranked_path=false, path_steps=32, path_fraction=1.0, band_tolerance=None, band_deviance_cap=0.001, path_tolerance=0.0, prune_main_effects=false, path_min_share=0.0, rebalance=false))]
     #[allow(clippy::too_many_arguments)]
     fn fit_multiclass_pruned(
         &self,
@@ -4387,16 +4385,8 @@ impl PyBooster {
         es_holdout: Option<Vec<bool>>,
         // Honest ES holdout for the full-data DEPLOY fit, expressed over ALL rows.
         deploy_es_holdout: Option<Vec<bool>>,
-        // Set-level no-harm guard on the DEPLOYED per-class banks, with out-of-bag evidence
-        // (see `prune::multiclass_prune_guard`). OFF by default: unlike the single-output path
-        // this one is new, so a K>=3 fit that does not ask for it stays byte-identical.
-        prune_guard: bool,
-        prune_guard_tol: f64,
+        // Minimum out-of-bag rows the ranked path needs to score its prefixes.
         prune_guard_min_rows: usize,
-        // Whether OUT-OF-BAG rows are honest for this fit — true iff no group can straddle the
-        // in-bag/out-of-bag boundary (ungrouped, or an all-singleton grouping). Only the caller
-        // knows the grouping, so it decides; false routes the guard to the shared carve.
-        guard_oob_honest: bool,
         // Bag count of the SELECTION fit (the K>=3 analogue of the single-output path's
         // `prune_fold_bags`). 1 = the shipped single, unbagged selection fit, byte-identical to
         // every earlier release. See `fit_multiclass_pruned_owned` for why the knob exists.
@@ -4426,11 +4416,8 @@ impl PyBooster {
         min_mean_gain: f64,
         drop_z: Option<f64>,
         keep_budget: usize,
-        // SE-aware guard bar: `min(tol*dev_full, max(guard_z*SE, guard_floor*(null-full)))`.
-        guard_z: f64,
-        guard_floor: f64,
         bag_groups: Option<PyReadonlyArray1<'_, u32>>,
-        // Ranked-path selector (see `multiclass_ranked_path`): replaces the fold CV and the guard.
+        // Ranked-path selector (see `multiclass_ranked_path`): replaces the fold CV.
         ranked_path: bool,
         path_steps: usize,
         path_fraction: f64,
@@ -4441,6 +4428,8 @@ impl PyBooster {
         prune_main_effects: bool,
         // The ranked path's variance-share floor (`t_boost_core::prune::drop_low_share`).
         path_min_share: f64,
+        // Re-solve the kept tables after the keep-set (see `rebalance_multiclass_cells`).
+        rebalance: bool,
     ) -> PyResult<(PyMultiClassTableModel, String)> {
         cap_global_pool_once(self.n_jobs);
         let bag_groups = bag_groups
@@ -4482,10 +4471,7 @@ impl PyBooster {
                     n_folds,
                     es_holdout,
                     deploy_es_holdout,
-                    prune_guard,
-                    prune_guard_tol,
                     prune_guard_min_rows,
-                    guard_oob_honest,
                     sel_bags,
                     box_budget,
                     lambda_tables,
@@ -4499,8 +4485,6 @@ impl PyBooster {
                     min_mean_gain,
                     drop_z,
                     keep_budget,
-                    guard_z,
-                    guard_floor,
                     bag_groups,
                     ranked_path,
                     path_steps,
@@ -4510,6 +4494,7 @@ impl PyBooster {
                     path_tolerance,
                     prune_main_effects,
                     path_min_share,
+                    rebalance,
                 )
             })
             .map_err(py_err)?;
@@ -5408,7 +5393,8 @@ impl PyModel {
     }
 
     /// [`apply_keepset`](Self::apply_keepset) with a DEPLOYED-BOX BUDGET, returning
-    /// `(table_model, box_budget_report_json)`.
+    /// `(table_model, box_budget_report_json, table_budget_report_json, rebalance_report_json)`
+    /// (the last `None` without `rebalance`).
     ///
     /// `box_budget` is the total rank-1 boxes the deployed bank may carry (`0` disables it and
     /// makes this method bit-identical to `apply_keepset`). `box_rank` supplies the held-out
@@ -5439,7 +5425,7 @@ impl PyModel {
         cat_x: Option<Vec<Vec<String>>>,
         table_budget: usize,
         table_min_arity: u8,
-    ) -> PyResult<(PyTableModel, String, String)> {
+    ) -> PyResult<(PyTableModel, String, String, Option<String>)> {
         let columns = raw_columns_from_array(x)?;
         let y_vec = y
             .as_slice()
@@ -5472,7 +5458,7 @@ impl PyModel {
             .collect();
         let model = Arc::clone(&self.model);
         let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let (tm, report, table_report) = py
+        let (tm, report, table_report, rebalance_report) = py
             .detach(move || {
                 let binned = serve_binned_for_model(&model, &columns, cat_x.as_deref())?;
                 let serve = ServeBinnedMatrix(binned);
@@ -5515,6 +5501,10 @@ impl PyModel {
                 "table budget report: {err}"
             )))
         })?;
+        let rebalance_json = rebalance_report
+            .map(|r| serde_json::to_string(&r))
+            .transpose()
+            .map_err(|err| py_err(PbError::Serialization(format!("rebalance report: {err}"))))?;
         Ok((
             PyTableModel {
                 model: Arc::new(tm),
@@ -5522,6 +5512,7 @@ impl PyModel {
             },
             report_json,
             table_report_json,
+            rebalance_json,
         ))
     }
 
@@ -5605,9 +5596,10 @@ impl PyModel {
     }
 
     /// Whether `bag_oob_group_raw` can run on this model: it needs the outer-bag soup's
-    /// runtime bag partition AND membership (so a single fit or a wire round-trip is out) and
-    /// no §G1 cell correction. Ask this instead of catching the error, so a genuine failure in
-    /// the evidence pass is not misread as "no out-of-bag rows".
+    /// runtime bag partition AND membership (so a single fit or a wire round-trip is out). A §G1
+    /// cell correction is fine: the evidence pass shares it across the bags. Ask this instead of
+    /// catching the error, so a genuine failure in the evidence pass is not misread as "no
+    /// out-of-bag rows".
     fn bag_oob_available(&self) -> bool {
         bag_oob_evidence_available(&self.model)
     }
@@ -5717,15 +5709,14 @@ impl PyModel {
         })
     }
 
-    /// The prune guard's out-of-bag evidence in ONE pass: for each fit row, the sums over the
+    /// The ranked path's out-of-bag evidence in ONE pass: for each fit row, the sums over the
     /// bags that never trained on it of (a) the full bag bank's raw score, (b) the bag bank
     /// intercepts, and (c) each passed table GROUP's tables alone, plus the count of such bags.
     ///
     /// `groups` is a list of table groups, each a list of supports (raw feature id lists).
     /// Because table scores are additive, any PREFIX union of the groups is
-    /// `(f0_sum + Σ_{g ≤ k} group_sums[g]) / counts` — which is what lets the guard evaluate
-    /// its whole re-admission ladder (keep-set first, then each doubling chunk in rank order)
-    /// without rebuilding a single bank per rung.
+    /// `(f0_sum + Σ_{g ≤ k} group_sums[g]) / counts` — which is what lets the ranked path score
+    /// every prefix of its admission sequence without rebuilding a single bank per prefix.
     ///
     /// `x` MUST be the fit design — same rows, SAME ORDER — since the recorded membership is
     /// positional. Only the row COUNT is checked (a permuted design cannot be detected and
@@ -5798,9 +5789,12 @@ type BagOobGroupArrays<'py> = (
     Bound<'py, PyArray1<u32>>,
 );
 
+/// One dense table's graduation payload: `(table index, feature ids, shape, values, support,
+/// per-axis categorical flags)`.
+type GraduationTableInput = (usize, Vec<u32>, Vec<usize>, Vec<f64>, Vec<f64>, Vec<bool>);
+
 /// Low-level Python tables-only served model: a pruned/purified fANOVA bank that IS the model,
 /// scored by the lossless LUT-sum (no trees). Produced by [`PyModel::prune_to_tables`].
-type GraduationTableInput = (usize, Vec<u32>, Vec<usize>, Vec<f64>, Vec<f64>, Vec<bool>);
 
 #[pyclass(name = "_TableModel", skip_from_py_object)]
 #[derive(Clone)]
@@ -5877,52 +5871,11 @@ impl PyTableModel {
     /// serializing and parsing the complete model merely to inspect a handful of table tensors.
     #[pyo3(signature = (max_cells=2500))]
     fn graduation_tables(&self, max_cells: usize) -> PyResult<Vec<GraduationTableInput>> {
-        let mut out = Vec::new();
-        for (index, table) in self.model.bank.tables.iter().enumerate() {
-            let shape = table.values.shape();
-            if table.values.is_sparse()
-                || table.support.is_sparse()
-                || !(1..=2).contains(&shape.len())
-                || table.values.len() > max_cells
-            {
-                continue;
-            }
-            if table.support.shape() != shape {
-                return Err(py_err(PbError::ShapeMismatch {
-                    what: format!("graduation table {index} support shape differs from values"),
-                }));
-            }
-            let mut axis_categorical = Vec::with_capacity(table.axes.len());
-            for axis in &table.axes {
-                let provenance = self
-                    .model
-                    .provenance
-                    .iter()
-                    .find(|provenance| provenance.raw == axis.raw)
-                    .ok_or_else(|| {
-                        py_err(PbError::Internal {
-                            what: format!(
-                                "graduation table {index} axis raw {} has no provenance",
-                                axis.raw.0
-                            ),
-                        })
-                    })?;
-                axis_categorical.push(!matches!(provenance.kind, AxisKind::Numeric));
-            }
-            out.push((
-                index,
-                feature_set_ids(&table.u),
-                shape,
-                table.values.values().into_owned(),
-                table.support.values().into_owned(),
-                axis_categorical,
-            ));
-        }
-        Ok(out)
+        graduation_table_inputs(&self.model, max_cells).map_err(py_err)
     }
 
     /// Apply dense graduation and optional reference-preserving factored diffusion together.
-    #[pyo3(signature = (x, y, weight, updates, alpha, exposure=None, cat_x=None, n_jobs=None, box_budget=0))]
+    #[pyo3(signature = (x, y, weight, updates, alpha, exposure=None, cat_x=None, n_jobs=None, box_budget=0, reanchor=true))]
     #[allow(clippy::too_many_arguments)]
     fn apply_high_order_graduation(
         &self,
@@ -5936,6 +5889,7 @@ impl PyTableModel {
         cat_x: Option<Vec<Vec<String>>>,
         n_jobs: Option<usize>,
         box_budget: usize,
+        reanchor: bool,
     ) -> PyResult<(PyTableModel, bool, String)> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -5947,7 +5901,7 @@ impl PyTableModel {
                 run_on_pool(n_jobs, || {
                     apply_graduation_updates_impl(
                         &model, columns, y, weight, exposure, cat_x, updates, None, alpha,
-                        box_budget,
+                        box_budget, reanchor,
                     )
                 })
             })
@@ -5964,9 +5918,10 @@ impl PyTableModel {
         ))
     }
 
-    /// Apply LAPACK-smoothed dense table values, re-anchor a log-link model, and enforce the
-    /// weighted train-deviance no-harm guard. The design is marshalled and binned only once.
-    #[pyo3(signature = (x, y, weight, updates, exposure=None, cat_x=None, n_jobs=None, eval_rows=None))]
+    /// Apply LAPACK-smoothed dense table values, re-anchor a log-link model (unless `reanchor`
+    /// is false), and enforce the weighted train-deviance no-harm guard. The design is
+    /// marshalled and binned only once.
+    #[pyo3(signature = (x, y, weight, updates, exposure=None, cat_x=None, n_jobs=None, eval_rows=None, reanchor=true))]
     #[allow(clippy::too_many_arguments)]
     fn apply_graduation(
         &self,
@@ -5979,6 +5934,7 @@ impl PyTableModel {
         cat_x: Option<Vec<Vec<String>>>,
         n_jobs: Option<usize>,
         eval_rows: Option<Vec<u32>>,
+        reanchor: bool,
     ) -> PyResult<(PyTableModel, bool)> {
         let columns = raw_columns_from_array(x)?;
         let y = array1_to_vec(y, "y")?;
@@ -5991,7 +5947,7 @@ impl PyTableModel {
             .detach(move || {
                 run_on_pool(n_jobs, || {
                     apply_graduation_updates(
-                        &model, columns, y, weight, exposure, cat_x, updates, eval_rows,
+                        &model, columns, y, weight, exposure, cat_x, updates, eval_rows, reanchor,
                     )
                 })
             })
@@ -6369,6 +6325,109 @@ impl PyTableModel {
         ))
     }
 
+    /// Project this deployed model back onto its monotone constraints (see
+    /// `t_boost_core::monotone`), and re-anchor the intercept when anything changed and
+    /// `reanchor` is set. `x`/`cat_x`/`y`/`weight`/`exposure` are the TRAINING data, `h` the
+    /// loss curvature per row at this model's score, and `monotone` one sign (-1/0/+1) per raw
+    /// feature in native order. Returns `(model, report_json)`; a model whose every constrained
+    /// family already passes comes back unchanged.
+    #[pyo3(signature = (x, h, monotone, y, weight, exposure=None, cat_x=None, reanchor=true, n_jobs=None))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: one argument per training input (§12.2).
+    fn enforce_monotone(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        h: PyReadonlyArray1<'_, f64>,
+        monotone: Vec<i8>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        exposure: Option<PyReadonlyArray1<'_, f32>>,
+        cat_x: Option<Vec<Vec<String>>>,
+        reanchor: bool,
+        n_jobs: Option<usize>,
+    ) -> PyResult<(PyTableModel, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let h = h
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("h must be contiguous float64: {e}")))?
+            .to_vec();
+        let y_vec = y
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
+            .to_vec();
+        let w_vec = weight
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
+            .to_vec();
+        let offset: Option<Vec<f32>> = match exposure {
+            Some(e) => Some(
+                e.as_slice()
+                    .map_err(|err| {
+                        PyValueError::new_err(format!("exposure must be contiguous: {err}"))
+                    })?
+                    .iter()
+                    .map(|&v| v.ln())
+                    .collect(),
+            ),
+            None => None,
+        };
+        let mut signs = Vec::new();
+        for (raw, &s) in monotone.iter().enumerate() {
+            if s != 0 {
+                let feature = u32::try_from(raw)
+                    .map_err(|_| PyValueError::new_err("too many features for monotone"))?;
+                signs.push(t_boost_core::monotone::MonotoneSign {
+                    feature,
+                    increasing: s > 0,
+                });
+            }
+        }
+        let model = Arc::clone(&self.model);
+        let (tm, report) = py
+            .detach(move || {
+                let run = || -> Result<(TableModel, String), PbError> {
+                    let binned = serve_binned_for_tables(&model, columns, cat_x, None)?;
+                    let loss = loss_choice_from_tag(&model.schema.objective)?;
+                    let (tm, report) = t_boost_core::monotone::enforce_monotone(
+                        &model,
+                        &binned,
+                        &y_vec,
+                        &w_vec,
+                        offset.as_deref(),
+                        loss.as_loss(),
+                        &signs,
+                        &h,
+                        reanchor,
+                    )?;
+                    let json = serde_json::to_string(&report).map_err(|err| {
+                        PbError::Serialization(format!(
+                            "could not serialize monotone report: {err}"
+                        ))
+                    })?;
+                    Ok((tm, json))
+                };
+                require_nonzero_n_jobs(n_jobs)?;
+                match n_jobs {
+                    Some(nj) => rayon::ThreadPoolBuilder::new()
+                        .num_threads(nj)
+                        .build()
+                        .map_err(|err| PbError::InvalidConfig {
+                            what: format!("could not build rayon pool: {err}"),
+                        })?
+                        .install(run),
+                    None => run(),
+                }
+            })
+            .map_err(py_err)?;
+        Ok((
+            PyTableModel {
+                model: Arc::new(tm),
+                serve: Default::default(),
+            },
+            report,
+        ))
+    }
+
     /// Every training label of each categorical raw feature, as `(raw id, labels)` in raw
     /// order (see `CatEncoderStore::known_labels`).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
@@ -6498,8 +6557,37 @@ struct PyMultiClassModel {
     model: Arc<MultiClassModel>,
 }
 
+/// The per-bag boosting report of a multiclass fit: every class of a bag shares its rounds, so
+/// the first class's report stands for all of them.
+fn multiclass_fit_report(mc: &MultiClassModel) -> Option<&[t_boost_core::engine::BagFitReport]> {
+    mc.classes.first()?.fit_report.as_deref()
+}
+
 #[pymethods]
 impl PyMultiClassModel {
+    /// Per-bag boosting report of the fit, in bag order: `(trees_kept, rounds_trained,
+    /// stop_reason, train_deviance_history, eval_deviance_history)`, as [`PyModel::fit_report`].
+    /// A round grows one tree per class, so the counts are rounds; the classes share them. The
+    /// training history is empty (a multiclass fit takes no observer); the early-stopping one is
+    /// the multinomial deviance of every round. `None` on a loaded model.
+    #[allow(clippy::type_complexity)] // JUSTIFIED: a plain list of Python tuples.
+    fn fit_report(&self) -> Option<Vec<(u32, u32, String, Vec<f64>, Vec<f64>)>> {
+        multiclass_fit_report(&self.model).map(|reports| {
+            reports
+                .iter()
+                .map(|r| {
+                    (
+                        r.trees_kept,
+                        r.rounds_trained,
+                        r.reason.as_str().to_owned(),
+                        r.train_deviance.clone(),
+                        r.eval_deviance.clone(),
+                    )
+                })
+                .collect()
+        })
+    }
+
     /// `categorical_labels` merged over every class's encoders (each label once per feature).
     fn categorical_labels(&self) -> Vec<(u32, Vec<String>)> {
         merged_class_labels(self.model.classes.iter().map(|c| &c.schema.cat_encoders))
@@ -6708,6 +6796,71 @@ impl PyMultiClassModel {
         })
     }
 
+    /// Band every class bank of `tables`, this model's tables-only form (see
+    /// `band_multiclass_table_model`), against the noise of every bag's full bank: an unpruned
+    /// multiclass fit is banded as a pruned one is. Returns the banded model and the per-class
+    /// banding reports as JSON.
+    #[pyo3(signature = (tables, x, y, weight, tolerance, deviance_cap, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: the design plus the banding and measure knobs.
+    fn band_tables(
+        &self,
+        py: Python<'_>,
+        tables: PyRef<'_, PyMultiClassTableModel>,
+        x: PyReadonlyArray2<'_, f32>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        tolerance: f64,
+        deviance_cap: f64,
+        cat_x: Option<Vec<Vec<String>>>,
+        ref_measure: Option<String>,
+        laplace: f32,
+        measure_floor: f32,
+    ) -> PyResult<(PyMultiClassTableModel, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
+        let w_vec = weight
+            .as_slice()
+            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
+            .to_vec();
+        let model = Arc::clone(&self.model);
+        let tm = Arc::clone(&tables.model);
+        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
+        let (banded, reports) = py
+            .detach(move || {
+                let first = model.classes.first().ok_or_else(|| PbError::Internal {
+                    what: "multiclass model has no classes".into(),
+                })?;
+                let serve =
+                    ServeBinnedMatrix(serve_binned_for_model(first, &columns, cat_x.as_deref())?);
+                band_multiclass_table_model(
+                    &tm,
+                    &model,
+                    &serve,
+                    &columns,
+                    cat_x.as_deref(),
+                    &w_vec,
+                    w_measure,
+                    None,
+                    tolerance,
+                    &labels,
+                    deviance_cap,
+                )
+            })
+            .map_err(py_err)?;
+        let json = serde_json::to_string(&reports).map_err(|err| {
+            py_err(PbError::Serialization(format!(
+                "could not serialize banding report: {err}"
+            )))
+        })?;
+        Ok((
+            PyMultiClassTableModel {
+                model: Arc::new(banded),
+                serve: Default::default(),
+            },
+            json,
+        ))
+    }
+
     /// PROBE (2026-09-07): retain an arbitrary keep-set on this model (the K>=3 deploy step).
     #[pyo3(signature = (x, y, weight, keep, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
     #[allow(clippy::too_many_arguments)]
@@ -6724,21 +6877,7 @@ impl PyMultiClassModel {
         measure_floor: f32,
     ) -> PyResult<PyMultiClassTableModel> {
         let columns = raw_columns_from_array(x)?;
-        let n_classes = self.model.n_classes();
-        let labels: Vec<u32> = y
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
-            .iter()
-            .map(|&l| {
-                if !l.is_finite() || l < 0.0 || l.fract() != 0.0 || l as usize >= n_classes {
-                    Err(PyValueError::new_err(format!(
-                        "label {l} not in 0..{n_classes}"
-                    )))
-                } else {
-                    Ok(l as u32)
-                }
-            })
-            .collect::<PyResult<Vec<_>>>()?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
         let w_vec = weight
             .as_slice()
             .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
@@ -6763,105 +6902,6 @@ impl PyMultiClassModel {
             model: Arc::new(tm),
             serve: Default::default(),
         })
-    }
-
-    /// PROBE (2026-09-07): carve arms on `mask` rows — `(rows, f0[K,n], full[K,n], group[G,K,n])`.
-    #[pyo3(signature = (x, weight, groups, mask, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn mc_carve_arms<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyReadonlyArray2<'_, f32>,
-        weight: PyReadonlyArray1<'_, f32>,
-        groups: Vec<Vec<Vec<u32>>>,
-        mask: Vec<bool>,
-        cat_x: Option<Vec<Vec<String>>>,
-        ref_measure: Option<String>,
-        laplace: f32,
-        measure_floor: f32,
-    ) -> PyResult<(
-        Vec<usize>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray3<f64>>,
-    )> {
-        let columns = raw_columns_from_array(x)?;
-        let w_vec = weight
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
-            .to_vec();
-        let groups_fs: Vec<Vec<FeatureSet>> = groups
-            .iter()
-            .map(|g| g.iter().map(|ids| feature_set_from_raw_ids(ids)).collect())
-            .collect();
-        let model = Arc::clone(&self.model);
-        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let arms = py
-            .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let serve = ServeBinnedMatrix(binned);
-                multiclass_carve_arms(&model, &serve, w_measure, &w_vec, &groups_fs, &mask)
-            })
-            .map_err(py_err)?;
-        let f0 = PyArray2::from_vec2(py, &arms.f0)
-            .map_err(|e| PyValueError::new_err(format!("f0 shape: {e}")))?;
-        let full = PyArray2::from_vec2(py, &arms.full)
-            .map_err(|e| PyValueError::new_err(format!("full shape: {e}")))?;
-        let group = PyArray3::from_vec3(py, &arms.group)
-            .map_err(|e| PyValueError::new_err(format!("group shape: {e}")))?;
-        Ok((arms.rows, f0, full, group))
-    }
-
-    /// PROBE (2026-09-07): out-of-bag arms — `(rows, f0[K,n], full[K,n], group[G,K,n])`.
-    #[pyo3(signature = (x, weight, groups, cat_x=None, ref_measure=None, laplace=1.0, measure_floor=0.001))]
-    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-    fn mc_oob_arms<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyReadonlyArray2<'_, f32>,
-        weight: PyReadonlyArray1<'_, f32>,
-        groups: Vec<Vec<Vec<u32>>>,
-        cat_x: Option<Vec<Vec<String>>>,
-        ref_measure: Option<String>,
-        laplace: f32,
-        measure_floor: f32,
-    ) -> PyResult<(
-        Vec<usize>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray2<f64>>,
-        Bound<'py, PyArray3<f64>>,
-    )> {
-        let columns = raw_columns_from_array(x)?;
-        let w_vec = weight
-            .as_slice()
-            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
-            .to_vec();
-        let groups_fs: Vec<Vec<FeatureSet>> = groups
-            .iter()
-            .map(|g| g.iter().map(|ids| feature_set_from_raw_ids(ids)).collect())
-            .collect();
-        let model = Arc::clone(&self.model);
-        let w_measure = parse_ref_measure(ref_measure, laplace, measure_floor).map_err(py_err)?;
-        let arms = py
-            .detach(move || {
-                let first = model.classes.first().ok_or_else(|| PbError::Internal {
-                    what: "multiclass model has no classes".into(),
-                })?;
-                let binned = serve_binned_for_model(first, &columns, cat_x.as_deref())?;
-                let serve = ServeBinnedMatrix(binned);
-                multiclass_oob_arms(&model, &serve, w_measure, &w_vec, &groups_fs)
-            })
-            .map_err(py_err)?;
-        let f0 = PyArray2::from_vec2(py, &arms.f0)
-            .map_err(|e| PyValueError::new_err(format!("f0 shape: {e}")))?;
-        let full = PyArray2::from_vec2(py, &arms.full)
-            .map_err(|e| PyValueError::new_err(format!("full shape: {e}")))?;
-        let group = PyArray3::from_vec3(py, &arms.group)
-            .map_err(|e| PyValueError::new_err(format!("group shape: {e}")))?;
-        Ok((arms.rows, f0, full, group))
     }
 
     #[pyo3(signature = (x, ref_measure=None, laplace=1.0, measure_floor=0.001, basis_json=None, cat_x=None, overflow=None, weight=None, exposure=None))]
@@ -7108,6 +7148,60 @@ impl PyMultiClassTableModel {
     fn deployed_census<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let banks: Vec<&TableBank> = self.model.classes.iter().map(|c| &c.bank).collect();
         deployed_census_dict(py, &banks)
+    }
+
+    /// The dense order-1/2 tables of every class bank the graduation solver can smooth, one list
+    /// per class (see `_TableModel.graduation_tables`).
+    #[pyo3(signature = (max_cells=2500))]
+    fn graduation_tables(&self, max_cells: usize) -> PyResult<Vec<Vec<GraduationTableInput>>> {
+        self.model
+            .classes
+            .iter()
+            .map(|c| graduation_table_inputs(c, max_cells).map_err(py_err))
+            .collect()
+    }
+
+    /// Graduate every class bank: the smoothed dense tables `(class, table, values)` and, with
+    /// `alpha > 0`, the high-order diffusion, re-anchored and kept only if the training
+    /// multinomial deviance rises by at most 1% (see `apply_multiclass_graduation`). Returns the
+    /// model, whether the smoothing was adopted, and the per-class high-order reports as JSON.
+    #[pyo3(signature = (x, y, weight, updates, alpha=0.0, cat_x=None, n_jobs=None, box_budget=0))]
+    #[allow(clippy::too_many_arguments)] // JUSTIFIED: the design plus the graduation knobs.
+    fn apply_graduation(
+        &self,
+        py: Python<'_>,
+        x: PyReadonlyArray2<'_, f32>,
+        y: PyReadonlyArray1<'_, f32>,
+        weight: PyReadonlyArray1<'_, f32>,
+        updates: Vec<(usize, usize, Vec<f64>)>,
+        alpha: f64,
+        cat_x: Option<Vec<Vec<String>>>,
+        n_jobs: Option<usize>,
+        box_budget: usize,
+    ) -> PyResult<(PyMultiClassTableModel, bool, String)> {
+        let columns = raw_columns_from_array(x)?;
+        let labels = class_labels_from_array(&y, self.model.n_classes())?;
+        let weight = array1_to_vec(weight, "weight")?;
+        let model = Arc::clone(&self.model);
+        let (graduated, adopted, reports) = py
+            .detach(move || {
+                run_on_pool(n_jobs, || {
+                    apply_multiclass_graduation(
+                        &model, columns, labels, weight, cat_x, updates, alpha, box_budget,
+                    )
+                })
+            })
+            .map_err(py_err)?;
+        let reports =
+            serde_json::to_string(&reports).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok((
+            PyMultiClassTableModel {
+                model: Arc::new(graduated),
+                serve: Default::default(),
+            },
+            adopted,
+            reports,
+        ))
     }
 
     #[getter]
@@ -7699,7 +7793,6 @@ fn fit_owned(
     cat_x: Option<Vec<Vec<String>>>,
     es_holdout: Option<Vec<bool>>,
     bag_groups: Option<Vec<u32>>,
-    eval: Option<EvalRows>,
 ) -> Result<Model, PbError> {
     let n_numeric = columns.len();
     let n_cat = cat_x.as_ref().map_or(0, Vec::len);
@@ -7718,14 +7811,13 @@ fn fit_owned(
     // leakage-free. Ordered/LeaveOneOut have subtler profiles (the LOO target-encoding
     // pathology), so keep them gated with internal early stopping for now.
     if cat_x.is_some()
-        && eval.is_none()
         && state.config.validation_fraction.is_some()
         && matches!(state.cat_config.leakage, LeakageScheme::LeaveOneOut)
     {
         return Err(PbError::InvalidConfig {
             what: "validation_fraction with native categoricals is not supported under \
                    cat_leakage='loo' (own-target mean-shift pathology); use 'kfold' (default) \
-                   or 'ordered' (one-honest-holdout), or an external validation split"
+                   or 'ordered' (one-honest-holdout), or set validation_fraction=None"
                 .into(),
         });
     }
@@ -7733,8 +7825,8 @@ fn fit_owned(
     // on this ambient pool, so total worker threads stay at the resolved local width. Sized to
     // `state.fit_pool_width` (the scheduling heuristic) when set, else `state.n_jobs` — see
     // `run_fit_pool`'s doc for why the two are kept separate.
-    let run = || match &eval {
-        None => fit_model_ambient_bagged(
+    let run = || {
+        fit_model_ambient_bagged(
             &state,
             &columns,
             &y,
@@ -7746,84 +7838,18 @@ fn fit_owned(
             cat_x.as_deref(),
             es_holdout.as_deref(),
             bag_groups.as_deref(),
-        ),
-        Some(eval) => fit_with_eval_rows(
-            &state,
-            &columns,
-            &y,
-            weight.as_deref(),
-            exposure.as_deref(),
-            feature_names,
-            class_labels,
-            &monotone_map,
-            cat_x.as_deref(),
-            es_holdout.as_deref(),
-            bag_groups.as_deref(),
-            eval,
-        ),
+        )
     };
     run_fit_pool(state.n_jobs, state.fit_pool_width, run)
 }
 
-/// An external evaluation set for [`fit_with_eval_rows`]: rows laid out like the fit design.
-struct EvalRows {
-    columns: Vec<Vec<f32>>,
-    cat_x: Option<Vec<Vec<String>>>,
-    y: Vec<f32>,
-    weight: Option<Vec<f32>>,
-    exposure: Option<Vec<f32>>,
-    unseen_rare: bool,
-}
-
-/// The reserved label the Python layer gives a null categorical value. A null is never an
-/// unseen level: it keeps its own (missing) level.
-const CAT_MISSING_LABEL: &str = "__t_boost_missing__";
-
-/// `eval_cats` with every label its feature never saw replaced by one of the labels the fit
-/// pooled into that feature's rare level, so it scores exactly as a rare level does. A feature
-/// that pooled nothing keeps its labels (they fall back to the encoder base).
-fn route_unseen_to_rare(
-    eval_cats: &[Vec<String>],
-    n_numeric: usize,
-    encoders: &t_boost_core::cat::CatEncoderStore,
-) -> Result<Vec<Vec<String>>, PbError> {
-    let known = encoders.known_labels();
-    let rare = encoders.rare_members();
-    eval_cats
-        .iter()
-        .enumerate()
-        .map(|(j, column)| {
-            let raw = raw_id(n_numeric + j)?;
-            // A real pooled label, not the missing level (which can itself be pooled).
-            let target = rare.get(&raw).and_then(|members| {
-                members
-                    .iter()
-                    .find(|m| m.as_str() != CAT_MISSING_LABEL)
-                    .or_else(|| members.first())
-            });
-            let (Some(known), Some(target)) = (known.get(&raw), target) else {
-                return Ok(column.clone());
-            };
-            let known: BTreeSet<&str> = known.iter().map(String::as_str).collect();
-            Ok(column
-                .iter()
-                .map(|label| {
-                    if label == CAT_MISSING_LABEL || known.contains(label.as_str()) {
-                        label.clone()
-                    } else {
-                        target.clone()
-                    }
-                })
-                .collect())
-        })
-        .collect()
-}
-
 /// Run `fit` on a worker thread while this (the calling) thread serves `observer`: each round
 /// event is handed over a channel, the Python callable runs here with the GIL, and its verdict
-/// goes back to the waiting bag. Once it returns truthy or raises, every later event is told
-/// to stop, so all bags wind down; an exception is re-raised unchanged after the fit thread
-/// finishes (its model is discarded).
+/// goes back to the waiting bag. A truthy verdict stops that bag only: the bags run in
+/// parallel, so stopping the others "now" would leave them wherever the scheduler had got
+/// them, and the fitted model would depend on timing; a bag's own rounds and deviances do not.
+/// Once it raises, every later event is told to stop, so all bags wind down, and the exception
+/// is re-raised unchanged after the fit thread finishes (its model is discarded).
 fn fit_with_observer<F>(
     py: Python<'_>,
     mut state: PyBooster,
@@ -7849,9 +7875,9 @@ where
         std::thread::scope(|scope| {
             let worker = scope.spawn(move || fit(state));
             let mut raised: Option<PyErr> = None;
-            let mut stop = false;
             for (event, reply) in rx.iter() {
-                if !stop {
+                // After an exception the fit is discarded: stop every bag without calling again.
+                let stop = raised.is_some() || {
                     let verdict = Python::attach(|py| -> PyResult<bool> {
                         observer
                             .bind(py)
@@ -7864,14 +7890,11 @@ where
                             ))?
                             .is_truthy()
                     });
-                    match verdict {
-                        Ok(v) => stop = v,
-                        Err(err) => {
-                            raised = Some(err);
-                            stop = true;
-                        }
-                    }
-                }
+                    verdict.unwrap_or_else(|err| {
+                        raised = Some(err);
+                        true
+                    })
+                };
                 // A bag that already finished no longer listens; nothing to do then.
                 let _ = reply.send(stop);
             }
@@ -7885,282 +7908,6 @@ where
         Ok(result) => result.map_err(py_err),
         Err(_) => Err(InternalError::new_err("the fit thread panicked")),
     }
-}
-
-/// [`fit_model_ambient_bagged`] with an external evaluation set (R1). The numeric grids and
-/// categorical encoders are fit on the fit rows alone; the evaluation rows are then binned
-/// through them exactly as serving bins unseen rows, appended, and marked as the shared
-/// early-stopping holdout, with [`FitControl::external_holdout`] keeping their targets out of
-/// the intercept and the slope recalibration. Bags never draw them and the cell refit never
-/// sees them (holdout rows are in-bag for everyone).
-#[allow(clippy::too_many_arguments)]
-fn fit_with_eval_rows(
-    state: &PyBooster,
-    columns: &[Vec<f32>],
-    y: &[f32],
-    weight: Option<&[f32]>,
-    exposure: Option<&[f32]>,
-    feature_names: Option<Vec<String>>,
-    class_labels: Option<Vec<String>>,
-    monotone_map: &MonotoneMap,
-    cat_x: Option<&[Vec<String>]>,
-    es_holdout: Option<&[bool]>,
-    bag_groups: Option<&[u32]>,
-    eval: &EvalRows,
-) -> Result<Model, PbError> {
-    if es_holdout.is_some() {
-        return Err(PbError::InvalidConfig {
-            what: "an external evaluation set replaces es_holdout; pass one or the other".into(),
-        });
-    }
-    if eval.columns.len() != columns.len()
-        || eval.cat_x.as_ref().map(Vec::len) != cat_x.map(<[Vec<String>]>::len)
-    {
-        return Err(PbError::ShapeMismatch {
-            what: "eval_x must have the same numeric and categorical columns as x".into(),
-        });
-    }
-    if exposure.is_some() != eval.exposure.is_some() {
-        return Err(PbError::InvalidInput {
-            what: "exposure and eval_exposure must be given together".into(),
-        });
-    }
-    let n_fit = y.len();
-    let n_eval = eval.y.len();
-    if n_eval == 0 {
-        return Err(PbError::InvalidInput {
-            what: "the evaluation set has no rows".into(),
-        });
-    }
-    let n_rows = u32::try_from(n_fit + n_eval).map_err(|_| PbError::InvalidInput {
-        what: "more than u32::MAX rows is out of scope for v1".into(),
-    })?;
-    for (what, len) in eval
-        .columns
-        .iter()
-        .map(|c| ("eval_x column", c.len()))
-        .chain(
-            eval.cat_x
-                .iter()
-                .flatten()
-                .map(|c| ("eval_cat_x column", c.len())),
-        )
-        .chain(eval.weight.iter().map(|w| ("eval_weight", w.len())))
-        .chain(eval.exposure.iter().map(|e| ("eval_exposure", e.len())))
-    {
-        if len != n_eval {
-            return Err(PbError::ShapeMismatch {
-                what: format!("{what} len {len} != eval_y len {n_eval}"),
-            });
-        }
-    }
-    let joined = |fit: Option<&[f32]>, ev: Option<&[f32]>| -> Option<Vec<f32>> {
-        if fit.is_none() && ev.is_none() {
-            return None;
-        }
-        let mut out = fit.map_or_else(|| vec![1.0; n_fit], <[f32]>::to_vec);
-        out.extend_from_slice(ev.unwrap_or(&vec![1.0; n_eval]));
-        Some(out)
-    };
-    let all_y: Vec<f32> = y.iter().chain(&eval.y).copied().collect();
-    let all_weight = joined(weight, eval.weight.as_deref());
-    let all_exposure = joined(exposure, eval.exposure.as_deref());
-    let mask: Vec<bool> = (0..n_fit + n_eval).map(|r| r >= n_fit).collect();
-    let n_numeric = columns.len();
-    let loss = state.objective.instantiate()?;
-    let mut config = state.config.clone();
-    config.fit_control.external_holdout = true;
-    let spec = FitSpec {
-        loss: loss.as_loss(),
-        weight: all_weight.as_deref(),
-        exposure: all_exposure.as_deref(),
-        monotone: monotone_map.clone(),
-        interaction: state.interaction.clone(),
-        credibility: state.credibility,
-        fixed_holdout: Some(&mask),
-        bag_groups: None,
-        seed: state.seed,
-    };
-    // Bag groups cover the fit rows; the holdout rows are never drawn, so any id serves them.
-    let all_groups: Option<Vec<u32>> = bag_groups.map(|g| {
-        let mut out = g.to_vec();
-        out.resize(n_fit + n_eval, 0);
-        out
-    });
-    let spec = FitSpec {
-        bag_groups: all_groups.as_deref(),
-        ..spec
-    };
-    let append = |mut fit: BinnedMatrix, ev: BinnedMatrix| -> Result<BinnedMatrix, PbError> {
-        if fit.data.len() != ev.data.len() {
-            return Err(PbError::Internal {
-                what: "evaluation design has a different axis count".into(),
-            });
-        }
-        for (dst, src) in fit.data.iter_mut().zip(ev.data) {
-            dst.extend(src);
-        }
-        fit.n_rows = n_rows;
-        Ok(fit)
-    };
-    let mut cat_axes_per_raw: Option<Vec<Vec<TsEncodingId>>> = None;
-    let mut model = match cat_x {
-        None => {
-            let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
-            let fit_x = bin_columns(&refs, weight, &state.bin_config, state.seed)?;
-            let mut ev = BinnedMatrix {
-                data: Vec::with_capacity(n_numeric),
-                n_rows: u32::try_from(n_eval).unwrap_or(u32::MAX),
-                grids: fit_x.grids.clone(),
-                provenance: fit_x.provenance.clone(),
-            };
-            for (values, grid) in eval.columns.iter().zip(&fit_x.grids) {
-                ev.data.push(
-                    values
-                        .iter()
-                        .map(|&v| bin(v, grid))
-                        .collect::<Result<Vec<u8>, _>>()?,
-                );
-            }
-            let x = append(fit_x, ev)?;
-            Booster::with_config(config).fit(&x, &all_y, &spec)?
-        }
-        Some(cats) => {
-            let eval_cats = eval.cat_x.as_deref().unwrap_or(&[]);
-            let numeric = columns
-                .iter()
-                .enumerate()
-                .map(|(i, values)| {
-                    Ok::<_, PbError>(NumericColumn {
-                        raw: FeatureId(raw_id(i)?),
-                        values,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let cat_cols = cats
-                .iter()
-                .enumerate()
-                .map(|(j, levels)| {
-                    let raw = FeatureId(raw_id(n_numeric + j)?);
-                    let ids = categorical_channel_ids(
-                        levels,
-                        weight,
-                        exposure,
-                        state.cat_channels,
-                        &state.cat_config,
-                        state.cat_count_min_levels,
-                        state.cat_class_freq_min_levels,
-                        None,
-                    )?;
-                    let cols = ids
-                        .iter()
-                        .map(|&id| {
-                            Ok::<_, PbError>(CategoricalColumn {
-                                raw,
-                                id,
-                                levels,
-                                config: cat_channel_config(
-                                    id,
-                                    &state.cat_config,
-                                    state.cat_count_config.as_ref(),
-                                    &[],
-                                )?,
-                            })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    Ok::<_, PbError>((ids, cols))
-                })
-                .collect::<Result<Vec<(Vec<TsEncodingId>, Vec<_>)>, _>>()?;
-            let axes: Vec<Vec<TsEncodingId>> =
-                cat_cols.iter().map(|(ids, _)| ids.clone()).collect();
-            let cat_spec = FitSpec {
-                monotone: expand_monotone_map_for_cat_channels(&spec.monotone, n_numeric, &axes)?,
-                ..spec
-            };
-            let categorical = cat_cols
-                .into_iter()
-                .flat_map(|(_, cols)| cols)
-                .collect::<Vec<_>>();
-            let fitted = bin_train_columns_with_holdout(
-                &numeric,
-                &categorical,
-                y,
-                weight,
-                exposure,
-                &state.bin_config,
-                state.seed,
-                None,
-            )?;
-            let routed;
-            let eval_cats = if eval.unseen_rare {
-                routed = route_unseen_to_rare(eval_cats, n_numeric, &fitted.cat_encoders)?;
-                routed.as_slice()
-            } else {
-                eval_cats
-            };
-            let eval_numeric = eval
-                .columns
-                .iter()
-                .enumerate()
-                .map(|(i, values)| {
-                    Ok::<_, PbError>(NumericColumn {
-                        raw: FeatureId(raw_id(i)?),
-                        values,
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let eval_categorical = axes
-                .iter()
-                .zip(eval_cats)
-                .enumerate()
-                .flat_map(|(j, (ids, levels))| {
-                    ids.iter().map(move |&id| {
-                        Ok::<_, PbError>(ServeCategoricalColumn {
-                            raw: FeatureId(raw_id(n_numeric + j)?),
-                            id,
-                            levels,
-                        })
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let train = fitted.train.0;
-            let ev = bin_serve_columns(
-                &eval_numeric,
-                &eval_categorical,
-                &train.grids,
-                &train.provenance,
-                &fitted.cat_encoders,
-            )?;
-            let x = TrainBinnedMatrix(append(train, ev.0)?);
-            cat_axes_per_raw = Some(axes);
-            Booster::with_config(config).fit_train(&x, &all_y, &cat_spec, fitted.cat_encoders)?
-        }
-    };
-    // Bag membership is reported over the FIT rows only (the holdout rows were in every bag).
-    if let Some(in_bag) = model.bag_in_bag.as_mut() {
-        for bag in in_bag {
-            bag.truncate(n_fit);
-        }
-    }
-    if let Some(names) = feature_names {
-        let names = match &cat_axes_per_raw {
-            Some(axes) => expand_feature_names_for_cat_channels(names, n_numeric, axes)?,
-            None => names,
-        };
-        if names.len() != model.schema.feature_names.len() {
-            return Err(PbError::ShapeMismatch {
-                what: format!(
-                    "feature_names len {} != n_features {}",
-                    names.len(),
-                    model.schema.feature_names.len()
-                ),
-            });
-        }
-        model.schema.feature_names = names;
-    }
-    model.schema.class_labels = class_labels;
-    model.validate()?;
-    Ok(model)
 }
 
 /// Fit a single-output [`Model`] on the **ambient** rayon pool (no pool of its own): bin the
@@ -8277,7 +8024,9 @@ fn fit_model_ambient_bagged(
         None => {
             let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
             let x = bin_columns(&refs, weight, &state.bin_config, state.seed)?;
-            Booster::with_config(state.config.clone()).fit(&x, y, &spec)?
+            let mut model = Booster::with_config(state.config.clone()).fit(&x, y, &spec)?;
+            model.fit_cat_bins = Some(Vec::new());
+            model
         }
         // Native categorical path: numeric columns keep raw ids `0..n_numeric`, each
         // categorical column gets a sequential raw id after them, so the serve-time
@@ -8501,13 +8250,16 @@ fn fit_multiclass_owned_bagged(
             None => {
                 let refs: Vec<&[f32]> = columns.iter().map(Vec::as_slice).collect();
                 let x = bin_columns(&refs, weight.as_deref(), &state.bin_config, state.seed)?;
-                let model = Booster::with_config(state.config.clone()).fit_multiclass(
+                let mut model = Booster::with_config(state.config.clone()).fit_multiclass(
                     &x,
                     &y,
                     n_classes,
                     &class_labels,
                     &spec,
                 )?;
+                for class in &mut model.classes {
+                    class.fit_cat_bins = Some(Vec::new());
+                }
                 Ok((model, None))
             }
             Some(cats) => {
@@ -8662,7 +8414,7 @@ fn mc_stage<T>(name: &str, f: impl FnOnce() -> T) -> T {
     out
 }
 
-/// K>=3 fit-and-prune. Two selection regimes share one deploy/guard/apply tail:
+/// K>=3 fit-and-prune. Two selection regimes share one deploy/apply tail:
 ///
 /// * **CV selection** (`fold_of` given; the default since 2026-09-07): the single-output prune's
 ///   design ported to K>=3. The DEPLOY soup is fitted first and its realized supports are the
@@ -8675,9 +8427,7 @@ fn mc_stage<T>(name: &str, f: impl FnOnce() -> T) -> T {
 ///   `sel_rows`, walked on that slice. Kept for A/B and for the historical artifacts; it is the
 ///   path measured to drop tables on noise (see `design/multiclass-design.md` §9g).
 ///
-/// The guard then measures the shipped keep-set against the full deploy bank on honest rows
-/// with an SE-aware bar (`guard_z`, `guard_floor`), and the keep-set is retained on the deploy
-/// banks with the box/table budgets.
+/// The keep-set is then retained on the deploy banks with the box/table budgets.
 #[allow(clippy::too_many_arguments)]
 fn fit_multiclass_pruned_owned(
     mut state: PyBooster,
@@ -8696,10 +8446,7 @@ fn fit_multiclass_pruned_owned(
     n_folds: usize,
     es_holdout: Option<Vec<bool>>,
     deploy_es_holdout: Option<Vec<bool>>,
-    prune_guard: bool,
-    prune_guard_tol: f64,
     prune_guard_min_rows: usize,
-    guard_oob_honest: bool,
     sel_bags: u16,
     box_budget: usize,
     lambda_tables: f64,
@@ -8713,8 +8460,6 @@ fn fit_multiclass_pruned_owned(
     min_mean_gain: f64,
     drop_z: Option<f64>,
     keep_budget: usize,
-    guard_z: f64,
-    guard_floor: f64,
     bag_groups: Option<Vec<u32>>,
     ranked_path: bool,
     path_steps: usize,
@@ -8724,6 +8469,7 @@ fn fit_multiclass_pruned_owned(
     path_tolerance: f64,
     prune_main_effects: bool,
     path_min_share: f64,
+    rebalance: bool,
 ) -> Result<(MultiClassTableModel, String), PbError> {
     let n = y.len();
     if n == 0 {
@@ -8855,7 +8601,6 @@ fn fit_multiclass_pruned_owned(
             };
             st
         };
-        let deploy_es_holdout_mask = deploy_es_holdout.clone();
         let fit_deploy = |st: PyBooster| -> Result<MultiClassModel, PbError> {
             fit_multiclass_owned_bagged(
                 st,
@@ -8871,133 +8616,18 @@ fn fit_multiclass_pruned_owned(
                 bag_groups.clone(),
             )
         };
-        let mut ranked_used = false;
-        let (mut report, deploy_model, selection_json): (
-            PruneReport,
-            MultiClassModel,
-            Option<serde_json::Value>,
-        ) = if ranked_path {
-            // RANKED PATH: one deploy fit, supports ranked by purified variance under heredity,
-            // prefixes scored on the per-class out-of-bag juries, the minimum deployed. No fold
-            // CV, no guard (see `multiclass_ranked_path`).
-            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
+        // The CV fold vote over the deploy fit's realized supports: one fold refit per fold,
+        // walked on its held-out rows, aggregated by `aggregate_prune_selection`.
+        let fold_vote = |deploy_model: &MultiClassModel,
+                         full_supports: &[(FeatureSet, f64)],
+                         fold_of: &[i64]|
+         -> Result<(PruneReport, serde_json::Value), PbError> {
             let deploy_first = deploy_model
                 .classes
                 .first()
                 .ok_or_else(|| PbError::Internal {
                     what: "multiclass deploy fit produced no classes".into(),
                 })?;
-            let serve = ServeBinnedMatrix(serve_binned_for_model(
-                deploy_first,
-                &columns,
-                cat_x.as_deref(),
-            )?);
-            let supports = mc_stage("deploy_supports", || {
-                multiclass_realized_supports(&deploy_model, &serve, w_measure.clone(), &full_weight)
-            })?;
-            let sel = mc_stage("ranked_path", || {
-                multiclass_ranked_path(
-                    &deploy_model,
-                    &serve,
-                    &labels,
-                    &full_weight,
-                    w_measure.clone(),
-                    &supports,
-                    path_steps,
-                    path_fraction,
-                    path_tolerance,
-                    prune_guard_min_rows,
-                    prune_main_effects,
-                )
-            })?;
-            drop(serve);
-            let (keep, path_json) = match sel {
-                Some((keep, path)) => {
-                    // The variance-share floor, after the path's cutoff
-                    // (`prune_min_variance_share`). A skipped path keeps the full bank, floor
-                    // included, as the single-output path does and `binding_report_` says.
-                    let (keep, dropped_low) = t_boost_core::prune::drop_low_share(
-                        &keep,
-                        &supports,
-                        path_min_share,
-                        prune_main_effects,
-                    );
-                    let mut path_json = serde_json::to_value(&path).map_err(|err| {
-                        PbError::Serialization(format!("could not serialize path report: {err}"))
-                    })?;
-                    if let Some(obj) = path_json.as_object_mut() {
-                        obj.insert(
-                            "min_variance_share".into(),
-                            serde_json::json!(path_min_share),
-                        );
-                        obj.insert(
-                            "dropped_low_share".into(),
-                            serde_json::to_value(&dropped_low).map_err(|err| {
-                                PbError::Serialization(format!(
-                                    "could not serialize dropped tables: {err}"
-                                ))
-                            })?,
-                        );
-                    }
-                    (keep, path_json)
-                }
-                None => (
-                    supports.iter().map(|(u, _)| u.clone()).collect(),
-                    serde_json::json!({ "skipped": "no out-of-bag evidence: full bank kept" }),
-                ),
-            };
-            ranked_used = true;
-            let kept_set: std::collections::BTreeSet<FeatureSet> = keep.iter().cloned().collect();
-            let table_scores: Vec<PruneTableScore> = supports
-                .iter()
-                .map(|(u, v)| PruneTableScore {
-                    u: u.clone(),
-                    order: u8::try_from(u.order()).unwrap_or(u8::MAX),
-                    mean_gain: *v,
-                    se_gain: 0.0,
-                    variance: *v,
-                    sticky: cfg.is_sticky(u),
-                    selected: kept_set.contains(u),
-                })
-                .collect();
-            let effective_order =
-                u8::try_from(keep.iter().map(FeatureSet::order).max().unwrap_or(0))
-                    .unwrap_or(u8::MAX);
-            (
-                PruneReport {
-                    kept: keep,
-                    dropped: Vec::new(),
-                    effective_order,
-                    path: Vec::new(),
-                    table_scores,
-                    delta_vs_full: 0.0,
-                },
-                deploy_model,
-                Some(path_json),
-            )
-        } else if let Some(fold_of) = fold_of.as_deref() {
-            // ---- CV selection: deploy first, its realized supports are the candidates.
-            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
-            let deploy_first = deploy_model
-                .classes
-                .first()
-                .ok_or_else(|| PbError::Internal {
-                    what: "multiclass deploy fit produced no classes".into(),
-                })?;
-            let deploy_serve = ServeBinnedMatrix(serve_binned_for_model(
-                deploy_first,
-                &columns,
-                cat_x.as_deref(),
-            )?);
-            let full_supports = mc_stage("deploy_supports", || {
-                multiclass_realized_supports(
-                    &deploy_model,
-                    &deploy_serve,
-                    w_measure.clone(),
-                    &full_weight,
-                )
-            })?;
-            drop(deploy_serve);
             let full_ids: Vec<Vec<u32>> = full_supports
                 .iter()
                 .map(|(u, _)| feature_set_ids(u))
@@ -9156,9 +8786,11 @@ fn fit_multiclass_pruned_owned(
             let sel_value: serde_json::Value = serde_json::from_str(&sel_json).map_err(|err| {
                 PbError::Serialization(format!("could not parse selection report: {err}"))
             })?;
-            (report, deploy_model, Some(sel_value))
-        } else {
-            // ---- Legacy split selection.
+            Ok((report, sel_value))
+        };
+        // The legacy single train/select split (`multiclass_prune_cv=False`): one selection fit
+        // on the complement of `sel_rows`, walked on that slice.
+        let split_walk = || -> Result<PruneReport, PbError> {
             let train_rows: Vec<usize> = is_selected
                 .iter()
                 .enumerate()
@@ -9230,6 +8862,122 @@ fn fit_multiclass_pruned_owned(
             )?;
             drop(sel_serve);
             drop(sel_model);
+            Ok(report)
+        };
+        let mut ranked_used = false;
+        let (mut report, deploy_model, selection_json): (
+            PruneReport,
+            MultiClassModel,
+            Option<serde_json::Value>,
+        ) = if ranked_path || cv {
+            // Deploy first: its realized supports are the candidates of either selector.
+            let deploy_model = mc_stage("deploy_fit", || fit_deploy(state.clone()))?;
+            let deploy_first = deploy_model
+                .classes
+                .first()
+                .ok_or_else(|| PbError::Internal {
+                    what: "multiclass deploy fit produced no classes".into(),
+                })?;
+            let serve = ServeBinnedMatrix(serve_binned_for_model(
+                deploy_first,
+                &columns,
+                cat_x.as_deref(),
+            )?);
+            let supports = mc_stage("deploy_supports", || {
+                multiclass_realized_supports(&deploy_model, &serve, w_measure.clone(), &full_weight)
+            })?;
+            // RANKED PATH: supports ranked by purified variance under heredity, prefixes scored
+            // on the per-class out-of-bag juries, the minimum deployed (see
+            // `multiclass_ranked_path`). Without an out-of-bag jury it returns `None` and the fit
+            // falls back to the fold vote, as the single-output path does.
+            let sel = if !ranked_path {
+                None
+            } else {
+                mc_stage("ranked_path", || {
+                    multiclass_ranked_path(
+                        &deploy_model,
+                        &serve,
+                        &labels,
+                        &full_weight,
+                        w_measure.clone(),
+                        &supports,
+                        path_steps,
+                        path_fraction,
+                        path_tolerance,
+                        prune_guard_min_rows,
+                        prune_main_effects,
+                    )
+                })?
+            };
+            drop(serve);
+            match sel {
+                None => match fold_of.as_deref() {
+                    Some(fold_of) => {
+                        let (report, sel_value) = fold_vote(&deploy_model, &supports, fold_of)?;
+                        (report, deploy_model, Some(sel_value))
+                    }
+                    None => (split_walk()?, deploy_model, None),
+                },
+                Some((keep, path)) => {
+                    // The variance-share floor, after the path's cutoff (`prune_min_variance_share`).
+                    let (keep, dropped_low) = t_boost_core::prune::drop_low_share(
+                        &keep,
+                        &supports,
+                        path_min_share,
+                        prune_main_effects,
+                    );
+                    let mut path_json = serde_json::to_value(&path).map_err(|err| {
+                        PbError::Serialization(format!("could not serialize path report: {err}"))
+                    })?;
+                    if let Some(obj) = path_json.as_object_mut() {
+                        obj.insert(
+                            "min_variance_share".into(),
+                            serde_json::json!(path_min_share),
+                        );
+                        obj.insert(
+                            "dropped_low_share".into(),
+                            serde_json::to_value(&dropped_low).map_err(|err| {
+                                PbError::Serialization(format!(
+                                    "could not serialize dropped tables: {err}"
+                                ))
+                            })?,
+                        );
+                    }
+                    ranked_used = true;
+                    let kept_set: std::collections::BTreeSet<FeatureSet> =
+                        keep.iter().cloned().collect();
+                    let table_scores: Vec<PruneTableScore> = supports
+                        .iter()
+                        .map(|(u, v)| PruneTableScore {
+                            u: u.clone(),
+                            order: u8::try_from(u.order()).unwrap_or(u8::MAX),
+                            mean_gain: *v,
+                            se_gain: 0.0,
+                            variance: *v,
+                            sticky: cfg.is_sticky(u),
+                            selected: kept_set.contains(u),
+                        })
+                        .collect();
+                    let effective_order =
+                        u8::try_from(keep.iter().map(FeatureSet::order).max().unwrap_or(0))
+                            .unwrap_or(u8::MAX);
+                    (
+                        PruneReport {
+                            kept: keep,
+                            dropped: Vec::new(),
+                            effective_order,
+                            path: Vec::new(),
+                            table_scores,
+                            delta_vs_full: 0.0,
+                        },
+                        deploy_model,
+                        Some(path_json),
+                    )
+                }
+            }
+        } else {
+            // ---- Legacy split selection, then the deploy fit.
+            let report = split_walk()?;
             let deploy_model = fit_deploy(state.clone())?;
             (report, deploy_model, None)
         };
@@ -9241,68 +8989,32 @@ fn fit_multiclass_pruned_owned(
             })?;
         let deploy_binned = serve_binned_for_model(deploy_first, &columns, cat_x.as_deref())?;
         let deploy_serve = ServeBinnedMatrix(deploy_binned);
-        let (shipped_keep, guard) = if prune_guard && !ranked_used {
-            let ev = if guard_oob_honest {
-                Some(MulticlassGuardEvidence::OutOfBag)
-            } else {
-                deploy_es_holdout_mask
-                    .as_deref()
-                    .map(MulticlassGuardEvidence::Carve)
-            };
-            match ev {
-                Some(ev) => {
-                    let (k, g) = mc_stage("guard", || {
-                        multiclass_prune_guard(
-                            &deploy_model,
-                            &deploy_serve,
-                            &labels,
-                            &full_weight,
-                            w_measure.clone(),
-                            &report.kept,
-                            &report.table_scores,
-                            ev,
-                            prune_guard_tol,
-                            prune_guard_min_rows,
-                            guard_z,
-                            guard_floor,
-                        )
-                    })?;
-                    (k, Some(g))
-                }
-                None => (
-                    report.kept.clone(),
-                    Some(MulticlassGuardReport::skipped(
-                        true,
-                        "no honest evidence: a panel fit with validation_fraction unset",
-                    )),
-                ),
-            }
-        } else {
-            (report.kept.clone(), None)
-        };
+        let shipped_keep = report.kept.clone();
         let evidence: BTreeMap<FeatureSet, f64> = report
             .table_scores
             .iter()
             .map(|ts| (ts.u.clone(), ts.mean_gain))
             .collect();
         let w_measure_band = w_measure.clone();
-        let (table_model, box_report, table_report) = mc_stage("keepset_apply", || {
-            prune_multiclass_to_keepset_budgeted(
-                &deploy_model,
-                &deploy_serve,
-                &labels,
-                &full_weight,
-                w_measure,
-                &shipped_keep,
-                box_budget,
-                table_budget,
-                table_min_arity,
-                &evidence,
-            )
-        })?;
+        let (table_model, box_report, table_report, rebalance_report) =
+            mc_stage("keepset_apply", || {
+                prune_multiclass_to_keepset_budgeted(
+                    &deploy_model,
+                    &deploy_serve,
+                    &labels,
+                    &full_weight,
+                    w_measure,
+                    &shipped_keep,
+                    rebalance,
+                    box_budget,
+                    table_budget,
+                    table_min_arity,
+                    &evidence,
+                )
+            })?;
         // BANDING (see `band_multiclass_table_model`): after the keep-set, before the report.
         let (table_model, banding_reports) = match band_tolerance {
-            Some(tol) if multiclass_bag_oob_evidence_available(&deploy_model) => {
+            Some(tol) => {
                 let (tm, reps) = mc_stage("banding", || {
                     band_multiclass_table_model(
                         &table_model,
@@ -9312,7 +9024,7 @@ fn fit_multiclass_pruned_owned(
                         cat_x.as_deref(),
                         &full_weight,
                         w_measure_band.clone(),
-                        &shipped_keep,
+                        Some(&shipped_keep),
                         tol,
                         &labels,
                         band_deviance_cap,
@@ -9348,24 +9060,41 @@ fn fit_multiclass_pruned_owned(
             if let Some(sel) = selection_json {
                 obj.insert("selection".into(), sel);
             }
-            let mut g = match &guard {
-                Some(g) => serde_json::to_value(g).map_err(|err| {
-                    PbError::Serialization(format!("could not serialize guard report: {err}"))
-                })?,
-                None => serde_json::json!({ "enabled": false, "fired": false }),
-            };
-            if (box_report.engaged || table_report.engaged) && guard.is_some() {
-                if let Some(obj) = g.as_object_mut() {
-                    obj.insert("budget_blind".into(), serde_json::Value::Bool(true));
-                }
+            if let Some(rep) = &rebalance_report {
+                obj.insert(
+                    "rebalance".into(),
+                    serde_json::to_value(rep).map_err(|err| {
+                        PbError::Serialization(format!(
+                            "could not serialize rebalance report: {err}"
+                        ))
+                    })?,
+                );
             }
-            obj.insert("guard".into(), g);
             if let Some(reps) = &banding_reports {
                 obj.insert(
                     "banding".into(),
                     serde_json::to_value(reps).map_err(|err| {
                         PbError::Serialization(format!("could not serialize banding report: {err}"))
                     })?,
+                );
+            }
+            if let Some(reports) = multiclass_fit_report(&deploy_model) {
+                // The deployed fit's per-bag boosting report, lifted out by the estimator.
+                obj.insert(
+                    "fit_report".into(),
+                    serde_json::Value::Array(
+                        reports
+                            .iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "trees_kept": r.trees_kept,
+                                    "rounds_trained": r.rounds_trained,
+                                    "reason": r.reason.as_str(),
+                                    "eval_deviance": r.eval_deviance,
+                                })
+                            })
+                            .collect(),
+                    ),
                 );
             }
             if let Some(cr) = deploy_model.cell_refit {
@@ -9772,11 +9501,27 @@ fn loss_choice_from_tag(tag: &t_boost_core::loss::ObjectiveTag) -> Result<LossCh
     })
 }
 
-/// Bin raw serve columns through a [`TableModel`]'s frozen grids/encoders (mirrors
-/// [`serve_binned_for_model`] but for the tables-only served model — same fields, no trees).
+/// Multiclass labels as class indices: each `y` must be an integer in `0..n_classes`.
+fn class_labels_from_array(y: &PyReadonlyArray1<'_, f32>, n_classes: usize) -> PyResult<Vec<u32>> {
+    y.as_slice()
+        .map_err(|e| PyValueError::new_err(format!("y must be contiguous: {e}")))?
+        .iter()
+        .map(|&l| {
+            if !l.is_finite() || l < 0.0 || l.fract() != 0.0 || l as usize >= n_classes {
+                Err(PyValueError::new_err(format!(
+                    "label {l} not in 0..{n_classes}"
+                )))
+            } else {
+                Ok(l as u32)
+            }
+        })
+        .collect()
+}
+
 /// Band every class bank of a multiclass tables model (see `t_boost_core::banding`). Each class is
 /// banded on its own softmax curvature `w · p_k (1 - p_k)`, its own logits as the distil target and
-/// its own bag noise (the deploy soup's class-`k` bags restricted to the keep-set).
+/// its own bag noise (the deploy soup's class-`k` bags restricted to the keep-set; with one bag,
+/// the deviance cap alone bounds the banding).
 #[allow(clippy::too_many_arguments)] // JUSTIFIED: the multiclass deploy stage's own inputs (§12.2).
 fn band_multiclass_table_model(
     tm: &MultiClassTableModel,
@@ -9786,7 +9531,7 @@ fn band_multiclass_table_model(
     cat_x: Option<&[Vec<String>]>,
     w: &[f32],
     w_measure: RefMeasure,
-    keep: &[FeatureSet],
+    keep: Option<&[FeatureSet]>,
     tolerance: f64,
     labels: &[u32],
     deviance_cap: f64,
@@ -9857,7 +9602,7 @@ fn band_multiclass_table_model(
             .max(1e-15);
         dev -= 2.0 * mi * p.ln();
     }
-    let dev_mean = dev / ws.max(f64::MIN_POSITIVE);
+    let dev_mean = (dev / ws.max(f64::MIN_POSITIVE)).max(0.0); // rounding never makes it negative
     let all_rows: Vec<u32> = (0..u32::try_from(n).unwrap_or(u32::MAX)).collect();
     // The bag banks behind the noise estimate are purified under the same row mass as the
     // multiclass prune's and keep-set's banks (`measure_mass`: the weights, under a measure that
@@ -9880,26 +9625,34 @@ fn band_multiclass_table_model(
             .collect();
         let mck = mc.classes.get(k).ok_or_else(|| no_class(k))?;
         let tmk = tm.classes.get(k).ok_or_else(|| no_class(k))?;
-        let var = mc_stage("banding.bag_variance", || {
-            t_boost_core::prune::bag_score_variance_for_rows(
-                mck,
-                serve,
-                w_measure.clone(),
-                bag_mass.as_deref(),
-                Some(keep),
-                &all_rows,
-            )
-        })?;
-        let b = mck.bag_spans.as_ref().map_or(2, Vec::len).max(2) as f64;
         let hs: f64 = h.iter().sum();
-        let num: f64 = h.iter().zip(&var).map(|(&hi, &vi)| hi * vi / b).sum();
+        // One bag has no spread to measure its noise by: the deviance cap alone bounds the
+        // banding.
+        let sigma = match mck.bag_spans.as_ref().map(Vec::len) {
+            Some(n_bags) if n_bags >= 2 => {
+                let var = mc_stage("banding.bag_variance", || {
+                    t_boost_core::prune::bag_score_variance_for_rows(
+                        mck,
+                        serve,
+                        w_measure.clone(),
+                        bag_mass.as_deref(),
+                        keep,
+                        &all_rows,
+                    )
+                })?;
+                let b = n_bags as f64;
+                let num: f64 = h.iter().zip(&var).map(|(&hi, &vi)| hi * vi / b).sum();
+                (num / hs.max(f64::MIN_POSITIVE)).sqrt()
+            }
+            _ => f64::INFINITY,
+        };
         let cells = mc_stage("banding.class_cells", || class_cells(tmk))?;
         let rows = t_boost_core::banding::BandingRows {
             cells: &cells,
             h: &h,
             mass: &mass,
             target: lk,
-            sigma: (num / hs.max(f64::MIN_POSITIVE)).sqrt(),
+            sigma,
             // the class's share of the deviance cap (expected increase Σ h δ² / Σ w per class)
             mse_cap: deviance_cap * dev_mean * ws / (hs.max(f64::MIN_POSITIVE) * k_classes as f64),
         };
@@ -10085,6 +9838,8 @@ fn table_merged_axes_json(tm: &TableModel) -> Result<String, PbError> {
         .map_err(|err| PbError::Serialization(format!("could not serialize merged axes: {err}")))
 }
 
+/// Bin raw serve columns through a [`TableModel`]'s frozen grids/encoders (mirrors
+/// [`serve_binned_for_model`] but for the tables-only served model — same fields, no trees).
 fn serve_binned_for_tables(
     tm: &TableModel,
     numeric_cols: Vec<Vec<f32>>,
@@ -10320,101 +10075,61 @@ fn deployed_census_dict<'py>(
     Ok(d)
 }
 
-/// `eval_rows`, when given, restricts the no-harm comparison to those rows of the design —
-/// the caller passes the rows the bags left OUT of bag, so the acceptance is honest rather
-/// than a training-loss brake — and tightens the slack from the legacy 1% (a training loss
-/// always rises under smoothing) to a tenth of a percent.
-/// The log-link intercept rebalance still runs on every row: it is the balance step, not the
-/// gate. `None` is the pre-2026-09-06 behaviour, byte for byte.
-#[allow(clippy::too_many_arguments)] // JUSTIFIED: one binding, one core call; the tuple would only rename them.
-fn apply_graduation_updates(
+/// The dense order-1/2 tables of `model` the graduation solver can smooth (see
+/// `_TableModel.graduation_tables`).
+fn graduation_table_inputs(
     model: &TableModel,
-    columns: Vec<Vec<f32>>,
-    y: Vec<f32>,
-    weight: Vec<f32>,
-    exposure: Option<Vec<f32>>,
-    cat_x: Option<Vec<Vec<String>>>,
-    updates: Vec<(usize, Vec<f64>)>,
-    eval_rows: Option<Vec<u32>>,
-) -> Result<(TableModel, bool), PbError> {
-    let (model, adopted, _) = apply_graduation_updates_impl(
-        model, columns, y, weight, exposure, cat_x, updates, eval_rows, 0.0, 0,
-    )?;
-    Ok((model, adopted))
+    max_cells: usize,
+) -> Result<Vec<GraduationTableInput>, PbError> {
+    let mut out = Vec::new();
+    for (index, table) in model.bank.tables.iter().enumerate() {
+        let shape = table.values.shape();
+        if table.values.is_sparse()
+            || table.support.is_sparse()
+            || !(1..=2).contains(&shape.len())
+            || table.values.len() > max_cells
+        {
+            continue;
+        }
+        if table.support.shape() != shape {
+            return Err(PbError::ShapeMismatch {
+                what: format!("graduation table {index} support shape differs from values"),
+            });
+        }
+        let mut axis_categorical = Vec::with_capacity(table.axes.len());
+        for axis in &table.axes {
+            let provenance = model
+                .provenance
+                .iter()
+                .find(|provenance| provenance.raw == axis.raw)
+                .ok_or_else(|| PbError::Internal {
+                    what: format!(
+                        "graduation table {index} axis raw {} has no provenance",
+                        axis.raw.0
+                    ),
+                })?;
+            axis_categorical.push(!matches!(provenance.kind, AxisKind::Numeric));
+        }
+        out.push((
+            index,
+            feature_set_ids(&table.u),
+            shape,
+            table.values.values().into_owned(),
+            table.support.values().into_owned(),
+            axis_categorical,
+        ));
+    }
+    Ok(out)
 }
 
-#[allow(clippy::too_many_arguments, clippy::type_complexity)]
-fn apply_graduation_updates_impl(
+/// One bank's graduation candidate: `bank` (the high-order diffusion's output) with the smoothed
+/// dense `updates` applied and, when there are any, re-purified. No re-anchor and no check: the
+/// callers own both.
+fn graduated_model(
     model: &TableModel,
-    columns: Vec<Vec<f32>>,
-    y: Vec<f32>,
-    weight: Vec<f32>,
-    exposure: Option<Vec<f32>>,
-    cat_x: Option<Vec<Vec<String>>>,
+    bank: TableBank,
     updates: Vec<(usize, Vec<f64>)>,
-    eval_rows: Option<Vec<u32>>,
-    high_order_alpha: f64,
-    box_budget: usize,
-) -> Result<
-    (
-        TableModel,
-        bool,
-        Vec<t_boost_core::explain::HighOrderSmoothingReport>,
-    ),
-    PbError,
-> {
-    let numeric_raws: Vec<u32> = model
-        .provenance
-        .iter()
-        .filter(|p| matches!(p.kind, AxisKind::Numeric))
-        .map(|p| p.raw.0)
-        .collect();
-    let existing_boxes: usize = model.bank.factored.iter().map(|f| f.n_boxes()).sum();
-    let added_budget = if box_budget == 0 {
-        4096
-    } else {
-        4096.min(box_budget.saturating_sub(existing_boxes))
-    };
-    let (bank, report) = model.bank.smooth_high_order(
-        &numeric_raws,
-        high_order_alpha,
-        1024,
-        added_budget,
-        2_000_000,
-    )?;
-    if updates.is_empty() && !report.iter().any(|r| r.applied) {
-        return Ok((model.clone(), true, report));
-    }
-    if let Some(rows) = eval_rows.as_deref() {
-        if rows.is_empty() {
-            return Err(PbError::InvalidInput {
-                what: "graduation eval_rows must not be empty".into(),
-            });
-        }
-        if let Some(&bad) = rows.iter().find(|&&r| r as usize >= y.len()) {
-            return Err(PbError::InvalidInput {
-                what: format!(
-                    "graduation eval row {bad} is out of range for {} rows",
-                    y.len()
-                ),
-            });
-        }
-    }
-    if y.len() != weight.len()
-        || exposure
-            .as_ref()
-            .is_some_and(|values| values.len() != y.len())
-    {
-        return Err(PbError::ShapeMismatch {
-            what: format!(
-                "graduation input lengths y={}, weight={}, exposure={}",
-                y.len(),
-                weight.len(),
-                exposure.as_ref().map_or(y.len(), Vec::len)
-            ),
-        });
-    }
-
+) -> Result<TableModel, PbError> {
     let mut graduated = model.clone();
     graduated.bank = bank;
     let dense_changed = !updates.is_empty();
@@ -10490,6 +10205,268 @@ fn apply_graduation_updates_impl(
             graduated.bank = repurified;
         }
     }
+    Ok(graduated)
+}
+
+/// Graduation of every class bank of a multiclass tables model: each class's high-order
+/// diffusion and smoothed dense tables (`updates` are `(class, table, values)`; see
+/// [`graduated_model`]), then one multinomial re-anchor of the class intercepts on every row, and
+/// the single-output path's training-deviance check: the smoothing is kept only if the training
+/// multinomial deviance rises by at most 1%. The diffusion's added boxes come out of one
+/// `box_budget` shared by the classes and spent in class order, as the deployed box budget
+/// counts every class's copy of a table. Returns the model, whether the smoothing was adopted,
+/// and the per-class high-order reports.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_multiclass_graduation(
+    model: &MultiClassTableModel,
+    columns: Vec<Vec<f32>>,
+    labels: Vec<u32>,
+    weight: Vec<f32>,
+    cat_x: Option<Vec<Vec<String>>>,
+    updates: Vec<(usize, usize, Vec<f64>)>,
+    high_order_alpha: f64,
+    box_budget: usize,
+) -> Result<
+    (
+        MultiClassTableModel,
+        bool,
+        Vec<Vec<t_boost_core::explain::HighOrderSmoothingReport>>,
+    ),
+    PbError,
+> {
+    let n_classes = model.classes.len();
+    let mut per_class: Vec<Vec<(usize, Vec<f64>)>> = vec![Vec::new(); n_classes];
+    for (class, index, values) in updates {
+        per_class
+            .get_mut(class)
+            .ok_or_else(|| PbError::InvalidInput {
+                what: format!("graduation class {class} out of range for {n_classes} classes"),
+            })?
+            .push((index, values));
+    }
+    let boxes = |bank: &TableBank| -> usize { bank.factored.iter().map(|f| f.n_boxes()).sum() };
+    let existing: usize = model.classes.iter().map(|c| boxes(&c.bank)).sum();
+    let mut remaining = box_budget.saturating_sub(existing);
+    let mut banks = Vec::with_capacity(n_classes);
+    let mut reports = Vec::with_capacity(n_classes);
+    for class in &model.classes {
+        let numeric_raws: Vec<u32> = class
+            .provenance
+            .iter()
+            .filter(|p| matches!(p.kind, AxisKind::Numeric))
+            .map(|p| p.raw.0)
+            .collect();
+        let added_budget = if box_budget == 0 {
+            4096
+        } else {
+            4096.min(remaining)
+        };
+        let (bank, report) = class.bank.smooth_high_order(
+            &numeric_raws,
+            high_order_alpha,
+            1024,
+            added_budget,
+            2_000_000,
+        )?;
+        remaining = remaining.saturating_sub(boxes(&bank).saturating_sub(boxes(&class.bank)));
+        banks.push(bank);
+        reports.push(report);
+    }
+    let changed =
+        per_class.iter().any(|u| !u.is_empty()) || reports.iter().flatten().any(|r| r.applied);
+    if !changed {
+        return Ok((model.clone(), true, reports));
+    }
+    if labels.len() != weight.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "graduation input lengths y={}, weight={}",
+                labels.len(),
+                weight.len()
+            ),
+        });
+    }
+    let mut graduated = model.clone();
+    for ((slot, (class, bank)), updates) in graduated
+        .classes
+        .iter_mut()
+        .zip(model.classes.iter().zip(banks))
+        .zip(per_class)
+    {
+        *slot = graduated_model(class, bank, updates)?;
+    }
+    let first = model.classes.first().ok_or_else(|| PbError::Internal {
+        what: "multiclass tables model has no classes".into(),
+    })?;
+    let binned = serve_binned_for_tables(first, columns, cat_x, None)?;
+    if binned.n_rows as usize != labels.len() {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "graduation design has {} rows but y has {}",
+                binned.n_rows,
+                labels.len()
+            ),
+        });
+    }
+    let logits = |m: &MultiClassTableModel| -> Result<Vec<Vec<f64>>, PbError> {
+        m.classes
+            .iter()
+            .map(|c| {
+                c.score_raw(&binned, None)
+                    .map(|v| v.into_iter().map(f64::from).collect())
+            })
+            .collect()
+    };
+    let mut after = logits(&graduated)?;
+    let shifts = t_boost_core::prune::multiclass_intercept_shifts(
+        &after,
+        &labels,
+        &weight,
+        "graduation reanchor",
+    )?;
+    for ((class, column), shift) in graduated.classes.iter_mut().zip(&mut after).zip(&shifts) {
+        class.bank.f0 += shift;
+        for v in column.iter_mut() {
+            *v += shift;
+        }
+    }
+    let raw_deviance = multinomial_deviance(&logits(model)?, &labels, &weight)?;
+    let graduated_deviance = multinomial_deviance(&after, &labels, &weight)?;
+    if !graduated_deviance.is_finite() || graduated_deviance > raw_deviance * 1.01 {
+        return Ok((model.clone(), false, reports));
+    }
+    graduated.validate()?;
+    Ok((graduated, true, reports))
+}
+
+/// Total weighted multinomial deviance `Σ w·2·(ln Σ_k e^{f_k} − f_y)` of `[class][row]` logits.
+fn multinomial_deviance(logits: &[Vec<f64>], labels: &[u32], w: &[f32]) -> Result<f64, PbError> {
+    let mut total = 0.0_f64;
+    let mut row = Vec::with_capacity(logits.len());
+    for (i, (&label, &wi)) in labels.iter().zip(w).enumerate() {
+        row.clear();
+        for column in logits {
+            row.push(
+                column
+                    .get(i)
+                    .copied()
+                    .ok_or_else(|| PbError::ShapeMismatch {
+                        what: format!("multinomial deviance: a class has no logit for row {i}"),
+                    })?,
+            );
+        }
+        let mx = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let log_z = row.iter().map(|v| (v - mx).exp()).sum::<f64>().ln() + mx;
+        let fy = row
+            .get(label as usize)
+            .copied()
+            .ok_or_else(|| PbError::InvalidInput {
+                what: format!("multinomial deviance: label {label} has no class"),
+            })?;
+        total += 2.0 * f64::from(wi) * (log_z - fy);
+    }
+    Ok(total)
+}
+
+/// `eval_rows`, when given, restricts the no-harm comparison to those rows of the design —
+/// the caller passes the rows the bags left OUT of bag, so the acceptance is honest rather
+/// than a training-loss brake — and tightens the slack from the legacy 1% (a training loss
+/// always rises under smoothing) to a tenth of a percent.
+/// The log-link intercept rebalance still runs on every row: it is the balance step, not the
+/// gate. `None` is the pre-2026-09-06 behaviour, byte for byte. `reanchor` false (the
+/// estimator's `reanchor=False`) leaves the intercept as fitted.
+#[allow(clippy::too_many_arguments)] // JUSTIFIED: one binding, one core call; the tuple would only rename them.
+fn apply_graduation_updates(
+    model: &TableModel,
+    columns: Vec<Vec<f32>>,
+    y: Vec<f32>,
+    weight: Vec<f32>,
+    exposure: Option<Vec<f32>>,
+    cat_x: Option<Vec<Vec<String>>>,
+    updates: Vec<(usize, Vec<f64>)>,
+    eval_rows: Option<Vec<u32>>,
+    reanchor: bool,
+) -> Result<(TableModel, bool), PbError> {
+    let (model, adopted, _) = apply_graduation_updates_impl(
+        model, columns, y, weight, exposure, cat_x, updates, eval_rows, 0.0, 0, reanchor,
+    )?;
+    Ok((model, adopted))
+}
+
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn apply_graduation_updates_impl(
+    model: &TableModel,
+    columns: Vec<Vec<f32>>,
+    y: Vec<f32>,
+    weight: Vec<f32>,
+    exposure: Option<Vec<f32>>,
+    cat_x: Option<Vec<Vec<String>>>,
+    updates: Vec<(usize, Vec<f64>)>,
+    eval_rows: Option<Vec<u32>>,
+    high_order_alpha: f64,
+    box_budget: usize,
+    reanchor: bool,
+) -> Result<
+    (
+        TableModel,
+        bool,
+        Vec<t_boost_core::explain::HighOrderSmoothingReport>,
+    ),
+    PbError,
+> {
+    let numeric_raws: Vec<u32> = model
+        .provenance
+        .iter()
+        .filter(|p| matches!(p.kind, AxisKind::Numeric))
+        .map(|p| p.raw.0)
+        .collect();
+    let existing_boxes: usize = model.bank.factored.iter().map(|f| f.n_boxes()).sum();
+    let added_budget = if box_budget == 0 {
+        4096
+    } else {
+        4096.min(box_budget.saturating_sub(existing_boxes))
+    };
+    let (bank, report) = model.bank.smooth_high_order(
+        &numeric_raws,
+        high_order_alpha,
+        1024,
+        added_budget,
+        2_000_000,
+    )?;
+    if updates.is_empty() && !report.iter().any(|r| r.applied) {
+        return Ok((model.clone(), true, report));
+    }
+    if let Some(rows) = eval_rows.as_deref() {
+        if rows.is_empty() {
+            return Err(PbError::InvalidInput {
+                what: "graduation eval_rows must not be empty".into(),
+            });
+        }
+        if let Some(&bad) = rows.iter().find(|&&r| r as usize >= y.len()) {
+            return Err(PbError::InvalidInput {
+                what: format!(
+                    "graduation eval row {bad} is out of range for {} rows",
+                    y.len()
+                ),
+            });
+        }
+    }
+    if y.len() != weight.len()
+        || exposure
+            .as_ref()
+            .is_some_and(|values| values.len() != y.len())
+    {
+        return Err(PbError::ShapeMismatch {
+            what: format!(
+                "graduation input lengths y={}, weight={}, exposure={}",
+                y.len(),
+                weight.len(),
+                exposure.as_ref().map_or(y.len(), Vec::len)
+            ),
+        });
+    }
+
+    let mut graduated = graduated_model(model, bank, updates)?;
 
     let binned = serve_binned_for_tables(model, columns, cat_x, None)?;
     if binned.n_rows as usize != y.len() {
@@ -10502,7 +10479,9 @@ fn apply_graduation_updates_impl(
         });
     }
 
-    if model.link == Link::Log {
+    // Smoothing a log-link table moves the portfolio total; restore it on the intercept, as the
+    // fit's own re-anchor does, unless the caller asked for the intercept as fitted.
+    if reanchor && model.link == Link::Log {
         let pred = graduated.predict_binned(&binned, None)?;
         let mut numerator = 0.0_f64;
         let mut denominator = 0.0_f64;

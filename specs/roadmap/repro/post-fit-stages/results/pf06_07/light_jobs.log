@@ -1,0 +1,30 @@
+=== ovr
+{'dataset': 'fr_instal', 'split': 0, 'ovr_class': 0, 'rate': 0.33802342641364214, 'fit_s': 64.78, 'n_trees_per_bag': [3700, 3330, 2395, 3909, 3861, 3952, 3458, 2960], 'stop': ['max_trees', 'early_stopping', 'early_stopping', 'max_trees', 'max_trees', 'max_trees', 'early_stopping', 'early_stopping'], 'test': 0.5390475012517532}
+{'dataset': 'fr_instal', 'split': 0, 'ovr_class': 2, 'rate': 0.02838107607571494, 'fit_s': 58.23, 'n_trees_per_bag': [1893, 3664, 3980, 2895, 2933, 3914, 945, 2923], 'stop': ['early_stopping', 'max_trees', 'max_trees', 'early_stopping', 'early_stopping', 'max_trees', 'early_stopping', 'early_stopping'], 'test': 0.09256387611856125}
+=== centred s1
+fr_instal s1 b8  unbanded centred: d_test +0.149% train x1.0040 smoothed 82 [21, 20, 19, 22] stats {'supports': 160, 'centred': 142, 'fallback': 18, 'agree_min': 1.0} joint 0.120 first +0.015
+=== centred s2
+fr_instal s2 b8  unbanded centred: d_test +0.095% train x1.0049 smoothed 74 [15, 16, 21, 22] stats {'supports': 144, 'centred': 127, 'fallback': 17, 'agree_min': 1.0} joint 0.220 first -0.130
+=== order pg16
+pg16_fleet 0 8 shipped first-order by order [f0, 1, 2, 3]: [ 1.000e-04  1.200e-03 -1.640e-02  1.473e-01] 
+ per class:
+ [[ 0.0004 -0.0006 -0.0008  0.052 ]
+ [ 0.0001  0.0008 -0.0012  0.0481]
+ [-0.0004  0.001  -0.0144  0.0472]] 
+ rms move:
+ [[0.0011 0.0079 0.0218 0.0351]
+ [0.0007 0.0117 0.0352 0.0456]
+ [0.0009 0.0065 0.0212 0.0371]]
+=== order fr1
+fr_instal 1 8 shipped first-order by order [f0, 1, 2, 3]: [-0.0031 -0.0045 -0.3236  0.7367] 
+ per class:
+ [[-1.900e-03 -1.800e-03 -5.240e-02  1.768e-01]
+ [-2.000e-04  3.000e-03 -7.800e-02  2.274e-01]
+ [-1.000e-03 -2.100e-03 -1.179e-01  2.019e-01]
+ [-0.000e+00 -3.500e-03 -7.520e-02  1.305e-01]] 
+ rms move:
+ [[0.0016 0.015  0.0446 0.0491]
+ [0.0002 0.0114 0.0434 0.0444]
+ [0.0025 0.0351 0.1074 0.1096]
+ [0.     0.022  0.0762 0.0787]]
+=== LIGHT DONE

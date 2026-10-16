@@ -18,7 +18,7 @@ def test_sql_reconstructs_numeric_boundaries_missing_and_boxes(depth, order):
         y += 2 * np.all(x > 0, axis=1)
     model = TBoostRegressor(n_trees=12, n_bags=1, n_jobs=2, validation_fraction=None,
                            max_depth=depth, max_interaction_order=order,
-                           prune=False, interaction_gain_hurdle=0,
+                           prune=False, band_tolerance=None, interaction_gain_hurdle=0,
                            colsample_bytree=1, leaf_refine_steps=0).fit(x, y)
     bank = json.loads(model.tables(x))
     assert bank['factored'], 'fixture must exercise boxes, not only dense tables'

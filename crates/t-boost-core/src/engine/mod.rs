@@ -885,6 +885,17 @@ pub struct Model {
     /// Never serialized: `None` on single fits (`n_bags == 1`), and on loaded models.
     #[serde(skip)]
     pub bag_in_bag: Option<Vec<Vec<bool>>>,
+    /// Runtime-only training-time bins of the FIT rows on every single-channel categorical
+    /// axis whose rows were binned by out-of-fold (cross-fit) target statistics, as
+    /// `(axis, bins)`: the cells the trees saw. The serve map bins a training row by a
+    /// full-data statistic that contains the row's own target, so the post-fit stages that
+    /// judge or refit the tables against the fit rows' targets score them here instead (see
+    /// [`crate::prune::fit_rows_matrix`]). Recorded by [`Booster::fit_train`] and
+    /// [`Booster::fit_multiclass_train`] ([`crate::data::training_categorical_bins`]):
+    /// `Some(empty)` when no axis needs it. `None` on loaded models, numeric-only fits (which
+    /// need none) and constructions that are not fits. Excluded from `PartialEq`.
+    #[serde(skip)]
+    pub fit_cat_bins: Option<Vec<(u32, Vec<u8>)>>,
     /// Runtime-only report from the [`Config::max_delta_step_gated`] rate-collapse detector
     /// (`None` when the gate was not armed for this fit, or on a loaded model). Like
     /// [`Self::bag_spans`] this is a `#[serde(skip)]` introspection aid excluded from
@@ -899,9 +910,9 @@ pub struct Model {
 }
 
 impl PartialEq for Model {
-    /// Structural equality over every field EXCEPT `bag_spans`/`bag_in_bag`/`delta_step_gate`
-    /// (see the struct doc): all three are runtime-only introspection aids, never part of a
-    /// model's identity.
+    /// Structural equality over every field EXCEPT the runtime-only ones (`bag_spans`,
+    /// `bag_intercepts`, `bag_in_bag`, `fit_cat_bins`, `delta_step_gate`, `fit_report`; see the
+    /// struct doc): they are fit-time aids, never part of a model's identity.
     fn eq(&self, other: &Self) -> bool {
         self.f0 == other.f0
             && self.trees == other.trees
@@ -2021,22 +2032,16 @@ pub struct Config {
     /// this: a caller who named a cap gets exactly that cap for the whole fit, gate or no gate.
     /// See [`GatedDeltaStep`] for the signal, the engage semantics, and the evidence.
     pub max_delta_step_gated: GatedStepPolicy,
-    /// Run-time controls that never change what a round computes: an external evaluation
-    /// holdout, per-round history, a round observer. The default is inert (bit-identical).
+    /// Run-time controls that never change what a round computes: a round observer. The
+    /// default is inert (bit-identical).
     pub fit_control: FitControl,
 }
 
 /// Run-time controls of a single-output fit ([`Config::fit_control`]).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct FitControl {
-    /// The [`FitSpec::fixed_holdout`] rows are an external evaluation set, not fit rows: they
-    /// only score early stopping. The holdout slope recalibration (`reanchor_slope`) is skipped
-    /// and the intercept re-anchor uses the training rows only.
-    pub external_holdout: bool,
-    /// Record each round's stopping deviance in [`BagFitReport`] (and the training deviance
-    /// too when an observer is set, which computes it).
-    pub record_history: bool,
-    /// Called after every boosting round; returning `true` stops this fit's boosting.
+    /// Called after every boosting round; returning `true` stops this fit's boosting. Setting
+    /// one also records the training deviance of every round in [`BagFitReport`].
     pub observer: Option<RoundObserver>,
     /// This fit's bag index, reported in [`RoundEvent::bag`] (set by the outer bag).
     pub bag: u32,
@@ -2109,10 +2114,11 @@ pub struct BagFitReport {
     pub rounds_trained: u32,
     /// Why the loop ended.
     pub reason: StopReason,
-    /// Per-round training deviance, when [`FitControl::record_history`] and an observer are set.
+    /// Per-round mean training deviance, when an observer is set ([`FitControl::observer`]):
+    /// it costs an extra pass over the training rows every round.
     pub train_deviance: Vec<f64>,
-    /// Per-round stopping deviance, when [`FitControl::record_history`] is set and stopping
-    /// rows exist.
+    /// Per-round mean deviance on the early-stopping rows, whenever they exist: early stopping
+    /// computes it anyway. A multiclass fit records the multinomial deviance.
     pub eval_deviance: Vec<f64>,
 }
 
@@ -2445,8 +2451,11 @@ impl Booster {
         // Thread the encoders into the fit so every model built — including each OuterBag /
         // GreedySelect member validated inside `soup_models` — carries them, not just the
         // single-fit result (R-CATSERVE: the souped/member models also serve via these).
-        let model = boost::fit(&self.config, &x.0, y, spec, &cat_encoders)?;
+        let mut model = boost::fit(&self.config, &x.0, y, spec, &cat_encoders)?;
         model.validate()?;
+        // A fresh fit records where its rows sat in training, which the post-fit stages score
+        // them at (`prune::fit_rows_matrix`). After `validate`, which reports a missing encoder.
+        model.fit_cat_bins = Some(crate::data::training_categorical_bins(&x.0, &cat_encoders)?);
         Ok(model)
     }
 
@@ -2473,7 +2482,7 @@ impl Booster {
         spec: &FitSpec,
         cat_encoders: CatEncoderStore,
     ) -> Result<MultiClassModel, PbError> {
-        let model = boost::fit_multiclass(
+        let mut model = boost::fit_multiclass(
             &self.config,
             &x.0,
             y,
@@ -2483,6 +2492,11 @@ impl Booster {
             &cat_encoders,
         )?;
         model.validate()?;
+        // As `fit_train`: every class records where the fit rows sat in training.
+        let bins = crate::data::training_categorical_bins(&x.0, &cat_encoders)?;
+        for class in &mut model.classes {
+            class.fit_cat_bins = Some(bins.clone());
+        }
         Ok(model)
     }
 

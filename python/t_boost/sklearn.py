@@ -91,7 +91,6 @@ _FIT_REPORT_ATTRS = (
     "n_trees_",
     "stopping_reason_",
     "evals_result_",
-    "_fit_eval_set_",
 )
 
 
@@ -195,7 +194,8 @@ _ES_ADAPTIVE_DEFAULT = 1.5
 # (the adapter forced prune=True on all val-is-None fits), so the constructors now default to
 # the same artifact. The selection is held-out-guarded (neutral-or-better by construction) and
 # costs a handful of extra single-bag fold fits on top of the deploy fit. prune=False deploys the
-# full, unpruned table bank instead: every fit's artifact is rating tables.
+# full, unpruned table bank instead: every fit's artifact is rating tables. Only the selection is
+# skipped; banding, graduation and the monotone repair run as for a pruned fit (2026-10-14).
 _PRUNE_DEFAULT = True
 
 
@@ -220,7 +220,7 @@ def _is_degenerate_grouping(groups: "np.ndarray") -> bool:
     Empty input is not degenerate (there is no grouping to speak of, and the empty-design error
     belongs to the caller). Float ids carrying NaN are not degenerate either: a NaN id is not an
     identity, so a column of them must not be read as a column of singletons — the same rule the
-    prune guard's OOB-honesty test uses, and the reason both now share this helper.
+    ranked path's OOB-honesty test uses, and the reason both share this helper.
     """
     g = np.asarray(groups)
     if g.shape[0] == 0:
@@ -523,19 +523,13 @@ def _resolve_min_data_in_leaf(value: int | None, max_depth: int) -> int:
 # (8/9 splits); k=2 is a wash. Every battery dataset with fit n >= 5*125 measured
 # neutral-or-better at k=5, so nothing above that changes.
 _MIN_PRUNE_FOLD_ROWS = 125
-# Set-level prune guard: minimum EVIDENCE rows for the pruned-vs-full bank comparison to be
-# worth trusting — below this the deviance ratio is noise and the guard stays silent. Counts
-# out-of-bag-covered rows on the OOB path, shared-ES-holdout rows on the grouped carve path.
-#
-# (There is no longer a minimum-FIT-ROWS gate. av33 needed one because the ungrouped guard
-# bought its honest slice with a shared ES carve that cost every bag ~validation_fraction of
-# its rows — a real fit cost that only amortised above ~100k rows. The OOB evidence path costs
-# the fit NOTHING, so the gate had nothing left to protect and is gone; see the guard block in
-# `_fit_and_prune`.)
+# Minimum out-of-bag-covered rows the ranked path needs to score its prefixes: below this the
+# path's deviances are noise, and the fit falls back to the fold vote.
+# The name dates from the set-level guard that used it first (removed 2026-10-14).
 _PRUNE_GUARD_MIN_ROWS = 500
 
 # --- EVIDENCE-GATED PRUNING (av37) defaults ---------------------------------------------------
-# See the estimator's `prune_drop_z` note for the mechanism. The three numbers are set here so
+# See the estimator's `prune_drop_z` note for the mechanism. The two numbers are set here so
 # the regressor, the classifier and the recipe cannot drift apart.
 #
 #   _PRUNE_DROP_Z_DEFAULT   how many SEs of the paired per-fold mean drop-gain a table must clear
@@ -544,8 +538,6 @@ _PRUNE_GUARD_MIN_ROWS = 500
 #                           pre-cascade keep-set reaches max(budget, the av36 keep-set size), so
 #                           the gate is a strict no-op wherever the deployed bank was already
 #                           larger than a human can read.
-#   _PRUNE_GUARD_Z_DEFAULT  SE multiplier on the set-level guard's breach test. `0.0` (the
-#                           shipped value) IS the av36 fixed-relative-tolerance test.
 #
 # `_PRUNE_DROP_Z_DEFAULT = 2.0`: measured, 13 arena datasets, paired against the av36 control.
 # The recovery is monotone in z and flattens above 2 (swautoins +0.0142/+0.0171/+0.0179/+0.0184
@@ -560,49 +552,6 @@ _PRUNE_GUARD_MIN_ROWS = 500
 # that it changes nothing measured: credit_g (av36 keeps 67), beMTPL16 (98), autobi_us (29),
 # allstate_sev (2,394) and homesite_conv are all bit-exact no-ops at either value, because the
 # budget is max(budget, the av36 keep-set) and theirs is already larger.
-#
-# `_PRUNE_GUARD_Z_DEFAULT = 0.0` — THE SE-AWARE GUARD BAR IS BUILT, MEASURED AND SHIPPED OFF.
-# The idea was that the guard should only re-admit on a statistically real gap. It does not
-# survive contact with the evidence: the guard's row-level SE on a zero-inflated compound target
-# is dominated by a handful of large claims, so it cannot resolve even a large set-level gap.
-# ohlsson_pp split 6 measured a +10.10% selected-vs-full gap — a real detonation the av36 guard
-# caught, re-admitting 13 tables to 38 — against a paired-difference SE of 9.56%, so even a
-# z = 1.5 bar sat at 14.3% and stayed silent: that split's test skill went -0.128 -> -1.799.
-# Across the four datasets whose guard ever fires, z > 0 never helped: swautoins -0.0020 (z=3) /
-# 0.0000 (z=1.5), swautoins_pp -0.0002 / 0.0000, freclaimdam -0.0011 / -0.0013, ohlsson_pp
-# -0.0619 at BOTH. The knob and its diagnostics (`gap_se`, `tol_effective`) stay, so the claim
-# stays falsifiable and a future estimator of the gap's noise can be dropped straight in.
-#
-# What actually protects the bank is the SELECTION gate, not the guard: on that same ohlsson_pp
-# split the shipped composition never builds the 13-table bank at all (it keeps 27), the gap
-# never reaches the tolerance, and the split scores -0.113 against the av36 control's -0.128.
-#
-# `_PRUNE_GUARD_Z_DN_DEFAULT = 2.0` / `_PRUNE_GUARD_TOL_FLOOR_DEFAULT = 0.005` (av39) — THE BAR
-# MOVES DOWN, NOT UP. The falsified `prune_guard_z` above is an UPWARD bar: it could only make the
-# guard fire LESS. The homesite_conv forensic (2026-08-25) found the opposite failure, and found it
-# to be the whole of that dataset's deficit: where the jury IS sharp, the fixed 5% tolerance is
-# enormous. homesite's paired-difference SE is 0.21%-0.27% of the full-bank level, so 5% is a
-# ~20-SE bar that licenses about 0.0075 log-loss of damage the guard can see perfectly well. Two
-# shapes, one cause:
-#   * SILENT — default split 1 measured a +4.80% selected-vs-full gap, 0.2 points under the bar,
-#     and shipped a bank that cost +0.0081 test log-loss against prune-off.
-#   * EARLY TERMINATION — tuned split 0 DID breach, climbed exactly one rung, and stopped at a
-#     4.48% residual that was still 17 SE of real damage.
-# Residual OOB gap predicts test damage near-linearly on that dataset (~0.0015 log-loss per 1% of
-# residual gap), so the stopping rule is as load-bearing as the trigger and both must move.
-# The bar is therefore `min(tol, max(tol_floor, z_dn * gap_se))`:
-#   * `min(tol, .)` — the recalibration can only TIGHTEN. Where the jury is blunt (ohlsson_pp's
-#     9.56% SE on a zero-inflated compound target — the measurement that killed the upward bar)
-#     `z_dn * gap_se` is far above `tol`, the min() pins the bar back at 5%, and the fit is
-#     bit-identical. This is what keeps the av37 verdict intact: the downward knob CANNOT raise a
-#     bar the upward knob was shipped off for failing to raise.
-#   * `max(tol_floor, .)` — a floor under the tightening, so an arbitrarily sharp jury cannot
-#     drive the bar to zero and re-admit the whole bank on immeasurable noise. 0.5% sits ~2 SE
-#     above homesite's own gap_se, i.e. right where the tightening saturates for the dataset that
-#     motivated it.
-# Measured on homesite at the equivalent fixed `prune_guard_tol = 0.02`: 85-92% of the prune-off
-# gain recovered on the bad cells, bit-identical on the good ones (their ladders already terminate
-# at a 0.55% residual, well inside 2%). `prune_guard_z_dn = 0.0` restores av37/av38 byte-for-byte.
 #
 # `_PRUNE_BOX_BUDGET_DEFAULT = 0` — SHIPPED OFF, exactly as the depth and order lifts shipped
 # their knobs off. The budget is a readability contract whose right value is a product call per
@@ -758,11 +707,10 @@ _PRUNE_MIN_MEAN_GAIN_DEFAULT = 0.0
 # purified variance, admit them in that order subject to heredity (a k-way table only once all its
 # (k-1)-way subsets are in), score heredity-closed prefixes on the soup's out-of-bag jury in ONE pass,
 # and deploy the prefix with the lowest out-of-bag deviance. No prune-CV refits, no stability vote,
-# no evidence gate/keep budget, no guard. Measured on 35 arena datasets (one split each, the arena's
-# tuned hp, real deploys): pairs -27%, >=3-way tables -72%, mean test deviance +0.016%, median
-# -0.011%, vs the fold vote + guard. The old guard existed because tables judged one at a time miss
-# jointly-important sets and could only be rescued in all-or-nothing chunks (catelematic13: 930 kept,
-# 7,554 re-admitted). "fold_vote" is the previous selector, kept for ablation.
+# no evidence gate/keep budget. Measured on 35 arena datasets (one split each, the arena's tuned hp,
+# real deploys): pairs -27%, >=3-way tables -72%, mean test deviance +0.016%, median -0.011%, vs the
+# fold vote and its set-level guard (the guard was removed on 2026-10-14). "fold_vote" is the
+# previous selector, kept for ablation and as the fallback when there is no out-of-bag jury.
 _PRUNE_SELECTOR_DEFAULT = "ranked_path"
 _PRUNE_PATH_STEPS_DEFAULT = 32
 # Stop at the smallest prefix capturing this fraction of the out-of-bag improvement the path offers
@@ -781,9 +729,13 @@ _PRUNE_PATH_TOLERANCE_DEFAULT = 0.001
 # VehGas pair on freMTPL2 because the VehGas main was 0.085%). 0 = off, so existing fits are
 # unchanged.
 _PRUNE_MIN_VARIANCE_SHARE_DEFAULT = 0.0
+# Why graduation can be declined: the native check keeps the smoothed tables only if they raise
+# the training deviance by at most 1% (`_graduate_table_model`).
+_GRADUATION_REJECTED = ("the smoothed tables raised the training deviance by more than 1%, so "
+                        "every table was kept as fitted")
 # Which knobs each keep-set selector reads, for `binding_report_`. The ranked path reads only its
-# own three. The fold vote reads the others: its CV and vote, the evidence gate, the walk's size
-# prices, the guard and the slope re-anchor, plus the K>=3 selection fits, legacy split and guard.
+# own four. The fold vote reads the others: its CV and vote, the evidence gate and the walk's size
+# prices, plus the K>=3 selection fits and legacy split.
 # Every other `prune_*` knob (`prune_main_effects`, `prune_guard_min_rows`, `prune_rebalance` and
 # the deployed budgets) is read by both. `multiclass_prune_cv` is left out: on grouped rows it also
 # picks the K>=3 deploy fit's early-stopping carve, so it is not inert on the path.
@@ -794,9 +746,7 @@ _FOLD_VOTE_KNOBS = (
     "prune_n_folds", "prune_fold_min_rows", "prune_fold_es_patience", "prune_validation_fraction",
     "prune_min_stability", "prune_min_mean_gain", "prune_drop_z", "prune_keep_budget",
     "prune_fold_fidelity", "prune_se_rule", "prune_lambda_boxes", "prune_lambda_tables",
-    "prune_size_penalty", "prune_guard", "prune_guard_tol", "prune_guard_z", "prune_guard_z_dn",
-    "prune_guard_tol_floor", "prune_slope_eps", "prune_slope_min_z", "multiclass_prune_sel_bags",
-    "multiclass_prune_guard", "multiclass_prune_guard_floor",
+    "prune_size_penalty", "multiclass_prune_sel_bags",
 )
 # `pruning_report_["selector"]` of a fold-vote fit: the single-output aggregator, then the K>=3
 # CV vote and its legacy single-split walk.
@@ -811,59 +761,34 @@ _FOLD_VOTE_SELECTORS = ("heldout_contribution_stability", "cv_fold_vote", "singl
 # `prune_path_fraction` is measured against that rather than the mains-only model. That loosens it
 # (`prune_path_tolerance` binds more often), so the deployed interactions can differ too.
 # The fold vote judges mains with the interactions' keep rule and its downward closure brings back
-# the mains of kept interactions; the guard ladders re-admit a dropped main ahead of the first
-# interaction that needs it.
+# the mains of kept interactions.
 _PRUNE_MAIN_EFFECTS_DEFAULT = False
 # Banding (2026-09-26): after the prune, every interaction table becomes a small product grid of
 # bands whose change to predictions is held within (tolerance * sigma)^2, sigma = the soup's bag
 # noise (see `t_boost_core::banding`). 0.75 measured (arena, 31 datasets): 3-way cells 274M -> 84k,
 # largest 3-way 10.8k cells, pooled test deviance +0.015%. None = no banding.
 _BAND_TOLERANCE_DEFAULT: float | None = 0.75
-# ...and never more than this fraction of the model's own training deviance (the curvature-weighted
-# squared move is the second-order estimate of the deviance it costs). The noise tolerance alone
-# lets a very noisy model move a long way systematically; this caps what that can cost. 0.001 = 0.1%.
+# ...and never more than this fraction of the model's own training deviance, as an estimated
+# EXPECTED cost: the curvature-weighted squared move Σ h δ² / Σ w is the deviance the move would add
+# if the unbanded tables were exactly right, and banding holds its cross-fitted estimate (bands fitted
+# on one half of the rows, the move measured on the other) within the cap. The noise tolerance alone
+# lets a very noisy model move a long way systematically; this caps the move, and alone bounds a
+# one-bag fit. 0.001 = 0.1%. New rows can exceed the estimate at tight caps (1.35x on fresh rows at
+# 0.00025; within it at the default). It does not cap the realized TRAINING rise (2026-10-14): that
+# adds the first-order term 2 Σ g δ / Σ w, positive on the training rows because the bagged, shrunk
+# tables sit short of each cell's training optimum and banding moves them further, and of either
+# sign on test rows. Where the cap binds alone the rise was 0-5.9x the cap (single-output, one bag)
+# and up to 6.6x (multiclass). Single-output: calibrating the budget to the realized rise, dropping
+# the cap and a 16x range of cap levels all measured within split noise. Multiclass: the cap is
+# shared between classes and binds at 8 bags on fr_instal, where dropping it cost +0.10% test
+# deviance and a 4x tighter cap gained 0.25-0.31%; the multiclass strength is an open decision
+# (specs/roadmap/post-fit-stages.md, PF-06).
 _BAND_DEVIANCE_CAP_DEFAULT = 0.001
-_PRUNE_GUARD_Z_DEFAULT = 0.0
-_PRUNE_GUARD_Z_DN_DEFAULT = 2.0
-_PRUNE_GUARD_TOL_FLOOR_DEFAULT = 0.005
-# K>=3 guard floor (2026-09-07): 0.2% of the honest `dev_null - dev_full` deviance improvement.
-# On the InsurArena multiclass panels this is 0.0001-0.0013 in log-loss units — below the paired
-# 2-SE term wherever the evidence is coarse (pg16, prudential) and just above it where the carve
-# is sharp (fremotor), where it buys a 30-40% smaller bank for ~0.0002 skill.
-_MULTICLASS_GUARD_FLOOR_DEFAULT = 0.002
 
 
-def _guard_tol_effective(
-    tol: float, gap_se: float, z_up: float, z_dn: float, tol_floor: float
-) -> float:
-    """The bar the set-level prune guard actually uses — trigger AND ladder stopping rule.
-
-    Two SE-aware corrections to the fixed relative tolerance `tol`, in this order:
-
-    * UPWARD (`z_up` = `prune_guard_z`, av37, shipped OFF at 0.0): `max(tol, z_up * gap_se)` —
-      only re-admit on a statistically real gap. Falsified; see `_PRUNE_GUARD_Z_DEFAULT`.
-    * DOWNWARD (`z_dn` = `prune_guard_z_dn`, av39): `min(tol, max(tol_floor, z_dn * gap_se))` —
-      where the jury is sharp, do not license 20 SE of measurable damage. See
-      `_PRUNE_GUARD_Z_DN_DEFAULT`.
-
-    Each correction is skipped when its multiplier is 0 or `gap_se` is not finite, so
-    `z_up = z_dn = 0` returns `tol` unchanged and reproduces the pre-av39 guard exactly. The
-    downward step is applied to the upward step's OUTPUT, so the two are composable and neither
-    silently disables the other: with both armed the bar is
-    `min(max(tol, z_up*se), max(tol_floor, z_dn*se))` clipped from below by nothing else.
-    """
-    tol_eff = float(tol)
-    finite = bool(np.isfinite(gap_se))
-    if float(z_up) > 0.0 and finite:
-        tol_eff = max(tol_eff, float(z_up) * float(gap_se))
-    if float(z_dn) > 0.0 and finite:
-        tol_eff = min(tol_eff, max(float(tol_floor), float(z_dn) * float(gap_se)))
-    return float(tol_eff)
-
-
-def _guard_mu(obj: str, raw: "np.ndarray") -> "np.ndarray":
-    """Response-scale mean for link-scale `raw` — the guard's inverse link, matching the
-    native losses (log for poisson/gamma/tweedie, logit for logistic, identity otherwise)."""
+def _response_mean(obj: str, raw: "np.ndarray") -> "np.ndarray":
+    """Response-scale mean for link-scale `raw`, matching the native losses (log for
+    poisson/gamma/tweedie, logit for logistic, identity otherwise)."""
     raw = np.asarray(raw, dtype=np.float64)
     mu: np.ndarray
     if obj in {"poisson", "gamma", "tweedie"}:
@@ -934,35 +859,11 @@ def _heredity_sequence(mains: list[Any], inter: list[Any]) -> list[Any]:
     return seq
 
 
-def _mains_before_their_interactions(ranked: list[Any]) -> list[Any]:
-    """`ranked` with each main effect in it moved to just before the first interaction in it that
-    contains that feature (or left where it is if it already comes first), so a re-admission
-    ladder cut from it never re-admits an interaction without its main effects. The identity when
-    `ranked` holds no main effect, which is every ladder over sticky mains. Mirrors the native
-    guard ladder's `mains_before_their_interactions`."""
-    mains = {u[0]: u for u in ranked if len(u) == 1}
-    if not mains:
-        return ranked
-    placed: set[Any] = set()
-    out: list[Any] = []
-    for u in ranked:
-        if len(u) > 1:
-            for i in u:
-                main = mains.get(i)
-                if main is not None and main not in placed:
-                    placed.add(main)
-                    out.append(main)
-        if u not in placed:
-            placed.add(u)
-            out.append(u)
-    return out
-
-
 def _band_curvature(
     obj: str, raw: "np.ndarray", w: "np.ndarray", tweedie_rho: float | None
 ) -> "np.ndarray":
     """Expected loss curvature per row in the link (`raw`, offset included) — the banding weights."""
-    mu = _guard_mu(obj, raw)
+    mu = _response_mean(obj, raw)
     h: np.ndarray
     if obj == "poisson":
         h = w * mu
@@ -976,295 +877,15 @@ def _band_curvature(
     return h
 
 
-def _guard_reanchor(
-    obj: str, raw: "np.ndarray", y: "np.ndarray", w: "np.ndarray", enabled: bool
-) -> "np.ndarray":
-    """Apply the DEPLOY re-anchor to a raw-bank score before the guard measures it.
-
-    `apply_keepset` balances the shipped bank's response total: a closed-form log-link
-    shift, a logit bisection, or an identity-link mean correction. The per-bag banks
-    the out-of-bag evidence sums have NOT had that shift, and the shift is NOT second-order:
-    purification centres each table under the REFERENCE measure (Laplace-smoothed product of
-    marginals), not the empirical one, so dropping a large share of the tables moves the
-    empirical level materially. Measured on allstate_sev split 0 — 76% of tables dropped — the
-    guard saw a +15.8% gap of which ~13.1 points was this missing shift alone, firing where the
-    artifact-scoring av33 guard correctly stayed silent at +3.9%.
-
-    Each arm gets its OWN one-parameter shift on the SAME rows, so this can only remove a level
-    artifact common to the comparison — it cannot manufacture a difference between the arms.
-    `enabled=False` (the estimator's resolved `reanchor`) returns `raw` untouched, matching a
-    deploy that does not re-anchor either.
-    """
-    raw = np.asarray(raw, dtype=np.float64)
-    if not enabled:
-        return raw
-    y = np.asarray(y, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    sum_wy = float((w * y).sum())
-    sum_w = float(w.sum())
-    if obj == "logistic":
-        if not 0.0 < sum_wy < sum_w:
-            raise ValueError("logit reanchor requires positives strictly inside (0, total weight)")
-        lo, hi = -60.0, 60.0
-        for _ in range(96):
-            mid = 0.5 * (lo + hi)
-            if float(np.dot(w, _guard_mu(obj, raw + mid))) < sum_wy:
-                lo = mid
-            else:
-                hi = mid
-        return raw + 0.5 * (lo + hi)
-    sum_wmu = float((w * _guard_mu(obj, raw)).sum())
-    if obj not in {"poisson", "gamma", "tweedie"}:
-        return raw + (sum_wy - sum_wmu) / sum_w if sum_w > 0.0 else raw
-    if sum_wmu > 0.0 and sum_wy > 0.0:
-        return raw + math.log(sum_wy / sum_wmu)
-    return raw
-
-
-# --- Post-prune OOB slope re-anchor (2026-08-22) -----------------------------------------
-# Log-link objectives only. `apply_keepset` re-solves the deployed bank's INTERCEPT but never
-# its SCALE, and dropping ~76% of the tables compresses the link-scale risk spread by ~10%
-# (measured on allstate_sev: sd(log mu) pruned/unpruned = 0.904-0.914). Under gamma the
-# flattened score over-predicts the low-severity rows and the deviance punishes that
-# asymmetrically — test-y decile 0 alone carries 93-132% of the whole prune cost.
-#
-# `|b - 1|` epsilon below which the correction is declared a no-op and the artifact is left
-# BYTE-IDENTICAL. This is the MATERIALITY gate — "is the rescale big enough to bother with" —
-# and it is deliberately not the one carrying the safety argument (see `_SLOPE_MIN_Z`). It
-# earns its keep at the two ends the z gate cannot reach: a guard that grew the keep-set back
-# to the full bank makes the correction an exact algebraic identity (allstate_sev split 3
-# measures b = 1.0000 on a 10,307-table bank), and a fit big enough to make a 0.3% wobble
-# "significant" should still not be rewritten for 0.3%.
-_SLOPE_EPS = 0.01
-# ...and the statistical gate, which is the one that actually decides. `|b - 1|` says the score
-# LOOKS mis-scaled; `z = |b - 1| / se(b)` says whether that is distinguishable from the sampling
-# noise of a thin out-of-bag jury. The paired 7-dataset / 45-split battery (2026-08-22) puts an
-# EMPTY BAND between the two populations:
-#
-#   z = 3.87 - 22.3   7 allstate_sev splits, sd ratio 0.90-0.97, b 1.016-1.098.
-#                     Every one a test-skill GAIN, worst +0.00092, mean +0.0066.
-#   z = 0.00 -  1.83  the other 38 splits, across 6 datasets. Firing on these only ever
-#                     cost skill: freclaimdam -0.0047, ohlsson_pp -0.0398, beMTPL16 -0.0006.
-#
-# `|b - 1|` alone does NOT separate them — the harmful population fits b up to 1.12 — which is
-# why the epsilon above cannot be the safety gate. 3.0 is the middle of the gap, not a tuned
-# value; anything in 2..3.8 selects the identical 7 splits. The low end is held down by a
-# separate probe: a correctly-fitted BINOMIAL slope on homesite_conv (not shipped, see
-# `_SLOPE_OBJECTIVES`) reached z = 2.50 while costing -0.0135, so 2.0 would not have been safe
-# had logistic ever been admitted.
-_SLOPE_MIN_Z = 3.0
-# Objectives the correction is defined for: the LOG-LINK family, where the prune-induced
-# compression was measured and where `a + b*F` is a rescale of a multiplicative risk score.
-#
-# `logistic` is absent ON EVIDENCE, not merely for want of it. An affine rescale of a logit is
-# principled in the abstract — it is exactly Platt scaling — so homesite_conv (261k rows, the
-# battery's classifier) was probed with a correctly-fitted BINOMIAL IRLS and the same
-# b_keep/b_full ratio. It HARMS: split 0 fits b = 1.030 and costs -0.0135 test skill, split 1
-# b = 0.991 for -0.0014. That is the expected shape — the mechanism is gamma's asymmetric y/mu
-# penalty on a compressed score, and a symmetric logit deviance has no such exposure — but it is
-# now measured rather than assumed. Widening this set means bringing that link's own IRLS too;
-# `_slope_variance_power` raises rather than let a log-link solve answer for a logit.
-_SLOPE_OBJECTIVES = frozenset({"poisson", "gamma", "tweedie"})
-# IRLS budget. Started at the shipped score (see `_fit_link_slope`), the 2-parameter log-link
-# GLM below converges in a handful of Newton steps on every battery cell; the cap only bounds a
-# pathological input, and the best-iterate tracking makes an overshoot harmless anyway.
-_SLOPE_MAX_ITER = 50
-# Rows scored on both banks to verify the fold before it is adopted (see
-# `_slope_reanchor_post_prune`). A strided sample of the fit design — enough to catch any
-# value-carrying field the fold missed, cheap enough to be invisible next to the fit.
-_SLOPE_VERIFY_ROWS = 4096
-
-
-def _slope_variance_power(obj: str, tweedie_rho: float | None) -> float:
-    """The GLM variance function's power `p` in `V(mu) = mu^p` for a log-link objective.
-
-    Raises for anything else. The solve below is log-link ALL THE WAY DOWN (`mu = exp(eta)`,
-    working response `eta + (y - mu)/mu`), so handing it a logit — or an identity link — does
-    not merely lose accuracy, it silently converges to the identity and reports "no correction
-    needed" for a score that genuinely needs one. Verified: on a logit compressed by a true
-    factor of 1.3 the log-link solve returns exactly `b = 1`. That failure is invisible in the
-    report, so it is made loud here instead: extending `_SLOPE_OBJECTIVES` to a new link must
-    force the author to supply that link's IRLS, not inherit a wrong one.
-    """
-    if obj == "poisson":
-        return 1.0
-    if obj == "gamma":
-        return 2.0
-    if obj == "tweedie":
-        return float(tweedie_rho if tweedie_rho is not None else 1.5)
-    raise ValueError(
-        f"the post-prune slope solve is log-link only; objective {obj!r} needs its own IRLS "
-        "(a logit would be Platt scaling, with its own working weights)"
-    )
-
-
-def _fit_link_slope(
-    obj: str, raw: "np.ndarray", y: "np.ndarray", w: "np.ndarray", tweedie_rho: float | None
-) -> "tuple[float, float, float]":
-    """Deviance-minimizing `(a, b)` for `eta = a + b * raw` under the objective's own GLM.
-
-    This is the canonical one-covariate log-link GLM fit — Fisher scoring (IRLS) on the 2-column
-    design `[1, raw]`, which for the log link is exactly Newton on the deviance — NOT a
-    least-squares fit of `log y` on `raw`. The distinction matters: the objective's variance
-    function is what makes the correction deviance-optimal for the loss the model is scored on,
-    and on gamma the two disagree materially (an OLS slope is pulled by the small-`y` tail that
-    the gamma weighting deliberately discounts).
-
-    `w` is the exposure-weight the guard measures on (the guard runs only when there is no
-    native exposure offset, so exposure lives in `w` and the fit is exposure-weighted exactly as
-    the objective demands). `raw` is centered before the solve purely for conditioning; the
-    returned pair is on the original scale.
-
-    Returns `(a, b, se_b)`, where `se_b` is the slope's GLM standard error (see below) — the
-    scale against which `|b - 1|` has to be judged. Returns `(0.0, 1.0, inf)` — the exact
-    identity, with no evidence — for any input that is degenerate or that fails to produce a
-    finite improving step, so a caller that folds it in is always a no-op.
-    """
-    raw = np.asarray(raw, dtype=np.float64)
-    y = np.asarray(y, dtype=np.float64)
-    w = np.asarray(w, dtype=np.float64)
-    ok = np.isfinite(raw) & np.isfinite(y) & np.isfinite(w) & (w > 0.0)
-    if ok.sum() < 2:
-        return (0.0, 1.0, float("inf"))
-    raw, y, w = raw[ok], y[ok], w[ok]
-    sw = float(w.sum())
-    if not (sw > 0.0):
-        return (0.0, 1.0, float("inf"))
-    # Center for conditioning: solve in `t = raw - m`, then shift the intercept back.
-    m = float(np.dot(w, raw) / sw)
-    t = raw - m
-    if not np.isfinite(m) or float(np.dot(w, t * t)) <= 0.0:
-        return (0.0, 1.0, float("inf"))  # a constant score has no slope to fit
-    p = _slope_variance_power(obj, tweedie_rho)
-    # Start AT the shipped artifact: in the centered parametrisation `eta = a + b*t` with
-    # `t = raw - m`, the identity `eta = raw` is `(a, b) = (m, 1)` — NOT `(0, 1)`, which would
-    # start the solve at a score deflated by `e^-m` (a factor of ~3000 on a severity bank) and
-    # let gamma's IRLS oscillate between the two exp clips instead of converging.
-    a, b = m, 1.0
-    best = (m, 1.0)
-    best_dev = _guard_mean_deviance(obj, y, a + b * t, w, tweedie_rho)
-    for _ in range(_SLOPE_MAX_ITER):
-        eta = a + b * t
-        mu = np.exp(np.clip(eta, -30.0, 30.0))
-        # Fisher weights `w * mu^(2-p)` and working response `eta + (y - mu)/mu`: the standard
-        # log-link IRLS for `V(mu) = mu^p`, which covers poisson (p=1), gamma (p=2) and
-        # tweedie (p=rho) in one expression.
-        ww = w * np.power(mu, 2.0 - p)
-        z = eta + (y - mu) / mu
-        if not (np.isfinite(ww).all() and np.isfinite(z).all()):
-            break
-        s0 = float(ww.sum())
-        s1 = float(np.dot(ww, t))
-        s2 = float(np.dot(ww, t * t))
-        r0 = float(np.dot(ww, z))
-        r1 = float(np.dot(ww, z * t))
-        det = s0 * s2 - s1 * s1
-        if not np.isfinite(det) or det <= 0.0:
-            break
-        a_new = (s2 * r0 - s1 * r1) / det
-        b_new = (s0 * r1 - s1 * r0) / det
-        if not (np.isfinite(a_new) and np.isfinite(b_new)):
-            break
-        step = max(abs(a_new - a), abs(b_new - b))
-        a, b = a_new, b_new
-        # Keep the best iterate by the objective's OWN deviance rather than trusting the last
-        # one. Fisher scoring on a well-posed 2-parameter problem converges monotonically here,
-        # but this makes the helper total: any oscillation or overshoot degrades to the best
-        # step actually seen, and a solve that never improves returns the exact identity.
-        dev_now = _guard_mean_deviance(obj, y, a + b * t, w, tweedie_rho)
-        if np.isfinite(dev_now) and dev_now < best_dev:
-            best_dev, best = dev_now, (a, b)
-        if step < 1e-12:
-            break
-    a, b = best
-    # Undo the centering: `a + b*(raw - m)` == `(a - b*m) + b*raw`.
-    a_out = a - b * m
-    if not (np.isfinite(a_out) and np.isfinite(b) and b > 0.0):
-        return (0.0, 1.0, float("inf"))
-    # --- standard error of the slope, at the solution -------------------------------------
-    # The textbook GLM result: `Var(beta) = phi * (X'WX)^-1`, so the slope's variance is
-    # `phi * s0/det` on the centered design. `phi` is estimated by the Pearson statistic over
-    # residual df rather than assumed 1 — poisson counts here are routinely over-dispersed, and
-    # gamma/tweedie have a free dispersion by construction. Centering is what makes this the
-    # variance of the SLOPE alone, uncorrelated with the level.
-    #
-    # It is the honest gate: `|b - 1|` says the score looks mis-scaled, `se` says whether that
-    # is distinguishable from the sampling noise of a thin out-of-bag jury on a small portfolio.
-    # A row-count floor is a crude proxy for the same thing; this is the quantity itself.
-    eta = a + b * t
-    mu = np.exp(np.clip(eta, -30.0, 30.0))
-    ww = w * np.power(mu, 2.0 - p)
-    s0 = float(ww.sum())
-    s1 = float(np.dot(ww, t))
-    s2 = float(np.dot(ww, t * t))
-    det = s0 * s2 - s1 * s1
-    n_eff = float(raw.size)
-    if not (np.isfinite(det) and det > 0.0 and n_eff > 2.0):
-        return (float(a_out), float(b), float("inf"))
-    pearson = float(np.sum(w * (y - mu) ** 2 / np.power(mu, p)))
-    phi = pearson / (n_eff - 2.0)
-    var_b = phi * s0 / det
-    se_b = math.sqrt(var_b) if np.isfinite(var_b) and var_b > 0.0 else float("inf")
-    return (float(a_out), float(b), float(se_b))
-
-
-def _scale_tensor_json(tensor: "dict[str, Any]", mult: float) -> None:
-    """Multiply a serialized `Tensor`'s cells in place. Handles both `TensorData` variants."""
-    data = tensor.get("data")
-    if not isinstance(data, dict):
-        return
-    if "Dense" in data:
-        data["Dense"] = [float(v) * mult for v in data["Dense"]]
-    elif "Sparse" in data:
-        for entry in data["Sparse"]:
-            entry["value"] = float(entry["value"]) * mult
-
-
-def _fold_slope_into_bank_json(doc: "dict[str, Any]", a: float, b: float) -> None:
-    """Fold `F -> a + b*F` into a serialized TableModel, in place.
-
-    The score is `f0 + Σ_u f_u(x)`, so an affine transform of it is EXACTLY representable in the
-    artifact's own algebra: `a + b*(f0 + Σ f_u) = (a + b*f0) + Σ (b * f_u)`. Table structure,
-    count, supports, axes and grids are untouched — only cell VALUES and the intercept move, so
-    the deployed bank stays the same fANOVA decomposition with the same tables.
-
-    Purification survives multiplication exactly: purity is the statement that every axis-slice
-    of every table has `w`-weighted mean zero, and `Σ w·(b·v) = b·Σ w·v = 0` for any `b`. Mass
-    conservation likewise re-centers on the scaled intercept. The cached second moments are the
-    only things that do NOT ride along for free — `variance` is `σ²(f_u)`, which scales by `b²`,
-    and the display-only `se_band` is a link-scale standard error, which scales by `|b|` — so
-    both are rewritten here rather than left stale (a stale `variance` keeps Sobol SHARES right,
-    since every table is off by the same factor, but reports the absolute figure wrong and would
-    break the I2 variance-sum identity).
-    """
-    bank = doc["model"]["bank"]
-    bank["f0"] = a + b * float(bank["f0"])
-    for tab in bank.get("tables") or []:
-        _scale_tensor_json(tab["values"], b)
-        tab["variance"] = float(tab["variance"]) * b * b
-        se = tab.get("se_band")
-        if isinstance(se, dict) and isinstance(se.get("per_cell"), dict):
-            _scale_tensor_json(se["per_cell"], abs(b))
-        # `support` is per-cell training mass, not a link-scale value — deliberately untouched.
-    for fac in bank.get("factored") or []:
-        # Over-budget order-3 effects in per-tree box form. Each box's 8 purified octant values
-        # are link-scale contributions and scale like any other cell; `per_axis_w` is a
-        # normalized cell measure (Σ = 1) and `low` is a routing mask — neither is scaled.
-        for box in fac.get("boxes") or []:
-            box["p"] = [float(v) * b for v in box["p"]]
-        fac["variance"] = float(fac["variance"]) * b * b
-
-
-def _guard_unit_deviance(
+def _unit_deviance(
     obj: str, y: "np.ndarray", raw: "np.ndarray", w: "np.ndarray", tweedie_rho: float | None
 ) -> "np.ndarray":
-    """PER-ROW unit deviance of link-scale predictions `raw` — the array `_guard_mean_deviance`
-    reduces. Split out so the guard can measure the SPREAD of its own evidence, not only its
-    mean (see `_guard_gap_se`)."""
+    """PER-ROW unit deviance of link-scale predictions `raw`: the array `_mean_deviance`
+    reduces."""
     y = np.asarray(y, dtype=np.float64)
     w = np.asarray(w, dtype=np.float64)
     raw = np.asarray(raw, dtype=np.float64)
-    mu = _guard_mu(obj, raw)
+    mu = _response_mean(obj, raw)
     if obj == "poisson":
         ylogy = np.where(y > 0, y * np.log(np.where(y > 0, y, 1.0) / mu), 0.0)
         dev = 2.0 * (ylogy - (y - mu))
@@ -1287,67 +908,20 @@ def _guard_unit_deviance(
     return np.asarray(dev, dtype=np.float64)
 
 
-def _guard_mean_deviance(
+def _mean_deviance(
     obj: str, y: "np.ndarray", raw: "np.ndarray", w: "np.ndarray", tweedie_rho: float | None
 ) -> float:
-    """Weighted mean unit deviance of link-scale predictions `raw` — the prune guard's metric.
+    """Weighted mean unit deviance of link-scale predictions `raw`: the ranked path's metric,
+    and the level banding's deviance cap is a fraction of.
 
-    Mirrors the native losses' unit deviance on the response scale (log link for
-    poisson/gamma/tweedie, logit for logistic, identity otherwise). Only the RATIO of two
-    values on the same rows is ever used, so the normalization constant is irrelevant.
+    Each objective's standard unit deviance on the response scale (log link for
+    poisson/gamma/tweedie, logit for logistic, identity otherwise).
     """
     w = np.asarray(w, dtype=np.float64)
-    dev = _guard_unit_deviance(obj, y, raw, w, tweedie_rho)
+    dev = _unit_deviance(obj, y, raw, w, tweedie_rho)
     ws = float(w.sum())
     return float((dev * w).sum() / ws) if ws > 0 else float("nan")
 
-
-def _guard_gap_se(
-    dev_sel: "np.ndarray", dev_full: "np.ndarray", w: "np.ndarray"
-) -> float:
-    """Standard error of the RELATIVE deviance gap `(D_sel - D_full) / D_full`.
-
-    `D_x` is the weighted mean unit deviance the guard compares; both arms are measured on the
-    SAME evidence rows, so the per-row difference is paired and its spread is the sampling noise
-    of the comparison itself — the quantity the fixed 5% relative tolerance has no way to see.
-    Only the NUMERATOR is random here. The test the guard runs is
-    `D_sel - D_full > tol * D_full`, and `D_full` appears on both sides: it is the common scale
-    the comparison is expressed in, not a source of disagreement between the two arms. So the
-    SE is that of the paired per-row DIFFERENCE, divided by the full-bank level —
-    `sd(w_i * (dev_sel_i - dev_full_i)) * sqrt(n) / (sum(w) * D_full)`.
-
-    THIS IS NOT A SIMPLIFICATION, IT IS THE MEASURED FIX. An earlier revision delta-methoded the
-    whole ratio, carrying the LEVEL's variance (`r^2 * Var(D_full)`) into the bar. On a
-    heavy-tailed objective that term is the tail of the deviance itself and it swamps everything:
-    ohlsson_pp (tweedie pure premium, 34,626 evidence rows) split 6 measured a +10.1% selected-
-    vs-full gap — a real detonation the av36 guard caught, re-admitting 13 tables to 38 — against
-    a ratio-SE of 7.5%, so a z=3 bar sat at 22.5% and stayed SILENT. That split's test skill went
-    from -0.128 to -1.799. The paired difference carries no such tail: the two arms differ only
-    by the dropped tables' per-row contributions.
-
-    ONE HONEST CAVEAT, recorded rather than corrected: on the out-of-bag path the rows are not
-    independent draws — each row's score is a mean over the ~1.9 bags that never drew it, and
-    neighbouring rows share bags. Ignoring that correlation UNDERSTATES this SE, i.e. errs
-    toward the guard still firing, which is the safe direction for a no-harm guard. Returns
-    `inf` when there is nothing to measure (fewer than two rows, or a non-positive full-bank
-    deviance), which makes the caller fall back to the fixed tolerance alone.
-    """
-    w = np.asarray(w, dtype=np.float64)
-    n = int(w.size)
-    sw = float(w.sum())
-    if n < 2 or not (sw > 0.0):
-        return float("inf")
-    d = w * (np.asarray(dev_sel, float) - np.asarray(dev_full, float))
-    lvl = float((w * np.asarray(dev_full, float)).sum() / sw)
-    if not (np.isfinite(lvl) and lvl > 0.0):
-        return float("inf")
-    sd = float(np.std(d, ddof=1))
-    if not np.isfinite(sd):
-        return float("inf")
-    # sum(d) / sum(w) is the absolute gap; its SE is sd(d) * sqrt(n) / sum(w).
-    se_abs = sd * math.sqrt(n) / sw
-    se_rel = se_abs / lvl
-    return float(se_rel) if np.isfinite(se_rel) else float("inf")
 
 # ES patience for the prune-CV FOLD fits only (deploy fits keep the estimator's own
 # early_stopping_rounds). Promoted from a study hook to the default 2026-07-16: fold fits are
@@ -2297,18 +1871,11 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_rebalance: bool = True,
         ref_measure: str | None = None,
         measure_floor: float = _MEASURE_FLOOR_DEFAULT,
-        prune_guard: bool = True,
-        prune_guard_tol: float = 0.05,
         prune_drop_z: float | None = _PRUNE_DROP_Z_DEFAULT,
         prune_keep_budget: int = _PRUNE_KEEP_BUDGET_DEFAULT,
         prune_fold_fidelity: bool = _PRUNE_FOLD_FIDELITY_DEFAULT,
-        prune_guard_z: float = _PRUNE_GUARD_Z_DEFAULT,
-        prune_guard_z_dn: float = _PRUNE_GUARD_Z_DN_DEFAULT,
-        prune_guard_tol_floor: float = _PRUNE_GUARD_TOL_FLOOR_DEFAULT,
-        multiclass_prune_guard: bool = True,
         multiclass_prune_sel_bags: int = 1,
         multiclass_prune_cv: bool = True,
-        multiclass_prune_guard_floor: float = _MULTICLASS_GUARD_FLOOR_DEFAULT,
         prune_box_budget: int = _PRUNE_BOX_BUDGET_DEFAULT,
         prune_lambda_boxes: float = _PRUNE_LAMBDA_BOXES_DEFAULT,
         prune_table_budget: int = _PRUNE_TABLE_BUDGET_DEFAULT,
@@ -2327,8 +1894,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         prune_fold_min_rows: int = _MIN_PRUNE_FOLD_ROWS,
         prune_fold_es_patience: int | None = None,
         prune_guard_min_rows: int = _PRUNE_GUARD_MIN_ROWS,
-        prune_slope_eps: float = _SLOPE_EPS,
-        prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
         unknown_category: str = "rare",
@@ -2470,26 +2035,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.prune_rebalance = prune_rebalance
         self.ref_measure = ref_measure
         self.measure_floor = measure_floor
-        # SET-LEVEL prune no-harm guard (2026-08-04). The keep-set is chosen from per-table
-        # leave-one-out held-out gains, which are structurally blind to mass carried JOINTLY by
-        # correlated tables (each table's marginal drop-gain is ~0 when siblings absorb it; the
-        # set's joint value is not the sum of marginals). Measured failures: allstate_sev fold-CV
-        # selections detonating +23% test deviance on some splits while a keep-set from another
-        # split scored normally, and the av32 mean+count collapsed-channel pair being dropped
-        # together on homesite_conv (+7.7%). The guard compares the DEPLOYED selected bank against
-        # the full bank on honest rows — each bag's own OUT-OF-BAG rows for an ungrouped fit
-        # (zero data cost, every size), the shared group-honest ES holdout for a grouped one —
-        # and, on a breach beyond `prune_guard_tol` (relative deviance), re-admits dropped tables
-        # in report-ranked order until the breach clears. Binary table dropping is preserved;
-        # only the keep-set grows. Silent (no breach) ⇒ the deployed model is exactly the
-        # unguarded one, and the FIT is byte-identical to a guard-off fit either way. See the
-        # guard block in `_fit_and_prune` for the evidence design and its caveats.
-        self.prune_guard = prune_guard
-        self.prune_guard_tol = prune_guard_tol
         # --- EVIDENCE-GATED PRUNING (av37) ------------------------------------------------
-        # `prune_drop_z=None` + `prune_guard_z=0.0` reproduce the av36 selection and guard
-        # byte-for-byte; both defaults above turn the gate on. Neither touches the FIT — this
-        # is post-fit selection only, exactly like `prune_guard` itself.
+        # `prune_drop_z=None` reproduces the av36 selection byte-for-byte; the default turns the
+        # gate on. It does not touch the FIT: this is post-fit selection only.
         #
         # `prune_drop_z`: a table with paired per-fold CV evidence is DROPPED only when its mean
         # drop-gain clears this many standard errors of that mean over the prune folds. No
@@ -2501,12 +2049,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # max(prune_keep_budget, the av36 keep-set size) — so a bank that was already larger
         # than the budget is left exactly as av36 chose it, and a small candidate bank (the
         # regime where the fold evidence cannot resolve anything) comes back whole.
-        # `prune_guard_z`: the set-level no-harm guard breaches on
-        # gap > max(prune_guard_tol, prune_guard_z * SE(gap)) rather than on the fixed relative
-        # tolerance alone. SHIPPED AT 0.0 — i.e. the fixed tolerance — because the measurement
-        # refused the idea: the guard's row-level SE on a compound target cannot resolve even a
-        # +10% set-level gap (see the `_PRUNE_GUARD_Z_DEFAULT` note for the ohlsson_pp case that
-        # settles it). `gap_se` and `tol_effective` are still reported on every fit.
         # `prune_box_budget`: the DEPLOYED-BOX budget (av38 readability gate). The av37
         # `prune_keep_budget` counts TABLES, which is the right unit for a dense bank and the
         # wrong one for a factored one — a factored effect deploys one rank-1 region box per
@@ -2524,24 +2066,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # Pin each prune fold's bank to the deploy fit's candidate supports (see
         # `_PRUNE_FOLD_FIDELITY_DEFAULT`). False reproduces every pre-existing fit byte-for-byte.
         self.prune_fold_fidelity = prune_fold_fidelity
-        self.prune_guard_z = prune_guard_z
-        # --- av39 DOWNWARD guard recalibration --------------------------------------------
-        # `prune_guard_z_dn` / `prune_guard_tol_floor` tighten the guard's bar to
-        # min(tol, max(tol_floor, z_dn * SE(gap))) — the same bar for the breach TRIGGER and the
-        # re-admission ladder's stopping rule. Where the jury is sharp the fixed 5% tolerance is
-        # a ~20-SE bar (homesite_conv: SE 0.21%-0.27%) that licenses damage the guard measures
-        # perfectly well; the min() means a blunt jury (ohlsson_pp: SE 9.56%) is pinned back at
-        # `tol` and bit-identical, so this knob can only ever make the guard fire MORE, never
-        # less. `prune_guard_z_dn = 0.0` restores av37/av38 byte-for-byte. See
-        # `_PRUNE_GUARD_Z_DN_DEFAULT` for the forensic that sized it.
-        self.prune_guard_z_dn = prune_guard_z_dn
-        self.prune_guard_tol_floor = prune_guard_tol_floor
-        # The K>=3 analogue of `prune_guard`, on out-of-bag evidence from the deploy soup's
-        # per-class bag banks (`prune::multiclass_prune_guard`). A SEPARATE flag, and OFF by
-        # default, because it is new: `prune_guard`'s default-on state carries the single-output
-        # battery behind it, and flipping this one silently would change every shipped K>=3
-        # artifact. It reuses `prune_guard_tol`. Ignored entirely for K<=2 and regression.
-        self.multiclass_prune_guard = multiclass_prune_guard
         # Bag count of the K>=3 prune's SELECTION fit — the multiclass analogue of the
         # single-output path's `prune_fold_bags`, landing on a different seam because the two
         # prune designs differ. The single-output prune CV fits one model PER FOLD, so fidelity
@@ -2562,17 +2086,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.multiclass_prune_sel_bags = multiclass_prune_sel_bags
         # K>=3 selection regime (2026-09-07). True = the single-output prune's design ported to
         # multiclass: `prune_n_folds` fold refits, each scored on its held-out fold, voted by
-        # `aggregate_prune_selection` with the `prune_drop_z` gate and `prune_keep_budget`, and
-        # the `multiclass_prune_guard` measuring the result with an SE-aware bar. False = the
-        # historical single train/select split walk (`prune_validation_fraction`), which was
+        # `aggregate_prune_selection` with the `prune_drop_z` gate and `prune_keep_budget`. False =
+        # the historical single train/select split walk (`prune_validation_fraction`), which was
         # measured to drop tables on noise (design/multiclass-design.md §9g).
         self.multiclass_prune_cv = multiclass_prune_cv
-        # Floor of the K>=3 guard's bar, as a fraction of the model's honest deviance improvement
-        # over the class prior (`dev_null - dev_full` on the evidence rows). The SE term alone
-        # demands statistical indistinguishability, which on a sharp instrument means near-zero
-        # pruning (fremotor_payfreq 2026-09-07: a 2-SE bar of 0.0001 re-admitted 96% of the
-        # bank); this names the price a simpler model is allowed to pay. 0 = SE term only.
-        self.multiclass_prune_guard_floor = multiclass_prune_guard_floor
         self.prune_box_budget = prune_box_budget
         self.prune_lambda_boxes = prune_lambda_boxes
         self.prune_table_budget = prune_table_budget
@@ -2616,12 +2133,9 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # ES patience for the prune-CV FOLD fits only (deploy fits keep `early_stopping_rounds`).
         # `None` resolves to the shipped 250; an explicit int overrides it.
         self.prune_fold_es_patience = prune_fold_es_patience
-        # Minimum honest evidence rows before the set-level no-harm guard will judge at all.
+        # Minimum out-of-bag rows the ranked path needs to score its prefixes (see
+        # `_PRUNE_GUARD_MIN_ROWS`).
         self.prune_guard_min_rows = prune_guard_min_rows
-        # Post-prune slope re-anchor gates: the dead band on |b-1|, and the significance bar the
-        # correction must clear before it is applied.
-        self.prune_slope_eps = prune_slope_eps
-        self.prune_slope_min_z = prune_slope_min_z
         # --- MERGED SPELLINGS (2026-09-04) -----------------------------------------------------
         # Stored verbatim so `get_params`/`clone` round-trip them, then RESOLVED onto the legacy
         # attributes below. Resolution — not reimplementation — is what makes this free: every
@@ -2901,8 +2415,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             and rep.get("evidence_budget_bound") is False
         )
         # The selector that chose the keep-set. Both gates are fold-vote knobs: when the ranked
-        # path ran instead, or a monotone fit kept the full bank, they are reported below with
-        # the other knobs of the selector that did not run.
+        # path ran instead, they are reported below with the other knobs of the selector that
+        # did not run.
         selector = rep.get("selector")
         fold_vote = selector in _FOLD_VOTE_SELECTORS
         for gate in ("prune_min_stability", "prune_min_mean_gain"):
@@ -2948,9 +2462,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                              if multiclass or not n.startswith("multiclass_")),
                        "the ranked path selected the tables, so the fold vote this knob tunes "
                        "did not run", "prune_selector")
-            if "skipped" in (rep.get("selection") or {}):
-                add_unread(_RANKED_PATH_KNOBS, "the fit had no out-of-bag rows to score the "
-                           "path on, so the full table bank was kept", None)
         elif pruning_on and fold_vote:
             if getattr(self, "prune_selector", None) == "fold_vote":
                 add_unread(_RANKED_PATH_KNOBS, "prune_selector='fold_vote', so the ranked path "
@@ -2959,10 +2470,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 add_unread(_RANKED_PATH_KNOBS, "the ranked path needs out-of-bag rows and this "
                            "fit had none it could use (for example n_bags=1), so the fold vote "
                            "selected the tables", None)
-        elif pruning_on and "constraints" in rep:
-            add_unread(tuple(n for n in defaults if n.startswith("prune_")),
-                       "monotone_constraints keeps the full table bank, so no table selection "
-                       "ran", "monotone_constraints")
 
         # size caps: a cap above the bank never binds (the count is only read when a cap is set)
         for cap, what in (("prune_table_budget", "tables"), ("prune_box_budget", "boxes")):
@@ -2975,23 +2482,25 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 else:
                     add(cap, "HONOURED", f"cap applied to deployed {what}")
 
-        # monotone: disclose WHICH axes each sign was expanded onto (the fix of 2026-09-04 binds
-        # every axis a categorical emits, which is a policy choice the caller should see)
+        # monotone: say how the deployed tables were kept monotone
         mono = getattr(self, "monotone_constraints", None)
         if mono:
-            _fn = getattr(self, "feature_names_in_", None)      # a numpy array; `or []` is ambiguous
-            names = [] if _fn is None else list(_fn)
-            add("monotone_constraints", "HONOURED",
-                f"signs expanded onto every axis of each named feature"
-                + (f"; input features: {names}" if names else ""))
+            if "monotone" in rep:
+                how = ("the trees enforce the signs, and the deployed tables were projected back "
+                       "onto them after the other post-fit stages; see "
+                       "pruning_report_['monotone']")
+            else:
+                how = "the trees enforce the signs; the full table bank is monotone as fitted"
+            add("monotone_constraints", "HONOURED", how)
 
-        # Only when set away from its default, like every other row (the default 0.1 is simply
-        # unused when eval_set supplies the rows; reporting it made every eval_set fit fail
-        # check_bindings).
-        if (getattr(self, "_fit_eval_set_", False) and self.validation_fraction is not None
-                and self.validation_fraction != defaults.get("validation_fraction")):
-            add("validation_fraction", "INERT",
-                "eval_set supplied the early-stopping rows, so no holdout was carved", "eval_set")
+        # A fixed graduation strength the training-deviance check declined: the tables were
+        # deployed as fitted. (Under GCV-chosen strengths a decline is reported, not a binding.)
+        graduation = getattr(self, "graduation_validation_", None) or {}
+        if ("graduation_alpha" in defaults and getattr(self, "graduation_alpha", None) is not None
+                and graduation.get("candidate_count") == 1
+                and graduation.get("adopted") is False):
+            add("graduation_alpha", "INERT",
+                str(graduation.get("rejected") or _GRADUATION_REJECTED))
 
         # deprecated spellings still work, but say so here as well as in the warning
         for old, (new, _why) in self._DEPRECATED.items():
@@ -3016,10 +2525,23 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         whose bank holds 24 tables, which is INERT and entirely harmless. `OVERRIDDEN` is the
         class where another knob is actively cancelling yours, which is never benign and is always
         worth interrupting for. `INERT` stays in `binding_report_` and in `check_bindings()`.
+
+        One INERT row warns too: a `graduation_alpha` the training-deviance check declined. You
+        asked for that smoothing and the deployed tables have none, which is never benign.
         """
         import warnings as _warnings
 
         for row in self.binding_report_:
+            if row["param"] == "graduation_alpha" and row["status"] == "INERT":
+                # Unlike other INERT knobs this is never benign: you asked for this smoothing
+                # strength and the deployed tables have none.
+                _warnings.warn(
+                    f"`graduation_alpha={row['value']!r}` had NO EFFECT on this fit: "
+                    f"{row['reason']}. Use a smaller `graduation_alpha`, or None to let each "
+                    "table choose its own strength. See `graduation_validation_`.",
+                    RuntimeWarning, stacklevel=3,
+                )
+                continue
             if row["status"] != "OVERRIDDEN":
                 continue
             _warnings.warn(
@@ -3186,19 +2708,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         if int(getattr(self, "prune_guard_min_rows", _PRUNE_GUARD_MIN_ROWS)) < 1:
             raise ValueError(
-                "prune_guard_min_rows must be >= 1: it is the honest-evidence-row floor below "
-                "which the set-level no-harm guard declines to judge."
-            )
-        eps = float(getattr(self, "prune_slope_eps", _SLOPE_EPS))
-        if not (math.isfinite(eps) and eps >= 0.0):
-            raise ValueError(
-                f"prune_slope_eps must be a finite value >= 0 (the |b-1| dead band); got {eps!r}."
-            )
-        min_z = float(getattr(self, "prune_slope_min_z", _SLOPE_MIN_Z))
-        if not (math.isfinite(min_z) and min_z >= 0.0):
-            raise ValueError(
-                "prune_slope_min_z must be a finite value >= 0 (the significance bar the slope "
-                f"correction must clear); got {min_z!r}."
+                "prune_guard_min_rows must be >= 1: it is the number of out-of-bag rows below "
+                "which the ranked path does not score its prefixes."
             )
         # Both of these reach only `aggregate_prune_selection`, which the K>=3 path does not
         # use — it selects on one train/select split with no per-fold vote to threshold. Same
@@ -3276,11 +2787,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 "prune_n_folds — set that instead, or leave prune_validation_fraction at its "
                 "default (0.15)."
             )
-        floor = float(getattr(self, "multiclass_prune_guard_floor", _MULTICLASS_GUARD_FLOOR_DEFAULT))
-        if not (math.isfinite(floor) and floor >= 0.0):
-            raise ValueError(
-                f"multiclass_prune_guard_floor must be a finite fraction >= 0 (got {floor!r})."
-            )
         if int(self.multiclass_prune_sel_bags) < 1:
             raise ValueError(
                 f"multiclass_prune_sel_bags must be >= 1 (got "
@@ -3336,6 +2842,30 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 "path. Use ['mean'] or ['mean','count'] here."
             )
 
+    def _validate_high_order_alpha(self) -> None:
+        high_alpha = self.graduation_high_order_alpha
+        if (isinstance(high_alpha, (bool, np.bool_))
+                or not isinstance(high_alpha, (int, float, np.integer, np.floating))
+                or not np.isfinite(high_alpha) or not 0.0 <= high_alpha <= 1.0):
+            raise ValueError("graduation_high_order_alpha must be finite and in [0, 1]")
+        if high_alpha > 0 and self.graduate is False:
+            raise ValueError("graduation_high_order_alpha requires graduation enabled")
+
+    def _validate_band_deviance_cap(self) -> None:
+        """`band_deviance_cap` bounds every banding, and is the only bound with one bag, so it
+        must be finite and above 0 on every path. (0 used to mean "no cap" on the single-output
+        path, where a one-bag fit then skipped banding, and a zero budget on the multiclass path,
+        which left every class bank unbanded at any bag count.)"""
+        cap = getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)
+        if (isinstance(cap, (bool, np.bool_))
+                or not isinstance(cap, (int, float, np.integer, np.floating))
+                or not np.isfinite(cap) or cap <= 0):
+            raise ValueError(
+                f"band_deviance_cap must be finite and > 0, got {cap!r}: it bounds how far "
+                "banding may move the predictions, and is the only bound when n_bags=1 leaves "
+                "no spread between bags; band_tolerance=None turns banding off"
+            )
+
     def _validate_multiclass_inert_params(self) -> None:
         """No silent parameter no-ops: the native multiclass (K>=3) path never applies the
         fully-corrective ridge leaf refit, DART, intercept/slope re-anchoring, or the
@@ -3348,9 +2878,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         value means the caller explicitly asked for something that cannot be honored, so it
         RAISES: there is no ordinary multiclass fit this would break.
 
-        `n_bags`/`bag_subsample` (outer bags souped per class) and
-        `leaf_refine_steps`/`leaf_refine_backtracks` (per-round Jacobi re-linearization with a
-        joint-deviance backtrack) are HONORED for K>=3 as of 2026-07-14,
+        `n_bags`/`bag_subsample` (outer bags souped per class) are HONORED for K>=3 as of
+        2026-07-14 (`leaf_refine_steps` is not: see the note at the end of this method),
         `subsample`/`mvs_min_rows` (§06.5 MVS row sampling) as of 2026-08-23, and
         `cell_refit_base`/`cell_refit_gamma` (the §G1 OOB cell refit, as K decoupled
         diagonal-Hessian cell solves accepted by ONE joint backtrack on the multinomial loss —
@@ -3362,9 +2891,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         Called once, near the top of `_fit_multiclass`, before either the pruned or unpruned
         branch (both are equally affected).
         """
-
-        if self.graduation_high_order_alpha != 0:
-            raise ValueError("higher-order smoothing does not support multiclass (K>=3)")
 
         def _raise(name: str, mechanism: str) -> None:
             raise ValueError(
@@ -3463,6 +2989,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if s not in (-1, 0, 1):
                 raise ValueError(f"monotone sign {s} must be -1, 0, or 1")
         return signs if any(signs) else None
+
+    @staticmethod
+    def _refuse_categorical_monotone(
+        monotone: list[int] | None, cat_idx: list[int], feature_names: list[str] | None
+    ) -> None:
+        """Monotone constraints apply to numeric features only. A categorical has no order of
+        its own (its axis is ordered by a target statistic learned from the data), so a sign on
+        one is refused rather than silently enforced along that learned order."""
+        if monotone is None:
+            return
+        bad = [i for i in cat_idx if monotone[i]]
+        if bad:
+            names = [feature_names[i] if feature_names is not None else f"f{i}" for i in bad]
+            raise ValueError(
+                f"monotone_constraints apply to numeric features only; {names} "
+                f"{'is' if len(names) == 1 else 'are'} categorical. To constrain an ordered "
+                "category, encode it as numbers."
+            )
 
     def _resolve_categorical(
         self, n_features: int, feature_names: list[str] | None
@@ -3763,9 +3307,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         """The purification measure this estimator fits under, as binding keyword arguments.
 
         ``ref_measure=None`` resolves to ``"exposure"`` here, in ONE place, so every binding
-        that builds a bank at fit time (the prune-CV folds, the deploy keep-set, the guard's
-        out-of-bag evidence, the multiclass prune) sees the same explicit name — the binding's
-        own ``None`` default is the legacy ``product_marginals`` and must never be relied on.
+        that builds a bank at fit time (the prune-CV folds, the deploy keep-set, the ranked
+        path's out-of-bag evidence, the multiclass prune) sees the same explicit name — the
+        binding's own ``None`` default is the legacy ``product_marginals`` and must never be
+        relied on.
         """
         name = self.ref_measure if self.ref_measure is not None else "exposure"
         floor = float(self.measure_floor)
@@ -3823,16 +3368,18 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
         eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
         eval_offset: Any | None = None,
-        labels: tuple[str, ...] = ("train", "validation", "test"),
+        labels: tuple[str, ...] | None = None,
         name: str | None = None,
         thresholds: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Return the model report: fit quality, structure, pruning evidence, rating tables,
         A/E by factor level, drift and review flags, as plain JSON (``report_version`` 2).
 
-        ``X``/``y`` are the train data; ``eval_set`` adds the validation data as one ``(X, y)``
-        pair (the ``fit`` convention), or validation and test data as a list of two pairs, with
-        the ``eval_*`` vectors as lists to match. ``labels`` names the datasets in that order.
+        ``X``/``y`` are the train data; ``eval_set`` adds the test data as one ``(X, y)`` pair,
+        or validation and test data as a list of two pairs, with the ``eval_*`` vectors as
+        lists to match. The bags early-stop and prune on rows they hold
+        back, so train and test are the usual pair. ``labels`` names the datasets in that order:
+        ``("train", "test")`` or ``("train", "validation", "test")`` by default.
         Pass aligned weights/exposure/offset explicitly, as for ``actual_vs_expected``. ``thresholds`` overrides the review thresholds
         (``t_boost._report.DEFAULT_THRESHOLDS``; ``None`` disables a check). The report
         describes the supplied data; it is not evidence that those data were held out. Render
@@ -3854,7 +3401,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         eval_set: tuple[Any, Any] | list[tuple[Any, Any]] | None = None,
         eval_sample_weight: Any | None = None, eval_exposure: Any | None = None,
         eval_offset: Any | None = None,
-        labels: tuple[str, ...] = ("train", "validation", "test"),
+        labels: tuple[str, ...] | None = None,
         name: str | None = None,
         thresholds: dict[str, Any] | None = None,
     ) -> str:
@@ -3900,7 +3447,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         disable_cell_refit: bool = False,
         early_stopping_rounds_override: int | None = None,
         fit_pool_width: int | None = None,
-        external_eval: bool = False,
     ) -> _Booster:
         # `n_bags` override lets the v2-prune CV fit cheap single-bag fold models (structure, not
         # variance-reduction, drives table selection) while the deployed model keeps its full bagging.
@@ -3933,10 +3479,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         reanchor_slope = self.reanchor_slope
         if reanchor_slope is None:
             reanchor_slope = obj in {"poisson", "gamma", "tweedie"}
-        if external_eval:
-            # The slope recalibration fits on the stopping holdout, and an `eval_set` must only
-            # score early stopping (an explicit True was refused in `_stage_fit_extras`).
-            reanchor_slope = False
         # path_smooth `None` resolves objective-aware (2026-07-23): heavy-tail gamma/tweedie
         # deviance is dominated by sparse-evidence cell variance, and the parent-shrinkage
         # credibility blend is the zero-cost smoother for exactly that (6-set screen:
@@ -4049,49 +3591,10 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             fit_pool_width=fit_pool_width,
         )
 
-    def _stage_fit_extras(
-        self,
-        eval_set: Any,
-        eval_sample_weight: Any,
-        eval_exposure: Any,
-        callbacks: Any,
-        has_exposure: bool,
-        eval_offset: Any = None,
-        has_offset: bool = False,
-    ) -> None:
-        """Validate and stash the fit's `eval_set` / `callbacks` for the deployed fit. The
-        stash lives only for the duration of `fit` (see `_fit_with_extras`)."""
+    def _stage_fit_extras(self, callbacks: Any) -> None:
+        """Validate and stash the fit's `callbacks` for the deployed fit. The stash lives only
+        for the duration of `fit` (see `_fit_with_extras`)."""
         extras: dict[str, Any] = {}
-        if eval_set is not None:
-            if not isinstance(eval_set, (tuple, list)) or len(eval_set) != 2:
-                raise ValueError("eval_set must be an (X_val, y_val) pair")
-            if self.reanchor_slope is True:
-                raise ValueError(
-                    "reanchor_slope=True cannot be combined with eval_set: the slope "
-                    "recalibration fits on the early-stopping rows, and eval_set rows may only "
-                    "score early stopping. Leave reanchor_slope at None."
-                )
-            x_val, vectors = self._resolve_fit_vectors(
-                eval_set[0],
-                {
-                    "y": eval_set[1], "sample_weight": eval_sample_weight,
-                    "exposure": eval_exposure, "offset": eval_offset,
-                },
-            )
-            if vectors["y"] is None:
-                raise ValueError("eval_set needs a target: (X_val, y_val)")
-            if has_exposure and vectors["exposure"] is None:
-                raise ValueError("the fit rows have exposure, so eval_exposure is required")
-            if not has_exposure and vectors["exposure"] is not None:
-                raise ValueError("eval_exposure needs exposure on the fit rows too")
-            if has_offset != (vectors["offset"] is not None):
-                raise ValueError("offset and eval_offset must be given together")
-            extras["eval"] = (
-                x_val, vectors["y"], vectors["sample_weight"], vectors["exposure"],
-                vectors["offset"],
-            )
-        elif eval_sample_weight is not None or eval_exposure is not None or eval_offset is not None:
-            raise ValueError("eval_sample_weight, eval_exposure and eval_offset need eval_set")
         if callbacks is not None:
             funcs = [callbacks] if callable(callbacks) else list(callbacks)
             if not all(callable(f) for f in funcs):
@@ -4099,64 +3602,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if funcs:
                 extras["callbacks"] = funcs
         self._fit_extras_ = extras
-
-    def _eval_target(self, y: Any) -> np.ndarray:
-        return _as_float32_1d(y, "eval y")
-
-    def _eval_design(
-        self, evals: tuple[Any, Any, Any, Any, Any], cat_idx: list[int],
-        feature_names: list[str] | None, n_features: int, fit_cats: Any = None,
-    ) -> dict[str, Any]:
-        """The `eval_set` rows laid out exactly as the fit design (same columns, same
-        categorical split), for the native fit's `eval_*` arguments."""
-        x_val, y_val, w_val, e_val, o_val = evals
-        _reject_sparse(x_val)
-        x_val = collect_frame(x_val)
-        if is_polars_eager(x_val) and feature_names is not None:
-            x_val = select_feature_columns(x_val, feature_names)
-        if _n_columns(x_val) != n_features:
-            raise ValueError(
-                f"eval_set X has {_n_columns(x_val)} features but X has {n_features}"
-            )
-        xv32, cat_v, _ = self._split_columns(x_val, cat_idx, feature_names)
-        if getattr(self, "unknown_category", "rare") == "error" and cat_v:
-            # The model does not exist yet, so the fit rows' own labels are the known set.
-            for pos, fit_col, val_col in zip(cat_idx, fit_cats or [], cat_v):
-                known = set(fit_col)
-                unseen = [v for v in dict.fromkeys(val_col)
-                          if v != _CAT_MISSING and v not in known][:5]
-                if unseen:
-                    name = feature_names[pos] if feature_names else f"f{pos}"
-                    raise ValueError(
-                        f"eval_set feature {name!r} has categorical value(s) the fit never "
-                        f"saw: {', '.join(map(repr, unseen))} (unknown_category='error')"
-                    )
-        n = int(xv32.shape[0])
-        if n == 0:
-            raise ValueError("eval_set has 0 rows")
-        out: dict[str, Any] = {
-            "eval_x": xv32,
-            "eval_y": np.ascontiguousarray(self._eval_target(y_val)),
-            "eval_cat_x": cat_v,
-        }
-        for key, value, name in (
-            ("eval_weight", w_val, "eval_sample_weight"),
-            ("eval_exposure", e_val, "eval_exposure"),
-        ):
-            if value is not None:
-                out[key] = np.ascontiguousarray(_as_float32_1d(value, name))
-        for key in ("eval_y", "eval_weight", "eval_exposure"):
-            if key in out and out[key].shape[0] != n:
-                raise ValueError(f"{key} has {out[key].shape[0]} rows but eval_set X has {n}")
-        if "eval_weight" in out and float(np.sum(out["eval_weight"])) <= 0.0:
-            raise ValueError("eval_sample_weight sums to zero")
-        if o_val is not None:
-            out["eval_y"], exposure = self._apply_offset(
-                out["eval_y"], out.get("eval_exposure"), _offset_array(o_val, n, "eval_offset")
-            )
-            if exposure is not None:
-                out["eval_exposure"] = exposure
-        return out
 
     def _apply_offset(
         self, y32: np.ndarray, exposure32: np.ndarray | None, offset: np.ndarray
@@ -4187,19 +3632,24 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._clear_fit_counts()
             return
         self._set_fit_counts([int(r[0]) for r in report], [str(r[2]) for r in report])
-        deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
-        if deploy.get("record_history"):
-            result: dict[str, dict[str, list[list[float]]]] = {}
-            if any(r[3] for r in report):
-                result["train"] = {"deviance": [list(r[3]) for r in report]}
-            if any(r[4] for r in report):
-                result["eval"] = {"deviance": [list(r[4]) for r in report]}
+        self._set_history([list(r[3]) for r in report], [list(r[4]) for r in report])
+
+    def _set_history(self, train: list[list[float]], eval_: list[list[float]]) -> None:
+        """`evals_result_` from the deployed fit's per-bag curves: the early-stopping rows'
+        deviance of every round (always recorded: the stopping rule computes it) and the
+        training rows' (recorded only with callbacks). Absent when there is neither."""
+        result: dict[str, dict[str, list[list[float]]]] = {}
+        if any(train):
+            result["train"] = {"deviance": train}
+        if any(eval_):
+            result["eval"] = {"deviance": eval_}
+        if result:
             self.evals_result_ = result
         else:
             self.__dict__.pop("evals_result_", None)
 
     def _clear_fit_counts(self) -> None:
-        """No boosting report (a multiclass fit, or a model saved before 0.7.0)."""
+        """No boosting report (a model saved before it was recorded)."""
         self.n_trees_per_bag_ = self.stopping_reason_per_bag_ = None
         self.n_trees_ = self.stopping_reason_ = None
         self.__dict__.pop("evals_result_", None)
@@ -4224,25 +3674,8 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         offset: Any | None = None,
     ) -> _Model | _TableModel:
         self._clear_stale_fit_state()
-        high_alpha = self.graduation_high_order_alpha
-        if (isinstance(high_alpha, (bool, np.bool_))
-                or not isinstance(high_alpha, (int, float, np.integer, np.floating))
-                or not np.isfinite(high_alpha) or not 0.0 <= high_alpha <= 1.0):
-            raise ValueError("graduation_high_order_alpha must be finite and in [0, 1]")
-        if high_alpha > 0 and (not self.prune or self.graduate is False):
-            raise ValueError("graduation_high_order_alpha requires prune=True and graduation enabled")
-        # No silent no-op: Whittaker-Henderson graduation only exists inside `_fit_and_prune`
-        # (see below) — an explicit graduate=True with prune=False is currently un-satisfiable,
-        # not a quiet pass-through. The auto-default (graduate=None, resolved to True for
-        # poisson/gamma) stays silent here: it never reaches this branch when prune is off
-        # (the resolution itself lives inside `_fit_and_prune`), so it truthfully has no effect
-        # for non-pruned fits without needing a special case.
-        if self.graduate and not self.prune:
-            raise ValueError(
-                "graduate=True has no effect without prune=True: Whittaker-Henderson "
-                "graduation only applies to the pruned tables-only artifact. Set prune=True, "
-                "or leave graduate at its default (None)."
-            )
+        self._validate_high_order_alpha()
+        self._validate_band_deviance_cap()
         if BUILD_PROFILE == "debug":
             warnings.warn(
                 "the t_boost extension is a DEBUG build — fit timings are unrepresentative"
@@ -4271,20 +3704,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         y32 = _as_float32_1d(y, "y")
         if x32.shape[0] != y32.shape[0]:
             raise ValueError(f"X has {x32.shape[0]} rows but y has {y32.shape[0]}")
-        extras = self.__dict__.get("_fit_extras_") or {}
+        # The staged dict itself (an empty one too): the pruned path reads `deploy` back from it.
+        extras = self.__dict__.setdefault("_fit_extras_", {})
         deploy: dict[str, Any] = {}
-        if "eval" in extras:
-            deploy.update(
-                self._eval_design(extras["eval"], cat_idx, feature_names, n_features, cat_x)
-            )
-            if getattr(self, "unknown_category", "rare") == "rare":
-                deploy["eval_unseen_rare"] = True
         if "callbacks" in extras:
             deploy["observer"] = _round_observer(extras["callbacks"], int(self.n_bags))
-        if deploy:
-            deploy["record_history"] = True
         extras["deploy"] = deploy
-        self._fit_eval_set_ = "eval" in extras
         if x32.shape[0] == 0:
             raise ValueError("X has 0 samples; need at least 1 row to fit")
         weight32 = None
@@ -4329,7 +3754,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             if _is_degenerate_grouping(groups_arr):
                 groups_arr = None
         # GROUP-AWARE outer bags (2026-09-07): dense group codes make every bag a subsample of
-        # whole groups, so the out-of-bag rows the cell refit and the prune guard read are honest
+        # whole groups, so the out-of-bag rows the cell refit and the ranked path read are honest
         # on panel data (a policy's other years never trained the jury that scores it).
         bag_codes = (
             np.ascontiguousarray(np.unique(groups_arr, return_inverse=True)[1], dtype=np.uint32)
@@ -4356,23 +3781,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # reorder the design (numeric axes first, then categoricals, per `_split_columns`),
         # so remap the sign vector to that axis order before handing it to the core.
         monotone = self._resolve_monotone(n_features, feature_names)
-        if self.graduation_high_order_alpha > 0 and monotone and any(monotone):
-            raise ValueError("higher-order smoothing does not support monotone constraints")
+        self._refuse_categorical_monotone(monotone, cat_idx, feature_names)
         if monotone is not None and cat_idx:
             cat_set = set(cat_idx)
             numeric_idx = [i for i in range(n_features) if i not in cat_set]
             monotone = [monotone[i] for i in numeric_idx] + [monotone[j] for j in cat_idx]
         if monotone is not None and any(monotone) and self.cell_refit_base is not None:
             raise ValueError("cell_refit_base cannot preserve monotone_constraints; leave it unset")
-        if (monotone is not None and any(monotone) and self.prune
-                and bool(getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT))):
-            raise ValueError(
-                "prune_main_effects cannot be honored with monotone_constraints: a monotone fit "
-                "deploys its full table bank without selection. Leave it at its default (False)."
-            )
-        booster = self._new_booster(
-            fit_pool_width=self._default_fit_pool(n_features), external_eval="eval_x" in deploy
-        )
+        booster = self._new_booster(fit_pool_width=self._default_fit_pool(n_features))
         model: _Model | _TableModel
         self._validate_box_budget_reachable()
         if self.prune:
@@ -4390,7 +3806,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         else:
             es_holdout: list[bool] | None = None
-            if groups_arr is not None and self.validation_fraction is not None and not deploy:
+            if groups_arr is not None and self.validation_fraction is not None:
                 seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
                 es_holdout = _carve_group_holdout(
                     groups_arr, float(self.validation_fraction), [seed, 1]
@@ -4411,8 +3827,14 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             self._record_fit_report(model)
         if not self.prune and isinstance(model, _Model):
             self.delta_step_gate_ = model.delta_step_gate
-            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
+            # Every fit deploys rating tables: an unpruned fit keeps all of them, then runs the
+            # post-fit stages a pruned fit runs (see `_finish_unpruned`).
+            full_model = model
             model = self._full_tables(model, x32, y32, weight32, exposure32, cat_x)
+            if isinstance(model, _TableModel):
+                model = self._finish_unpruned(
+                    full_model, model, x32, y32, weight32, exposure32, cat_x, monotone
+                )
         self._model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features
@@ -4470,12 +3892,39 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
 
         `graduate=None` resolves to ON: the smoothing is free on the measured catalog and a
         graduated bank is the better artifact to print. `graduate=False` skips it entirely
-        (and `graduation_report_` is then never set). Monotone fits keep the full bank
-        verbatim (see `_fit_and_prune_core`) and never graduate. Multiclass (K>=3) has no
-        graduation path at all and never reaches this method.
+        (and `graduation_report_` is then never set). A monotone fit runs every stage like any
+        other fit and is then projected back onto its signs (`_enforce_monotone`), last.
+        Multiclass (K>=3) fits graduate in `_fit_multiclass`, through `_graduate`.
         """
+        model = self._fit_and_prune_core(
+            booster, x32, y32, weight32, exposure32, axis_names, class_labels,
+            monotone, cat_x, groups_arr,
+        )
+        return self._graduate_and_repair(model, x32, y32, weight32, exposure32, cat_x, monotone)
+
+    def _graduate_and_repair(
+        self, model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int] | None,
+    ) -> "_TableModel":
+        """The last post-fit stages, for pruned and unpruned fits alike: graduation (unless
+        `graduate=False`), then the monotone repair when a sign is set."""
+        model = self._graduate(model, x32, y32, weight32, exposure32, cat_x)
+        if monotone is not None and any(monotone):
+            model = self._enforce_monotone(
+                model, x32, y32, weight32, exposure32, cat_x, monotone
+            )
+        return model
+
+    def _graduate(
+        self, model: Any, x32: np.ndarray, y32: np.ndarray, weight32: np.ndarray | None,
+        exposure32: np.ndarray | None, cat_x: list[list[str]] | None,
+    ) -> Any:
+        """Graduation unless `graduate=False`, of a single-output model or of every class bank
+        of a multiclass one (`y32` then holds the class indices); records
+        `graduation_validation_`."""
         n = len(y32)
-        do_graduate = self.graduate is not False and not (monotone and any(monotone))
+        do_graduate = self.graduate is not False
         if do_graduate:
             self.graduation_report_: list[dict[str, Any]] = []
         # `group_disjoint`/`selection_independent` are gone with the holdout they described:
@@ -4485,21 +3934,89 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         self.graduation_validation_: dict[str, Any] = {
             "evidence": "none", "training_rows": n, "holdout_rows": 0, "adopted": False,
         }
-        model = self._fit_and_prune_core(
-            booster, x32, y32, weight32, exposure32, axis_names, class_labels,
-            monotone, cat_x, groups_arr,
-        )
         if do_graduate:
             w = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
             model = self._graduate_table_model(
                 model, x32, y32, np.ascontiguousarray(w), exposure32, cat_x,
             )
         else:
-            self.graduation_validation_["skipped"] = (
-                "disabled" if self.graduate is False else "monotone_constraints"
-            )
+            self.graduation_validation_["skipped"] = "disabled"
         self.pruning_report_["graduation_validation"] = self.graduation_validation_
         return model
+
+    def _finish_unpruned(
+        self, full_model: _Model, table_model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int] | None,
+    ) -> "_TableModel":
+        """An unpruned fit keeps every table, then runs the post-fit stages a pruned fit runs:
+        banding, graduation and the monotone repair. Only the selection is skipped, so
+        `prune=False` switches off pruning and nothing else; `band_tolerance=None,
+        graduate=False` keeps the lossless full bank, which predicts as the ensemble does."""
+        supports = [list(u) for u in table_model.deployed_supports()]
+        report: dict[str, Any] = {"selector": "none", "kept": supports,
+                                  "n_candidates": len(supports)}
+        self.pruning_report_ = report
+        band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
+        if band_tol is not None:
+            n = len(y32)
+            w_full = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
+            expo_full = np.ascontiguousarray(exposure32) if exposure32 is not None else None
+            table_model = self._band_deployed(
+                table_model, full_model, None, x32, y32, w_full, expo_full, cat_x,
+                _canonical_objective(self.objective), float(band_tol),
+            )
+        self._reconcile_deployed(table_model)
+        return self._graduate_and_repair(
+            table_model, x32, y32, weight32, exposure32, cat_x, monotone
+        )
+
+    def _enforce_monotone(
+        self, model: "_TableModel", x32: np.ndarray, y32: np.ndarray,
+        weight32: np.ndarray | None, exposure32: np.ndarray | None,
+        cat_x: list[list[str]] | None, monotone: list[int],
+    ) -> "_TableModel":
+        """Project the deployed tables back onto `monotone_constraints`, after every other stage
+        (see `t_boost_core::monotone`). The trees keep only the FULL bank monotone; selection,
+        rebalance, banding and graduation each change it without knowing the constraint. The
+        projection is weighted by the loss curvature, as banding is, and records what it did in
+        `pruning_report_["monotone"]`."""
+        obj = _canonical_objective(self.objective)
+        n = len(y32)
+        w = np.ascontiguousarray(
+            weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
+        )
+        offset = (np.log(np.asarray(exposure32, dtype=np.float64))
+                  if exposure32 is not None else 0.0)
+        raw = np.asarray(model.predict_raw(x32, cat_x=cat_x), dtype=np.float64)
+        h = _band_curvature(obj, raw + offset, np.asarray(w, dtype=np.float64), self.tweedie_rho)
+        repaired, report_json = model.enforce_monotone(
+            x32, np.ascontiguousarray(h, dtype=np.float64), [int(s) for s in monotone],
+            np.ascontiguousarray(y32), w,
+            exposure=(np.ascontiguousarray(exposure32) if exposure32 is not None else None),
+            cat_x=cat_x, reanchor=self._resolved_reanchor(), n_jobs=self._resolve_n_jobs(),
+        )
+        self.pruning_report_["monotone"] = json.loads(report_json)
+        self._reconcile_deployed(repaired)
+        return repaired
+
+    def _resolved_reanchor(self) -> bool:
+        """`reanchor`, with `None` resolved by objective (keep in lockstep with `_new_booster`'s
+        resolution; logistic added 2026-07-23, single-output path only)."""
+        if self.reanchor is None:
+            return _canonical_objective(self.objective) in {"poisson", "gamma", "tweedie", "logistic"}
+        return bool(self.reanchor)
+
+    def _reconcile_deployed(self, table_model: "_TableModel") -> None:
+        """Reconcile the selection report with the shipped artifact: keep-set members whose
+        tables purify to nothing (typically order-3 candidates on narrow data) never reach the
+        deployed bank, and the report used to silently overstate the model."""
+        deployed = sorted(tuple(u) for u in table_model.deployed_supports())
+        kept_keys = {tuple(sorted(int(i) for i in u)) for u in self.pruning_report_.get("kept", [])}
+        self.pruning_report_["deployed"] = [list(u) for u in deployed]
+        self.pruning_report_["kept_not_deployed"] = [
+            list(u) for u in sorted(kept_keys - set(deployed))
+        ]
 
     def _checked_min_variance_share(self) -> float:
         value = float(getattr(self, "prune_min_variance_share", _PRUNE_MIN_VARIANCE_SHARE_DEFAULT))
@@ -4550,7 +4067,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         devs = []  # group g adds the tables of prefix sizes[g]; group 0 is the mains
         for g in range(gs.shape[0]):
             raw = raw + gs[g][ev] / cnt
-            devs.append(_guard_mean_deviance(obj, yv, raw, wv, self.tweedie_rho))
+            devs.append(_mean_deviance(obj, yv, raw, wv, self.tweedie_rho))
         best = int(np.argmin(devs))
         frac = float(getattr(self, "prune_path_fraction", _PRUNE_PATH_FRACTION_DEFAULT))
         if not 0.0 < frac <= 1.0:
@@ -4604,15 +4121,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                  "sticky": len(u) == 1 and not prune_mains}
                 for u in supports
             ],
-            "guard": {"enabled": False, "skipped": "ranked_path selector"},
         }
         return keep, report
 
     def _band_deployed(
-        self, table_model: Any, full_model: Any, keep: list[Any], x32: np.ndarray, y32: np.ndarray,
-        w_full: np.ndarray, expo_full: np.ndarray | None, cat_x: Any, obj: str, tolerance: float,
+        self, table_model: Any, full_model: Any, keep: list[Any] | None, x32: np.ndarray,
+        y32: np.ndarray, w_full: np.ndarray, expo_full: np.ndarray | None, cat_x: Any, obj: str,
+        tolerance: float,
     ) -> Any:
-        """Band the deployed tables (see `_BAND_TOLERANCE_DEFAULT`); records the report."""
+        """Band the deployed tables (see `_BAND_TOLERANCE_DEFAULT`); records the report. The
+        noise is the spread of the bags' banks restricted to `keep` (all of each bag's bank
+        when None, as an unpruned fit deploys)."""
         n_jobs = self._resolve_n_jobs()
         target = np.asarray(table_model.predict_raw(x32, cat_x=cat_x), dtype=np.float64)
         w = np.asarray(w_full, dtype=np.float64)
@@ -4620,29 +4139,29 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                   if expo_full is not None else 0.0)
         h = _band_curvature(obj, target + offset, w, self.tweedie_rho)
         mass = w * (np.asarray(expo_full, dtype=np.float64) if expo_full is not None else 1.0)
-        try:
+        # One bag has no spread to measure its noise by: the deviance cap alone bounds the
+        # banding (sigma = inf).
+        sigma = float("inf")
+        if bool(full_model.bag_oob_available()):
             # Each bag's bank is purified under the same row mass (weight x exposure) as every
             # other fit-time bank, so the noise is measured on the tables that actually ship.
             var, n_bags = full_model.bag_score_variance(
-                x32, keep=[list(u) for u in keep], cat_x=cat_x, n_jobs=n_jobs,
+                x32, keep=None if keep is None else [list(u) for u in keep], cat_x=cat_x,
+                n_jobs=n_jobs,
                 weight=np.ascontiguousarray(w_full), exposure=expo_full,
                 **self._measure_kwargs(),
             )
-        except ValueError as exc:
-            # No per-bag replicates to measure noise against (e.g. a §G1 cell-corrected soup):
-            # ship the unbanded tables and say so.
-            if isinstance(getattr(self, "pruning_report_", None), dict):
-                self.pruning_report_["banding"] = {"skipped": f"no bag noise estimate: {exc}"}
-            return table_model
-        s2 = np.asarray(var, dtype=np.float64) / max(int(n_bags), 1)
-        sigma = float(np.sqrt(np.sum(h * s2) / max(np.sum(h), 1e-300)))
+            s2 = np.asarray(var, dtype=np.float64) / max(int(n_bags), 1)
+            sigma = float(np.sqrt(np.sum(h * s2) / max(np.sum(h), 1e-300)))
         seed = int(self.seed) if getattr(self, "seed", None) is not None else 0
-        # expected deviance increase of a move δ is Σ h δ² / Σ w (deviance = 2·NLL, h = NLL
-        # curvature), so capping it at `band_deviance_cap` of the mean deviance caps the MSE at:
-        dev_mean = _guard_mean_deviance(obj, y32, target + offset, w, self.tweedie_rho)
+        # The cap is on the move's expected cost (banding holds its cross-fitted estimate), the
+        # deviance it would add if these tables were exactly right: Σ h δ² / Σ w (deviance = 2·NLL, h = NLL curvature), so capping it at
+        # `band_deviance_cap` of the mean deviance caps the MSE at `mse_cap`. The training
+        # deviance rises by more (see `_BAND_DEVIANCE_CAP_DEFAULT`).
+        # A (near-)perfect fit can round its deviance just below 0: a zero budget, not a negative one.
+        dev_mean = max(_mean_deviance(obj, y32, target + offset, w, self.tweedie_rho), 0.0)
         cap_frac = float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT))
-        mse_cap = (cap_frac * dev_mean * float(np.sum(w)) / max(float(np.sum(h)), 1e-300)
-                   if np.isfinite(dev_mean) and cap_frac > 0 else float("inf"))
+        mse_cap = cap_frac * dev_mean * float(np.sum(w)) / max(float(np.sum(h)), 1e-300)
         banded, report_json = table_model.band(
             x32, np.ascontiguousarray(h), np.ascontiguousarray(mass), np.ascontiguousarray(target),
             sigma, tolerance=tolerance, cat_x=cat_x, seed=seed, n_jobs=n_jobs, mse_cap=mse_cap,
@@ -4694,12 +4213,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # (`recommended_recipe`, `params["reanchor"] = True`). That crashed every grouped tuned
         # deploy fit with UnboundLocalError (insur-arena fremotor_prem, 9/9 splits NaN).
         obj = _canonical_objective(self.objective)
-        reanchor = self.reanchor
-        if reanchor is None:
-            # keep in lockstep with `_new_booster`'s resolution (logistic added 2026-07-23,
-            # single-output path only — see the comment there).
-            reanchor = obj in {"poisson", "gamma", "tweedie", "logistic"}
-        reanchor = bool(reanchor)
+        reanchor = self._resolved_reanchor()
         w_full = weight32 if weight32 is not None else np.ones(n, dtype=np.float32)
         expo_full = np.ascontiguousarray(exposure32) if exposure32 is not None else None
 
@@ -4711,17 +4225,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # selection (see `_carve_group_holdout`'s doc). Distinct deterministic streams
         # ([seed, 1]/[seed, 2]) keep the two draws independent; [seed, 0] is reserved for the
         # group-aware fold assignment below, mirroring the multiclass carve's key numbering.
-        # UNGROUPED fits carve NOTHING here — every bag keeps its own internal ES slice, exactly
-        # as it did before the guard existed. av33 briefly gave large ungrouped pruned fits a
-        # shared row-level carve so the guard would have an honest slice to score on; the OOB
-        # evidence path (see the guard block below) gets that honesty from the bags' own
-        # out-of-bag rows instead, at zero cost to the fit, so the carve — and the 100k size gate
-        # that rationed its ~10%-of-rows cost — are both gone. Ungrouped pruned fits are now
-        # byte-identical to guard-off fits at EVERY size.
+        # UNGROUPED fits carve NOTHING here — every bag keeps its own internal ES slice; the
+        # ranked path's honest rows are the bags' own out-of-bag rows, at no cost to the fit.
         deploy_es_holdout: list[bool] | None = None
         fold_es_holdout: list[bool] | None = None
         deploy = (self.__dict__.get("_fit_extras_") or {}).get("deploy") or {}
-        if self.validation_fraction is not None and groups_arr is not None and "eval_x" not in deploy:
+        if self.validation_fraction is not None and groups_arr is not None:
             # ES-runaway fix #2 (2026-07-20): on high-zero-mass Poisson/Tweedie panels an
             # unstratified group-honest carve can land almost entirely on zero-event groups —
             # the group-carve analog of the row-level bug es_strata_for_loss fixes (native
@@ -4787,20 +4296,6 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
         }
         full_supports = sorted(table_share)
-        if monotone is not None and any(monotone):
-            if self.prune_box_budget or self.prune_table_budget:
-                raise ValueError("monotone_constraints cannot be combined with table/box budgets")
-            self.pruning_report_: dict[str, Any] = {
-                "kept": [list(u) for u in full_supports],
-                "constraints": "full table bank retained; pruning/refits/graduation disabled",
-                "guard": {"enabled": False, "skipped": "full monotone bank retained"},
-            }
-            return full_model.apply_keepset(
-                x32, np.ascontiguousarray(y32), np.ascontiguousarray(w_full),
-                [list(u) for u in full_supports], reanchor=reanchor, rebalance=False,
-                n_jobs=self._resolve_n_jobs(), exposure=expo_full, cat_x=cat_x,
-                **self._measure_kwargs(),
-            )
         full_tree_count = int(getattr(full_model, "n_trees", 0))
         trees_per_bag = max(1, math.ceil(full_tree_count / max(1, int(self.n_bags))))
         fold_tree_cap = min(int(self.n_trees), max(64, int(math.ceil(2.0 * trees_per_bag))))
@@ -4924,10 +4419,7 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             )
             self.pruning_report_ = json.loads(report_json)
             _lap(f"(2) CV contribution scan ({self.pruning_report_['cv_folds']}/{k_folds} folds)")
-        # Graduation is handled after this complete pipeline, on a separate holdout
-        # excluded from every fit, encoder, keep-set vote, refit and recalibration.
-        graduate = False
-        grad_eval_rows = None
+        # Graduation runs after this method, on the deployed tables (see `_fit_and_prune`).
 
         # --- DEPLOYED-BOX BUDGET (av38) --------------------------------------------------
         # The budget spends on the SAME held-out evidence the av37 gate ranks by — the
@@ -4935,13 +4427,13 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # the last one a tight budget gives up. Supports the folds never scored rank at 0.0,
         # below every positively-evidenced support and above every harmful one. It is applied
         # natively, inside the keep-set application, because that is the only place the
-        # deployed bank's per-support BOX cost is known exactly; a budget of 0 never calls the
-        # budgeted binding at all, so an unbudgeted fit cannot be perturbed by this code.
+        # deployed bank's per-support BOX cost is known exactly; a budget of 0 is a no-op, so
+        # an unbudgeted fit deploys exactly the keep-set it selected.
         box_budget = max(0, int(getattr(self, "prune_box_budget", 0) or 0))
         # --- DEPLOYED MULTI-WAY TABLE BUDGET (2026-08-27) --------------------------------
         # Ralph's revised bar: cells within a table are free, the COUNT of >=3-way tables is
         # not. Same evidence ranking and the same binary dropping as the box budget, applied in
-        # the same place and composed after it; a budget of 0 never calls the budgeted binding.
+        # the same place and composed after it; a budget of 0 is a no-op.
         table_budget = max(0, int(getattr(self, "prune_table_budget", 0) or 0))
         table_min_arity = int(
             getattr(self, "prune_table_min_arity", _PRUNE_TABLE_MIN_ARITY_DEFAULT)
@@ -4956,524 +4448,40 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 except (KeyError, TypeError, ValueError):
                     continue
 
-        def _assemble_deploy(keep_now: list[Any]) -> "_TableModel":
-            if box_budget > 0 or table_budget > 0:
-                tm, box_report, table_report = full_model.apply_keepset_budgeted(
-                    x32,  # see fit() call above
-                    np.ascontiguousarray(y32),
-                    np.ascontiguousarray(w_full),
-                    keep_now,
-                    box_budget,
-                    box_rank,
-                    reanchor=reanchor,
-                    rebalance=bool(self.prune_rebalance),
-                    n_jobs=self._resolve_n_jobs(),
-                    exposure=expo_full,
-                    cat_x=cat_x,
-                    table_budget=table_budget,
-                    table_min_arity=table_min_arity,
-                    **self._measure_kwargs(),
-                )
-                # Last assembly wins: the guard's re-admission ladder re-enters here, and the
-                # bank the caller ends up holding is the one this report must describe.
-                if box_budget > 0:
-                    self.pruning_report_["box_budget"] = json.loads(box_report)
-                if table_budget > 0:
-                    self.pruning_report_["table_budget"] = json.loads(table_report)
-            else:
-                tm = full_model.apply_keepset(
-                    x32,  # see fit() call above
-                    np.ascontiguousarray(y32),
-                    np.ascontiguousarray(w_full),
-                    keep_now,
-                    reanchor=reanchor,
-                    rebalance=bool(self.prune_rebalance),
-                    n_jobs=self._resolve_n_jobs(),
-                    exposure=expo_full,
-                    cat_x=cat_x,
-                    **self._measure_kwargs(),
-                )
-            if graduate:
-                # Once per assembled artifact (the OOB guard assembles a single time after its
-                # ladder; only the panel carve path assembles per rung, on the cheap legacy
-                # gate). Runs BEFORE the slope re-anchor, which is the last affine step.
-                tm = self._graduate_table_model(
-                    tm, x32, y32, w_full, expo_full, cat_x, eval_rows=grad_eval_rows
-                )
-            return tm
-
-        table_model = _assemble_deploy(keep)
+        table_model, box_report, table_report, rebalance_report = (
+            full_model.apply_keepset_budgeted(
+                x32,  # see fit() call above
+                np.ascontiguousarray(y32),
+                np.ascontiguousarray(w_full),
+                keep,
+                box_budget,
+                box_rank,
+                reanchor=reanchor,
+                rebalance=bool(self.prune_rebalance),
+                n_jobs=self._resolve_n_jobs(),
+                exposure=expo_full,
+                cat_x=cat_x,
+                table_budget=table_budget,
+                table_min_arity=table_min_arity,
+                **self._measure_kwargs(),
+            )
+        )
+        if box_budget > 0:
+            self.pruning_report_["box_budget"] = json.loads(box_report)
+        if table_budget > 0:
+            self.pruning_report_["table_budget"] = json.loads(table_report)
+        if rebalance_report is not None:
+            self.pruning_report_["rebalance"] = json.loads(rebalance_report)
         band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
-        if band_tol is not None and bool(full_model.bag_oob_available()):
+        if band_tol is not None:
             table_model = self._band_deployed(
                 table_model, full_model, keep, x32, y32, w_full, expo_full, cat_x, obj,
                 float(band_tol),
             )
             _lap(f"(3b) banding (tolerance {band_tol})")
-        _lap(
-            f"(3) deploy contribution keep-set ({len(keep)}/{len(full_supports)} tables"
-            + (", graduated)" if graduate else ")")
-        )
+        _lap(f"(3) deploy contribution keep-set ({len(keep)}/{len(full_supports)} tables)")
 
-        # --- Set-level prune no-harm guard (2026-08-04; OOB evidence 2026-08-21) -----------
-        # The keep-set above is chosen from PER-TABLE leave-one-out held-out gains, which are
-        # structurally blind to mass carried JOINTLY by correlated tables: each table's
-        # marginal drop-gain is ~0 when its siblings absorb the signal, so a whole correlated
-        # family can be dropped while the fold evidence claims the total cost is ~0 (measured:
-        # allstate_sev split-7 selection detonated +23% outer test deviance while a keep-set
-        # from another split scored normally; homesite_conv's av32 collapsed mean+count channel
-        # pair was dropped together, +7.7%). This guard evaluates the DEPLOYED artifact —
-        # selected bank vs FULL bank — on honest rows, and on a breach re-admits dropped tables
-        # in report-ranked order (mean_gain desc) until the selected bank is within
-        # `prune_guard_tol` of the full bank. Binary table dropping is preserved; only the
-        # keep-set grows. Silent (no breach) => the deployed model is byte-identical to the
-        # unguarded one, and the FIT is byte-identical to a guard-off fit either way (the guard
-        # is post-fit selection only).
-        #
-        # WHERE THE HONEST ROWS COME FROM — two evidence paths, by fit shape:
-        #
-        # * "oob" (UNGROUPED bagged fits — the default, every size). Each bag trained on a
-        #   seeded subsample of the rows; the rows it did NOT draw are out of bag for it, and
-        #   the engine records that membership (`_Model.bag_in_bag_mask`, drawn not replayed).
-        #   For row r, the bags that never saw r are its jury, and the mean of their banks is
-        #   an honest estimate of the deployed score at r — the mean over ALL bags reproduces
-        #   the soup's deployed bank exactly (purify is linear at a fixed grid/measure), so the
-        #   jury mean is that same quantity, unbiased, computed blind. This is the estimator
-        #   the §G1 cell-refit's own no-harm guard already runs on tree scores (and a fit that
-        #   carries such a correction keeps the guard: the correction is soup-level, so the
-        #   evidence pass shares it whole across the bags — see `bag_member_model`). It costs the
-        #   fit NOTHING: no carve, no size gate, and at the shipped `n_bags=8` recipe about
-        #   83% of rows get a jury (measured on beMTPL16/euhealth: 83% coverage, mean jury 1.92
-        #   bags).
-        #   Three honest caveats, all reported in the `guard` block so they stay falsifiable:
-        #     (i) a ~1.9-bag jury is noisier than the 8-bag deployed soup, and that extra
-        #         variance sits in BOTH arms' deviance, so the measured ratio is diluted toward
-        #         1 — this direction errs toward silence. `oob_mean_jury` records the jury size.
-        #    (ii) both arms carry the deploy RE-ANCHOR before they are measured
-        #         (`_guard_reanchor`). An earlier revision skipped it, on the argument that
-        #         purified tables are reference-measure CENTERED so dropping them is
-        #         level-neutral. THAT ARGUMENT IS WRONG in the regime the guard operates in:
-        #         purification centres under the REFERENCE measure (Laplace-smoothed product of
-        #         marginals), not the empirical one, and dropping most of the tables moves the
-        #         empirical level a lot. Measured: allstate_sev s0 dropped 76% of its tables and
-        #         showed a level_shift of 0.199 on the gamma log link, which is +13.1 points of
-        #         the +15.8% gap the guard saw — it fired where the artifact-scoring av33 guard
-        #         correctly stayed silent at +3.9%. s7 was worse still (0.482 shift, +70.7 of
-        #         +83.4 points). `level_shift` keeps reporting the PRE-anchor gap so the
-        #         artifact stays visible; `reanchored` records whether the correction applied.
-        #   (iii) the arms are also raw banks in the sense that neither carries the deploy
-        #         REBALANCE (`prune_rebalance`, on by default) or GRADUATION (`graduate`, on by
-        #         default for poisson/gamma). Both of those improve the SELECTED arm only —
-        #         rebalance re-solves the surviving cells to the pruned structure's optimum and
-        #         is itself held-out-gated — so omitting them overstates the selected arm's
-        #         deviance and biases the guard toward FIRING, not toward silence. The carve
-        #         path scores the assembled artifact instead and has no such bias, so the two
-        #         paths' `dev_selected_*` are not interchangeable. Measured on the 6-split
-        #         beMTPL16/euhealth probe the total selected-vs-full gap was 0.001%-0.18% —
-        #         two to three orders below the 5% default tolerance — so the bias has room to
-        #         be wrong by a lot before it can move a decision. Pricing every rung through
-        #         `_assemble_deploy` would remove it, at the cost of the one-pass ladder (up to
-        #         ~14 full bank rebuilds per fire); the cheap version is the one that ships.
-        # * "carve" (PANEL fits). Panel fits already hold a shared group-honest ES slice out of
-        #   every bag (`deploy_es_holdout`), and it stays the evidence: a panel fit's OOB rows
-        #   are NOT honest, because an out-of-bag row's panel-mates are almost surely in bag,
-        #   which is exactly the memorization `_carve_group_holdout` exists to stop. Bags are
-        #   drawn at ROW granularity, so nothing stops a group from straddling the in-bag /
-        #   out-of-bag boundary. OOB is therefore not a superset here and panel fits keep their
-        #   battle-tested semantics unchanged. (Their carve is an EARLY-STOPPING carve that
-        #   predates the guard; nothing about it is guard-driven, and this change does not
-        #   touch it either way.)
-        #
-        #   DEGENERATE grouping is the exception: if every group is a SINGLETON (max group size
-        #   1 — e.g. an anonymised per-row policy id, which is what `euhealth`'s `id_anon`
-        #   actually is despite the panel framing), no group can straddle the boundary, so OOB
-        #   evidence is exactly as honest as it is on an ungrouped fit AND strictly better than
-        #   the carve: ~75% of rows get a jury (the ~83% ungrouped coverage, less the shared
-        #   holdout that is in bag for every bag) against the carve's ~10% single draw. Measured
-        #   on euhealth: 87,952 evidence rows against the carve's 11,735. Those fits
-        #   take the OOB path. Their fit is untouched — the shared ES carve is still built and
-        #   still early-stops the bags; only the guard's evidence moves.
-        #
-        # HOW THE TWO ESTIMATORS COMPARE, measured (deploy-fidelity arena fits, av34 battery).
-        # They agree in DIRECTION everywhere probed but disagree in magnitude by a few points,
-        # because a ~1.9-bag jury over ~75-83% of the rows and a single ~10% carve are
-        # different measurements of the same thing:
-        #     homesite_conv s0  carve +7.7%  oob +8.7%   both fire      oob -0.06% test dev
-        #                   s1  carve +5.6%  oob +4.8%   OOB MISSES     oob +3.93% test dev
-        #                   s2  carve +5.6%  oob +8.7%   oob fires harder, -4.84% test dev
-        #     allstate_sev  s0  carve +3.9%  oob +4.6%   both silent    oob -0.21% test dev
-        #                   s7  carve +26%   oob +23%    both fire      oob -0.03% test dev
-        # s1 is a NEAR-MISS against the 5% tolerance (4.8 vs 5.6), not a direction error — but
-        # it is a real +3.9% regression on that split, and it is the reason `prune_guard_tol`
-        # should be re-calibrated for this estimator rather than inherited from the carve.
-        # Across those five splits the paired mean is -0.24%, and the six neutrality splits
-        # (beMTPL16, euhealth) are bit-identical.
-        #
-        # Neither path is honest about the SELECTION itself — `fit_prune_selection` votes over
-        # all n rows, so the keep-set has seen the evidence rows. That was equally true of the
-        # av33 carve; the guard's job is to catch a catastrophic set-level miss, not to be an
-        # unbiased generalization estimate.
-        #
-        # Skipped (reported) when disabled or no evidence rows are available (n_bags=1
-        # has no OOB rows at all, and an ungrouped single-bag fit gets no guard — the pre-av33
-        # behavior); or fewer than `_PRUNE_GUARD_MIN_ROWS` evidence rows survive.
-        guard_info: dict[str, Any] = {
-            "enabled": bool(self.prune_guard) and not use_path, "fired": False,
-            "selection_independent": False,
-            "exposure_offset": expo_full is not None,
-        }
-        if use_path:
-            guard_info["skipped"] = "ranked_path selector"
-        if self.prune_guard and not use_path:
-            n_jobs = self._resolve_n_jobs()
-            tol = float(self.prune_guard_tol)
-            # The re-admission ladder is fixed BEFORE any evidence is scored: report-ranked
-            # candidates, chunked by the doubling rule. Pinning it up front is what lets the
-            # OOB path price every rung in a single pass over the per-bag banks (rung k is the
-            # prefix union of chunks 0..k, and table scores are additive).
-            kept_set = {tuple(sorted(int(i) for i in u)) for u in keep}
-            _seen: set[tuple[int, ...]] = set()
-            ranked: list[tuple[int, ...]] = []
-            for t in sorted(
-                self.pruning_report_.get("table_scores") or [],
-                key=lambda t: -(t.get("mean_gain") or 0.0),
-            ):
-                u = tuple(sorted(int(i) for i in t["u"]))
-                if u not in kept_set and u not in _seen:
-                    _seen.add(u)
-                    ranked.append(u)
-            ranked = _mains_before_their_interactions(ranked)
-            chunks: list[list[tuple[int, ...]]] = []
-            _grown, _rest = len(keep), list(ranked)
-            while _rest:
-                take = max(1, min(len(_rest), _grown))
-                chunks.append(_rest[:take])
-                _rest = _rest[take:]
-                _grown += take
-
-            def _dev(raw: "np.ndarray", yv: "np.ndarray", wv: "np.ndarray") -> float:
-                return _guard_mean_deviance(obj, yv, raw, wv, self.tweedie_rho)
-
-            evidence: str | None = None
-            skipped: str | None = None
-            # OOB rows are honest exactly when no group can straddle the in-bag/out-of-bag
-            # boundary — i.e. when there are no groups, or every group is a singleton (see the
-            # DEGENERATE-grouping note above). Bags are drawn at row granularity, so any real
-            # panel structure disqualifies them.
-            #
-            # Since av35 the second disjunct is UNREACHABLE from `fit()`: `_fit_model` normalizes
-            # a degenerate grouping to `None` at ingest, so such a fit arrives here already
-            # ungrouped (and got the ungrouped fit too — the carve it used to pay for is gone).
-            # It is kept as a fallback for a direct `_fit_and_prune` call with raw groups, and
-            # because it is the same predicate the normalizer uses (one shared helper, so the
-            # two can never drift into disagreeing about what "degenerate" means).
-            # With group-aware bags (`bag_codes`, 2026-09-07) a grouped fit's out-of-bag rows are
-            # honest: no group straddles a bag boundary, so the jury never trained on the row's
-            # group. Measured on fremotor_prem (gamma severity): the out-of-bag guard shipped
-            # 0.1266 vs the carve guard's 0.1222 on split 0 and tied on split 1, on 25.8k
-            # evidence rows against the carve's 3.5k. (A leaky row-bag out-of-bag jury must never
-            # be read here: it re-admits the whole bank on memorised rows.)
-            oob_honest = (
-                groups_arr is None or _is_degenerate_grouping(groups_arr) or bag_codes is not None
-            )
-            # ASK, don't catch: `bag_oob_available` is false exactly for a fit with no bag
-            # partition/membership — in practice `n_bags=1`. Anything the evidence
-            # pass itself raises — a mismatched design, an allocation failure — is a real bug
-            # and must surface, not be silently reported as "no out-of-bag rows".
-            # Called DIRECTLY, never through a `getattr(..., default)`: a missing attribute
-            # means the compiled module is older than this file (a stale `maturin develop`),
-            # and a default of False would silently disable the guard on exactly the large
-            # fits it exists for — which is what happened once during this feature's own
-            # validation probe. Let the AttributeError surface instead.
-            oob_ready = bool(full_model.bag_oob_available())
-
-            def _run_ladder(
-                dev_of_rung: Any, dev_full: float, n_val: int, tag: str, extra: dict[str, Any],
-                assemble_each_rung: bool, gap_se: float = float("inf"),
-            ) -> None:
-                """Breach test + report-ranked re-admission ladder, shared by both evidence
-                paths. `dev_of_rung(k)` is rung k's deviance (k=0 is the deployed keep-set,
-                k>=1 adds `chunks[k-1]`); it may assemble the deploy model as a side effect
-                (the carve path scores the artifact itself), which is what
-                `assemble_each_rung` records. Only the keep-set ever grows — binary table
-                dropping is preserved.
-                """
-                nonlocal keep, table_model
-                dev_sel = dev_of_rung(0)
-                # --- SE-AWARE BREACH TEST (av37) ------------------------------------------
-                # av36 breached on a FIXED 5% relative gap, whatever the jury's own spread. The
-                # jury is a ~1.9-bag mean over out-of-bag rows and its verdict correlates
-                # -0.004 / -0.267 / +0.092 with the eventual test verdict on the trio, so on a
-                # small or heavy-tailed portfolio a 5% gap is routinely inside the noise — and
-                # every spurious fire GROWS the deployed bank, which is the one thing the
-                # product cannot absorb. The bar is now max(tol, z * SE(gap)): the guard may
-                # only re-admit on evidence that is statistically real. Where the jury is sharp
-                # (large sets: SE well under a point) z*SE sits below `tol` and the test is
-                # exactly av36's. `prune_guard_z = 0.0` restores av36 unconditionally.
-                #
-                # The SAME bar terminates the re-admission ladder, so a fire that clears it
-                # stops as soon as the residual gap is no longer distinguishable — that is what
-                # keeps a real detonation's re-admission proportionate instead of shipping the
-                # whole bank.
-                #
-                # --- SE-AWARE DOWNWARD RECALIBRATION (av39) --------------------------------
-                # The upward bar above could only ever make the guard fire LESS. The homesite
-                # forensic found the opposite failure — a 0.21%-0.27% SE against a 5% bar — in
-                # BOTH shapes: a silent +4.80% trigger miss and a ladder that fired and then
-                # stopped one rung in at a 4.48% residual. `_guard_tol_effective` composes the
-                # two corrections; `min(tol, .)` means the recalibration can only tighten, so a
-                # blunt jury (ohlsson_pp, SE 9.56%) is pinned back at `tol` and bit-identical.
-                # BOTH the breach test and the `while` below read `tol_eff` through
-                # `threshold` — the stopping rule is as load-bearing as the trigger.
-                z = float(self.prune_guard_z)
-                z_dn = float(self.prune_guard_z_dn)
-                tol_floor = float(self.prune_guard_tol_floor)
-                tol_eff = _guard_tol_effective(tol, gap_se, z, z_dn, tol_floor)
-                guard_info.update(
-                    evidence=tag, holdout_rows=n_val, tol=tol, dev_full=float(dev_full),
-                    dev_selected_initial=float(dev_sel), kept_initial=len(keep),
-                    guard_z=z, gap_se=(float(gap_se) if np.isfinite(gap_se) else None),
-                    guard_z_dn=z_dn, tol_floor=tol_floor, n_chunks=len(chunks),
-                    tol_effective=float(tol_eff), **extra,
-                )
-                threshold = dev_full * (1.0 + tol_eff)
-                if not (np.isfinite(dev_sel) and np.isfinite(dev_full) and dev_sel > threshold):
-                    _lap(f"(6) prune guard [{tag}] (silent)")
-                    return
-                steps = 0
-                while dev_sel > threshold and steps < len(chunks):
-                    steps += 1
-                    dev_sel = dev_of_rung(steps)
-                keep_now = [sorted(int(i) for i in u) for u in keep]
-                for c in chunks[:steps]:
-                    keep_now += [list(u) for u in c]
-                if not assemble_each_rung:
-                    table_model = _assemble_deploy(keep_now)
-                guard_info.update(
-                    fired=True, steps=steps, dev_selected_final=float(dev_sel),
-                    kept_final=len(keep_now),
-                )
-                keep = keep_now  # the reconciliation below ships what we deployed
-                self.pruning_report_["kept"] = [sorted(int(i) for i in u) for u in keep_now]
-                _lap(
-                    f"(6) prune guard FIRED [{tag}] ({steps} step(s), kept "
-                    f"{guard_info['kept_initial']}->{len(keep_now)}, evidence dev "
-                    f"{guard_info['dev_selected_initial']:.5f}->{dev_sel:.5f} vs full "
-                    f"{dev_full:.5f})"
-                )
-
-            # HONESTY FLAG, not a control-flow change. The OOB rung path's rungs are raw
-            # per-support bank sums over `keep` — the SELECTION keep-set — assembled from the
-            # full model. What ships is `_assemble_deploy(keep)`, which then spends
-            # `prune_box_budget` / `prune_table_budget`. When a budget actually ENGAGES, rung 0
-            # therefore describes a bank that is not deployed: the breach test can read silent
-            # while the shipped bank is worse than the full one, and a ladder that fires
-            # re-admits tables the budget immediately re-caps, reporting a `kept_final` the
-            # artifact does not carry.
-            #
-            # It is flagged rather than skipped, deliberately. Skipping was tried and it BREAKS
-            # the knob's own no-op guarantee: at n=1200 the guard is eligible
-            # (`_PRUNE_GUARD_MIN_ROWS` is 500), so a NON-binding cap — one at or above the
-            # bank's own count, which must be a verbatim no-op — would have suppressed a guard
-            # fire and shipped 4 three-way tables where the unbudgeted fit ships 10. Changing
-            # control flow here also silently moves every shipped `prune_box_budget` cell.
-            #
-            # The CARVE path below is already honest: it scores `table_model`, the assembled and
-            # budgeted deploy. The real repair for the OOB path is to assemble each rung as the
-            # carve path does, paying one deploy assembly per step. That is the follow-up; until
-            # then the report says so out loud.
-            guard_min_rows = int(getattr(self, "prune_guard_min_rows", _PRUNE_GUARD_MIN_ROWS))
-            if oob_honest and oob_ready:
-                # --- OOB path (ungrouped, or singleton groups) ----------------------------
-                _t_ev = _time.perf_counter()
-                group_arg = [[sorted(int(i) for i in u) for u in keep]]
-                group_arg += [[list(u) for u in c] for c in chunks]
-                full_sum, f0_sum, group_sums, counts = full_model.bag_oob_group_raw(
-                    x32,  # see fit() call above — MUST be the fit design, rows in fit order
-                    group_arg,
-                    cat_x=cat_x,
-                    n_jobs=n_jobs,
-                    # Same measure AND same per-row mass as the deployed bank, or the OOB jury
-                    # would score a different ledger than the one that ships.
-                    weight=np.ascontiguousarray(w_full),
-                    exposure=expo_full,
-                    **self._measure_kwargs(),
-                )
-                counts = np.asarray(counts, dtype=np.int64)
-                ev = counts > 0
-                n_val = int(ev.sum())
-                if n_val < guard_min_rows:
-                    skipped = f"out-of-bag rows {n_val} < {guard_min_rows}"
-                else:
-                    evidence = "oob"
-                    cnt = counts[ev].astype(np.float64)
-                    yv = np.asarray(y32, dtype=np.float64)[ev]
-                    wv = np.asarray(w_full, dtype=np.float64)[ev]
-                    offset_ev = (np.log(np.asarray(expo_full, dtype=np.float64)[ev])
-                                 if expo_full is not None else np.zeros(n_val))
-                    raw_full = np.asarray(full_sum, dtype=np.float64)[ev] / cnt + offset_ev
-                    # Rung 0 is the deployed keep-set; each further rung adds one chunk. Every
-                    # rung is the running PREFIX union, so the intercept enters once and each
-                    # group's tables accumulate on top of it.
-                    group_sums = np.asarray(group_sums, dtype=np.float64)
-                    acc = np.asarray(f0_sum, dtype=np.float64)[ev] / cnt + offset_ev
-                    rungs = []
-                    for g in range(len(group_arg)):
-                        acc = acc + group_sums[g][ev] / cnt
-                        rungs.append(acc)
-                    # Both arms carry the deploy re-anchor before they are measured (see
-                    # `_guard_reanchor`): without it the guard tests a level artifact that the
-                    # shipped model does not have. `level_shift` below reports the RAW (pre-
-                    # anchor) gap, so the artifact stays visible in the report.
-                    raw_gap = float(np.average(rungs[0] - raw_full, weights=wv))
-                    raw_full = _guard_reanchor(obj, raw_full, yv, wv, reanchor)
-                    dev_full = _dev(raw_full, yv, wv)
-                    # Paired per-row deviances of the two arms the breach test compares — the
-                    # spread of THAT difference is what sizes the SE-aware bar (see
-                    # `_guard_gap_se` and the note in `_run_ladder`).
-                    gap_se = _guard_gap_se(
-                        _guard_unit_deviance(
-                            obj, yv, _guard_reanchor(obj, rungs[0], yv, wv, reanchor), wv,
-                            self.tweedie_rho,
-                        ),
-                        _guard_unit_deviance(obj, yv, raw_full, wv, self.tweedie_rho),
-                        wv,
-                    )
-                    _run_ladder(
-                        lambda k: _dev(
-                            _guard_reanchor(obj, rungs[k], yv, wv, reanchor), yv, wv
-                        ),
-                        dev_full,
-                        n_val,
-                        "oob",
-                        {
-                            "oob_rows": n_val,
-                            "oob_rows_uncovered": int(counts.size - n_val),
-                            "oob_mean_jury": float(cnt.mean()),
-                            "n_bags": int(self.n_bags),
-                            "level_shift": raw_gap,
-                            "reanchored": bool(reanchor),
-                            "evidence_seconds": float(_time.perf_counter() - _t_ev),
-                        },
-                        assemble_each_rung=False,
-                        gap_se=gap_se,
-                    )
-                    # --- post-prune slope re-anchor (log-link objectives only) -------------
-                    # The guard has settled the FINAL keep-set, so `rungs[final_k]` is the
-                    # out-of-bag link-scale score of exactly the bank that is about to ship —
-                    # the one array in this method on which the correction is honest. Fitting
-                    # it on any EARLIER rung and applying it to a bank the ladder later grew is
-                    # catastrophic, not merely wasteful: measured on allstate_sev split 3, the
-                    # pre-guard rung's b = 1.23 (it is describing a 1,934-table bank) applied to
-                    # the 10,307-table bank the guard actually deployed took the split from
-                    # +0.0926 to +0.0091. `final_k` is read from the ladder's own outcome for
-                    # that reason, never assumed to be 0.
-                    if obj in _SLOPE_OBJECTIVES and expo_full is None:
-                        final_k = (
-                            int(guard_info.get("steps") or 0)
-                            if guard_info.get("fired")
-                            else 0
-                        )
-                        table_model = self._slope_reanchor_post_prune(
-                            table_model, obj, rungs[final_k], yv, wv, reanchor,
-                            final_k, x32, cat_x, n_jobs, _lap, raw_full,
-                        )
-                    elif expo_full is not None:
-                        self.pruning_report_["slope"] = {
-                            "skipped": "native exposure offset: fixed offset is not rescaled"
-                        }
-            if evidence is None and deploy_es_holdout is not None:
-                # --- Shared-carve path — av33 semantics, unchanged -------------------------
-                # Reached by every real panel fit, and as a FALLBACK when a singleton-grouped
-                # fit cannot supply out-of-bag evidence (n_bags=1, a §G1 cell correction, or
-                # too few covered rows): its carve is already held out of the fit, so using it
-                # is strictly better than dropping the guard.
-                _t_ev = _time.perf_counter()
-                gmask = np.asarray(deploy_es_holdout, dtype=bool)
-                n_val = int(gmask.sum())
-                if n_val < guard_min_rows:
-                    skipped = f"holdout_rows {n_val} < {guard_min_rows}"
-                else:
-                    evidence = "carve"
-                    skipped = None
-                    xv = np.ascontiguousarray(np.asarray(x32)[gmask])
-                    cat_xv = (
-                        [list(np.asarray(col, dtype=object)[gmask]) for col in cat_x]
-                        if cat_x
-                        else None
-                    )
-                    yv = np.asarray(y32, dtype=np.float64)[gmask]
-                    wv = np.asarray(w_full, dtype=np.float64)[gmask]
-                    raw_full = np.asarray(
-                        full_model.predict_raw(xv, cat_x=cat_xv, n_jobs=n_jobs), dtype=np.float64
-                    )
-                    offset_val = (np.log(np.asarray(expo_full, dtype=np.float64)[gmask])
-                                  if expo_full is not None else np.zeros(n_val))
-                    raw_full = raw_full + offset_val
-                    dev_full = _dev(raw_full, yv, wv)
-                    # Same SE-aware bar as the OOB path, measured on the artifact this path
-                    # scores (rung 0 is the deployed keep-set as assembled above).
-                    gap_se = _guard_gap_se(
-                        _guard_unit_deviance(
-                            obj, yv,
-                            np.asarray(
-                                table_model.predict_raw(xv, cat_x=cat_xv, n_jobs=n_jobs),
-                                dtype=np.float64,
-                            ) + offset_val,
-                            wv, self.tweedie_rho,
-                        ),
-                        _guard_unit_deviance(obj, yv, raw_full, wv, self.tweedie_rho),
-                        wv,
-                    )
-
-                    def _carve_rung(k: int) -> float:
-                        # The carve path scores the ARTIFACT: rung k is re-assembled with
-                        # reanchor/rebalance/graduation before it is measured.
-                        nonlocal table_model
-                        if k:
-                            keep_k = [list(u) for u in keep]
-                            for c in chunks[:k]:
-                                keep_k += [list(u) for u in c]
-                            table_model = _assemble_deploy(keep_k)
-                        raw = np.asarray(
-                            table_model.predict_raw(xv, cat_x=cat_xv, n_jobs=n_jobs),
-                            dtype=np.float64,
-                        )
-                        return _dev(raw + offset_val, yv, wv)
-
-                    _run_ladder(
-                        _carve_rung, dev_full, n_val, "carve",
-                        {"evidence_seconds": float(_time.perf_counter() - _t_ev)},
-                        assemble_each_rung=True, gap_se=gap_se,
-                    )
-            if evidence is None and skipped is None:
-                skipped = (
-                    "no honest evidence: a panel fit with validation_fraction unset"
-                    if not oob_honest
-                    else "no out-of-bag evidence (single-bag fit)"
-                )
-            if evidence is None and skipped is not None:
-                guard_info["skipped"] = skipped
-        # See the note above the OOB branch: that path's rungs describe the pre-budget keep-set,
-        # so once a budget actually ENGAGES its verdict is about a bank that did not ship. Said
-        # in the report rather than silently, and only when a budget really bound — a budget
-        # that stayed idle left the deployed bank equal to the keep-set, so the verdict holds.
-        if guard_info.get("evidence") == "oob" and any(
-            (self.pruning_report_.get(k) or {}).get("engaged")
-            for k in ("box_budget", "table_budget")
-        ):
-            guard_info["budget_blind"] = True
-        self.pruning_report_["guard"] = guard_info
-
-        # Reconcile the selection report with the shipped artifact: keep-set members whose tables
-        # purify to nothing (typically order-3 candidates on narrow data) never reach the deployed
-        # bank, and the report used to silently overstate the model.
-        deployed = sorted(tuple(u) for u in table_model.deployed_supports())
-        kept_keys = {tuple(sorted(int(i) for i in u)) for u in self.pruning_report_.get("kept", [])}
-        self.pruning_report_["deployed"] = [list(u) for u in deployed]
-        self.pruning_report_["kept_not_deployed"] = [
-            list(u) for u in sorted(kept_keys - set(deployed))
-        ]
+        self._reconcile_deployed(table_model)
         return table_model
 
     # --- Whittaker-Henderson graduation of the deployed fANOVA tables (post-fit) -------------
@@ -5837,158 +4845,28 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             return None
         return int(table_idx), features, out, alpha
 
-    # --- Post-prune slope re-anchor ----------------------------------------------------------
-    # Deliberately SELF-GATING rather than parameterised: there is no new estimator knob. The
-    # correction is fitted on out-of-bag evidence the guard has already paid for, it is reported
-    # in full under `pruning_report_["slope"]` whether or not it fires, and it is applied only
-    # when the fitted slope is far enough from 1 that the bank demonstrably needs rescaling. A
-    # fit that does not need it keeps a byte-identical artifact.
-    def _slope_reanchor_post_prune(
-        self, table_model: "_TableModel", obj: str, rung_raw: "np.ndarray",
-        yv: "np.ndarray", wv: "np.ndarray", reanchor: bool, rung: int,
-        x32: "np.ndarray", cat_x: "list[list[str]] | None", n_jobs: int | None,
-        lap: "Callable[[str], None]", raw_full: "np.ndarray",
-    ) -> "_TableModel":
-        """Fit `a + b*F` on the FINAL keep-set's OOB scores and fold it into the shipped bank.
-
-        Returns the rescaled model, or `table_model` UNCHANGED (and byte-identical) when the
-        correction is a no-op, is not trustworthy, or does not verify. Every outcome is recorded
-        in `pruning_report_["slope"]`.
-        """
-        slope_eps = float(getattr(self, "prune_slope_eps", _SLOPE_EPS))
-        slope_min_z = float(getattr(self, "prune_slope_min_z", _SLOPE_MIN_Z))
-        info: dict[str, Any] = {"rung": int(rung), "evidence": "oob", "eps": slope_eps}
-        # Measure on the same re-anchored footing the guard used, so `dev_before` is comparable
-        # with `guard["dev_selected_final"]` and the reported gain is the correction's alone.
-        raw = _guard_reanchor(obj, rung_raw, yv, wv, reanchor)
-        rawf = np.asarray(raw_full, dtype=np.float64)
-        # --- the estimator: the slope of the keep-set RELATIVE to the full bank ---------------
-        # Fitting `b` on the keep-set's out-of-bag score alone measures TWO things at once, and
-        # only one of them is the prune's fault. An out-of-bag score is an average over the bags
-        # that did NOT see the row, so it is a systematically weaker (under-fit) predictor than
-        # the full-data artifact that actually ships, and it reads b > 1 EVEN WITH NO PRUNING AT
-        # ALL. Measured: on the healthy 8k guard fixture the FULL support set — nothing pruned,
-        # sd ratio exactly 1.000 — still fits b = 1.040; on brvehins1_pp split 0, sd ratio 0.999
-        # and b = 1.093, and applying it cost -0.0007 test skill.
-        #
-        # The full bank's own out-of-bag slope is that bias, measured on THE SAME ROWS with THE
-        # SAME jury and the same y. Dividing it out leaves the part attributable to the prune:
-        #
-        #     b_prune = b_keep / b_full
-        #
-        # On allstate_sev, where the correction was discovered, b_full is 0.9964-1.0039 and the
-        # ratio barely moves the number — the bias is negligible with 8 bags over 104k rows,
-        # which is exactly why fitting `b_keep` alone looked sound there. It is not sound in
-        # general, and the ratio costs one extra 2-parameter solve on an array already in hand.
-        b_keep, se_keep = _fit_link_slope(obj, raw, yv, wv, self.tweedie_rho)[1:]
-        b_full, se_full = _fit_link_slope(obj, rawf, yv, wv, self.tweedie_rho)[1:]
-        b = b_keep / b_full if np.isfinite(b_full) and b_full > 0.0 else 1.0
-        # Conservative standard error for the ratio: the two slopes are strongly POSITIVELY
-        # correlated (same rows, same y, nested banks), so their difference has a much smaller
-        # variance than this sum — erring toward silence is the right direction for a
-        # correction that can only be judged after the fact.
-        se_b = float(math.sqrt(se_keep * se_keep + se_full * se_full))
-        # How far from 1 the ratio is IN ITS OWN STANDARD ERRORS. This is the statistic the
-        # apply-gate is built on; `b` alone cannot tell a real 6% compression on 104k out-of-bag
-        # rows from a 5% wobble on 2k.
-        z_b = abs(b - 1.0) / se_b if np.isfinite(se_b) and se_b > 0.0 else 0.0
-        # The intercept is not fitted jointly with the ratio: once the scale is set, the level is
-        # whatever restores the aggregate balance the deploy re-anchor promises. `_guard_reanchor`
-        # IS that solve (and is a no-op when the estimator's `reanchor` is off, so a deploy that
-        # does not re-anchor does not acquire a level shift here either).
-        scaled_raw = _guard_reanchor(obj, b * raw, yv, wv, reanchor)
-        a = float(np.average(scaled_raw - b * raw, weights=wv)) if raw.size else 0.0
-        dev_before = _guard_mean_deviance(obj, yv, raw, wv, self.tweedie_rho)
-        dev_after = _guard_mean_deviance(obj, yv, a + b * raw, wv, self.tweedie_rho)
-        # The relative deviance the correction buys on its own evidence.
-        rel_gain = (
-            float((dev_before - dev_after) / dev_before)
-            if np.isfinite(dev_before) and dev_before > 0.0 and np.isfinite(dev_after)
-            else float("nan")
-        )
-        # The mechanism variable itself: how much of the full bank's link-scale spread the
-        # deployed keep-set still carries. Pruning compresses it (allstate_sev measured 0.90-0.91
-        # on the splits where the correction pays); a ratio at 1.0 means nothing was compressed
-        # and there is nothing for a slope to undo.
-        sd_keep = float(np.sqrt(np.cov(raw, aweights=wv, ddof=0))) if raw.size > 1 else 0.0
-        sd_full = float(np.sqrt(np.cov(rawf, aweights=wv, ddof=0))) if rawf.size > 1 else 0.0
-        info.update(
-            a=float(a), b=float(b), se_b=float(se_b), z_b=float(z_b),
-            b_keep=float(b_keep), b_full=float(b_full),
-            se_keep=float(se_keep), se_full=float(se_full),
-            rows=int(np.asarray(yv).size), sd_keep=sd_keep, sd_full=sd_full,
-            sd_ratio=(sd_keep / sd_full if sd_full > 0.0 else float("nan")),
-            dev_before=float(dev_before), dev_after=float(dev_after), rel_gain=rel_gain,
-        )
-        info["min_z"] = slope_min_z
-        if abs(b - 1.0) <= slope_eps:
-            # The overwhelmingly common case on a healthy or guard-relaxed fit. Bail BEFORE
-            # touching the artifact so the model is byte-identical to the pre-slope build.
-            info.update(applied=False, skipped=f"|b-1| {abs(b - 1.0):.4g} <= {slope_eps}")
-            self.pruning_report_["slope"] = info
-            return table_model
-        if not (np.isfinite(z_b) and z_b >= slope_min_z):
-            # The gate that does the real work. A slope 5% from 1 on a 2k-row portfolio with a
-            # 1.9-bag jury is noise, and folding it in costs real skill (freclaimdam, beMTPL16,
-            # brvehins1_pp all measured harm from exactly this). Silence is the safe default:
-            # the un-corrected bank is the shipped av35 artifact.
-            info.update(applied=False, skipped=f"z {z_b:.3g} < {slope_min_z}")
-            self.pruning_report_["slope"] = info
-            return table_model
-        doc = json.loads(table_model.to_json())
-        _fold_slope_into_bank_json(doc, a, b)
-        scaled = _TableModel.from_json(json.dumps(doc))
-        # VERIFY, then adopt. The fold is an exact identity on paper, but it is written against a
-        # serialization schema, and a schema that grew a new value-carrying field would corrupt
-        # the artifact silently. Scoring both banks on real rows is the check that cannot be
-        # fooled by a field this code does not know about: if anything failed to scale, the
-        # affine relation breaks and we ship the untouched model.
-        rows = np.asarray(x32)
-        stride = max(1, rows.shape[0] // _SLOPE_VERIFY_ROWS)
-        idx = np.arange(0, rows.shape[0], stride)[:_SLOPE_VERIFY_ROWS]
-        xs = np.ascontiguousarray(rows[idx])
-        cat_xs = (
-            [list(np.asarray(col, dtype=object)[idx]) for col in cat_x] if cat_x else None
-        )
-        old = np.asarray(
-            table_model.predict_raw(xs, cat_x=cat_xs, n_jobs=n_jobs), dtype=np.float64
-        )
-        new = np.asarray(
-            scaled.predict_raw(xs, cat_x=cat_xs, n_jobs=n_jobs), dtype=np.float64
-        )
-        want = a + b * old
-        # f32 scoring accumulation: compare on the scale of the score itself.
-        scale = float(np.max(np.abs(want))) if want.size else 0.0
-        err = float(np.max(np.abs(new - want))) if want.size else 0.0
-        info["verify_max_abs_err"] = err
-        if not (np.isfinite(new).all() and err <= 1e-4 * max(scale, 1.0)):
-            info.update(applied=False, skipped=f"affine verification failed (max err {err:.3g})")
-            self.pruning_report_["slope"] = info
-            return table_model
-        info["applied"] = True
-        self.pruning_report_["slope"] = info
-        lap(
-            f"(7) post-prune slope re-anchor APPLIED (rung {rung}, a={a:+.4f} b={b:.4f}, "
-            f"OOB dev {dev_before:.5f}->{dev_after:.5f})"
-        )
-        return scaled
-
-    def _graduate_table_model(self, table_model: "_TableModel", x32: "np.ndarray",
+    def _graduate_table_model(self, table_model: Any, x32: "np.ndarray",
                               y32: "np.ndarray", w_full: "np.ndarray",
                               exposure: "np.ndarray | None",
                               cat_x: "list[list[str]] | None",
-                              eval_rows: "np.ndarray | None" = None) -> "_TableModel":
+                              eval_rows: "np.ndarray | None" = None) -> Any:
+        """Graduate a `_TableModel`, or every class bank of a `_MultiClassTableModel` (whose
+        `y32` holds the class indices): the same per-table solves, then one native candidate,
+        re-anchored and checked on the training deviance."""
         if eval_rows is not None:
             raise ValueError("eval_rows from the fit design are not an independent holdout")
+        multiclass = isinstance(table_model, _MultiClassTableModel)
         report: list[dict[str, Any]] = []
-        updates: list[tuple[int, list[float]]] = []
+        # `(table, values)`, or `(class, table, values)` for a multiclass fit's class banks.
+        updates: list[tuple[Any, ...]] = []
         fixed = self.graduation_alpha
-        # Fidelity weights: the bank's `support` is BINNED ROW COUNTS, but the GCV noise model
-        # needs the cell's information mass. On aggregated portfolios one row can carry
-        # thousands of policy-years (swautoins: mean weight ~1200), so row-count GCV
-        # over-smooths by that factor. First-order fix: scale support by the mean training
-        # weight — exact for ~uniform weights, and a no-op (scale ~ 1) on individual-policy
-        # data. (Per-cell weight mass is not stored in the wire format; revisit if it ever is.)
+        # Fidelity weights: the bank's `support` is BINNED ROW COUNTS; scale it by the mean
+        # training weight so the cells carry their weight mass (exact for ~uniform weights, a
+        # no-op on individual-policy data; per-cell weight mass is not in the wire format).
+        # GCV itself picks the same smoother when every weight is multiplied by one constant
+        # (S(alpha; cW) = S(alpha/c; W)), so this does not change how much GCV smooths; it moves
+        # the searched alpha grid's edges, and it gives a fixed `graduation_alpha` the same
+        # meaning on aggregated rows (swautoins: mean weight ~1200) as on individual ones.
         w_scale = float(np.sum(w_full)) / float(max(len(w_full), 1))
         if self._measure_kwargs()["ref_measure"] == "exposure":
             # Under the exposure measure `support` already IS the per-cell effective mass
@@ -6000,7 +4878,12 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
         # before axis kinds are resolved, so it cannot yet tell a cheap separable table from an
         # expensive joint one — the real per-table budget is enforced inside `_graduate_one`
         # (see the two-tier cap comment on `_GRADUATION_MAX_CELLS`).
-        items = list(table_model.graduation_tables(self._GRADUATION_MAX_CELLS_RAW))
+        tables = table_model.graduation_tables(self._GRADUATION_MAX_CELLS_RAW)
+        keyed: list[tuple[int | None, Any]] = (
+            [(k, it) for k, class_tables in enumerate(tables) for it in class_tables]
+            if multiclass else [(None, it) for it in tables]
+        )
+        items = [it for _, it in keyed]
         jobs = self._resolve_n_jobs()
         jobs = max(1, min(int(jobs), len(items))) if (jobs and items) else 1
         # Tables are independent and the loop can fan out on a thread pool sized to n_jobs —
@@ -6041,15 +4924,22 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                     ))
             else:
                 results = [self._graduate_one(it, fixed, w_scale) for it in items]
-        for res in results:
+        for (k, _), res in zip(keyed, results):
             if res is None:
                 continue
             table_idx, features, out, alpha = res
+            entry = {"features": features, "alpha": alpha, "table_idx": int(table_idx)}
+            if k is not None:
+                entry["class"] = k
             if alpha > 0.0:
-                updates.append((int(table_idx), out.tolist()))
-            report.append({"features": features, "alpha": alpha, "table_idx": int(table_idx)})
+                updates.append((int(table_idx), out.tolist()) if k is None
+                               else (k, int(table_idx), out.tolist()))
+            report.append(entry)
         if not updates and self.graduation_high_order_alpha == 0:
             self.graduation_report_ = report
+            self.graduation_validation_.update(
+                adopted=False, candidate_count=0, skipped="no eligible smoothing updates",
+            )
             return table_model
 
         # Candidate construction and portfolio re-anchoring use the fit rows -- which are now
@@ -6059,7 +4949,23 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
             exposure=(np.ascontiguousarray(exposure) if exposure is not None else None),
             cat_x=cat_x, n_jobs=self._resolve_n_jobs(),
         )
-        if self.graduation_high_order_alpha > 0:
+        if not multiclass:
+            # A log-link candidate restores the portfolio total on its intercept, as the fit's
+            # own re-anchor does; `reanchor=False` keeps the intercept as fitted here too.
+            kwargs["reanchor"] = self._resolved_reanchor()
+        if multiclass:
+            # One method for both steps: the high-order diffusion runs only at alpha > 0.
+            candidate, train_adopted, class_reports = table_model.apply_graduation(
+                *args, alpha=float(self.graduation_high_order_alpha), cat_x=cat_x,
+                n_jobs=self._resolve_n_jobs(), box_budget=max(0, int(self.prune_box_budget or 0)),
+            )
+            if self.graduation_high_order_alpha > 0:
+                for k, entries in enumerate(json.loads(class_reports)):
+                    for entry in entries:
+                        report.append({**entry, "class": k, "method": "reference_diffusion",
+                                       "requested_alpha": entry["alpha"],
+                                       "alpha": entry["alpha"] if entry["applied"] else 0.0})
+        elif self.graduation_high_order_alpha > 0:
             candidate, train_adopted, high_report = table_model.apply_high_order_graduation(
                 *args, alpha=float(self.graduation_high_order_alpha),
                 box_budget=max(0, int(self.prune_box_budget or 0)), **kwargs,
@@ -6076,15 +4982,17 @@ class _BaseTBoost(BaseEstimator):  # type: ignore[misc]  # sklearn is untyped (n
                 adopted=False, candidate_count=0, skipped="no eligible smoothing updates",
             )
             return table_model
-        # NO ACCEPT/REJECT GATE (2026-09-20): see `_fit_and_prune` for the measurement that
-        # retired it. `train_adopted` is the native layer's own consistency check on the
-        # re-anchored candidate -- it declines when the smoothed bank cannot be balanced back
-        # onto the fit rows -- NOT a generalization test. Nothing here scores the candidate
-        # against held-out outcomes, because nothing is held out any more.
+        # No held-out gate (2026-09-20): see `_fit_and_prune` for the measurement that retired
+        # it. `train_adopted` is the native layer's check on the re-anchored candidate
+        # (`apply_graduation_updates_impl`): it declines when the smoothed bank's TRAINING
+        # deviance exceeds the fitted bank's by more than 1% -- a training-data check, NOT a
+        # generalization test. A declined candidate keeps every table as fitted.
         adopted = bool(train_adopted)
         self.graduation_validation_.update(
             adopted=adopted, candidate_count=1, n_smoothed=len(updates),
         )
+        if not adopted:
+            self.graduation_validation_["rejected"] = _GRADUATION_REJECTED
         self.graduation_report_ = [
             {**r, "rejected": not adopted, "alpha": r["alpha"] if adopted else 0.0}
             for r in report
@@ -6677,8 +5585,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
     (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
     tables are graduated (``graduate``). The fitted artifact is that tables-only model.
-    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
-    baseline.
+    Pass ``n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+    graduate=False`` for the cheapest single-fit baseline: one fit's full table bank, as the
+    trees fitted it.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -6832,29 +5741,30 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fade, and additionally requires 3-way admissions to clear a stricter multiplier than
         2-way admissions.
     graduate : bool or None, default=None
-        Whittaker-Henderson smoothing of the deployed fANOVA tables after pruning.
+        Whittaker-Henderson smoothing of the deployed fANOVA tables, pruned or not.
         ``None`` (the default) and ``True`` both enable it; ``False`` disables it and
         ``graduation_report_`` is then never set. NO ROWS ARE WITHHELD: the fit, the
         prune and the smoothing all see every row, and the smoothed bank is adopted
         whenever the native re-anchor accepts it (``graduation_validation_["adopted"]``).
-        There is deliberately NO accuracy gate -- between 2026-09-09 and 2026-09-20 one
-        existed, paid for by a ``prune_validation_fraction`` holdout carved out of every
-        fit, and it cost +1.29% mean test deviance on the arena catalog to decide a bit
-        worth -0.015%. Whether a smoothed tariff is what you want is your call, not a
-        deviance comparison's: set ``graduate=False`` for the raw pruned bank.
-        Monotone fits retain the full bank without smoothing. Explicit ``True`` requires
-        ``prune=True``. Multiclass (K>=3) graduation is unsupported.
+        There is deliberately no held-out accuracy gate -- between 2026-09-09 and
+        2026-09-20 one existed, paid for by a ``prune_validation_fraction`` holdout carved
+        out of every fit, and it cost +1.29% mean test deviance on the arena catalog to
+        decide a bit worth -0.015%. Whether smoothed tables are what you want is your call,
+        not a deviance comparison's: set ``graduate=False`` for the raw pruned bank. The
+        smoothing is kept only if it raises the training deviance by at most 1%; otherwise
+        every table is kept as fitted and ``graduation_validation_`` says why.
     graduation_alpha : float or None, default=None
         Fixed Whittaker-Henderson smoothing strength, overriding the per-table generalized
         cross-validation (GCV) alpha selection that ``graduate`` normally uses. ``None`` (the
         default) lets each table pick its own GCV-optimal alpha independently, including
         ``alpha=0`` (left untouched) for a table whose apparent roughness is real,
         well-supported shape rather than noise. Only relevant when ``graduate`` resolves to
-        ``True``.
+        ``True``. A strength that raises the training deviance by more than 1% is declined:
+        the tables are kept as fitted, the fit warns and ``binding_report_`` lists it INERT.
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
-        step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for monotone or multiclass fits. Numeric
+        step on factored interactions of orders 3 through 8. Requires graduation
+        enabled. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -6893,7 +5803,8 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        banding is skipped and pruning falls back to the fold vote.
+        pruning falls back to the fold vote, and no spread between bags, so
+        ``band_deviance_cap`` alone bounds the banding.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
@@ -6936,9 +5847,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
     reanchor : bool or None, default=None
         Whether to re-solve the model's global intercept exactly against the training data
         after fitting, removing post-shrinkage aggregate bias. ``None`` uses a link-aware
-        default: on for the log-link objectives ``gamma``/``tweedie`` where shrinkage bias
-        is largest (a no-op for ``poisson``), off otherwise. An explicit ``True``/``False``
-        always overrides the default.
+        default: on for the log-link objectives ``poisson``/``gamma``/``tweedie``, off
+        otherwise. An explicit ``True``/``False`` always overrides the default, including for
+        the intercept re-solve that follows an adopted graduation.
     reanchor_slope : bool or None, default=None
         Whether to fit an honest affine link-scale recalibration (``F' = b + a * F``) on the
         fit's own internal validation holdout after early stopping, correcting the uniform
@@ -6947,9 +5858,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         fit is ridge-shrunk toward the identity and only applied when its holdout deviance
         gain clears the prior penalty, so thin or uninformative holdouts stay at
         (near-)identity — this can only help or be neutral, never hurt. Inert without a
-        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` follows
-        the same link-aware default as ``reanchor``; an explicit ``True``/``False`` always
-        wins.
+        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` uses a
+        link-aware default: on for ``poisson``/``gamma``/``tweedie``, off otherwise. An
+        explicit ``True``/``False`` always wins.
     max_interaction_order : int, default=3
         Whole-tree cap on the number of distinct raw features a tree may use (1 to 8) —
         caps interaction ORDER, which is the number of axes an exported table has. It does
@@ -7026,7 +5937,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
         level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        feature and up to five unseen values. A null
         is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
         value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
         :meth:`unseen_values` counts the unseen ones.
@@ -7035,7 +5946,10 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
-        ``f{i}``) or integer index, valued the same way.
+        ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
+        categorical feature raises. The trees enforce the signs; every post-fit stage then
+        runs as usual and the deployed tables are projected back onto the signs last,
+        changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -7117,9 +6031,11 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
         the pruned artifact. ``prune_selector`` decides how the tables are judged: the default
         ranked path reads the bags' out-of-bag rows and costs little extra, while the fold vote
-        refits the model on cross-validation folds. ``False`` deploys the full, unpruned table
-        bank instead (fitted faster, but a much larger artifact than the pruned bank or the
-        trees it is built from). Either way the model is stored as rating tables.
+        refits the model on cross-validation folds. ``False`` keeps the full table bank
+        instead (fitted faster, but more tables than the pruned bank). Only the selection is
+        skipped: banding, graduation and the monotone repair run either way, and the model is
+        always stored as rating tables. ``band_tolerance=None, graduate=False`` keeps the full
+        bank exactly as the trees fitted it.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too. ``False`` deploys every main effect the fit
         built and prunes interactions only. ``True`` makes the main effects candidates in every
@@ -7130,17 +6046,17 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         interaction that needs it, and the path starts from the intercept-only model. So
         ``prune_path_fraction`` is then measured against the intercept-only model rather than
         the main-effects-only one, which can change the interactions kept as well. Requires
-        ``prune=True`` and refuses ``monotone_constraints`` (raises otherwise).
+        ``prune=True`` (raises otherwise).
     prune_selector : {"ranked_path", "fold_vote"}, default="ranked_path"
         How pruning chooses the tables to keep. ``"ranked_path"`` ranks the candidate tables by
         purified variance, admits them in that order under heredity (a k-way table only after
         all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
         deploys the smallest one that is good enough (``prune_path_fraction``,
         ``prune_path_tolerance``). It needs out-of-bag rows: without at least
-        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
-        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) the fit falls back to the
+        fold vote.
         ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
-        vote, evidence gate and no-harm guard: the parameters documented as fold vote only.
+        vote and evidence gate: the parameters documented as fold vote only.
         ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
         lists the parameters you set that it did not read.
     prune_path_fraction : float, default=0.995
@@ -7171,10 +6087,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         raises ``ValueError`` rather than silently no-opping.
     multiclass_prune_cv : bool, default=True
         Multiclass (K>=3) prune selection regime; see :class:`TBoostClassifier`.
-    multiclass_prune_guard_floor : float, default=0.002
-        Floor of the multiclass (K>=3) prune guard's bar; see :class:`TBoostClassifier`.
-    multiclass_prune_guard : bool, default=True
-        The multiclass (K>=3) fold vote's no-harm guard; see :class:`TBoostClassifier`.
     multiclass_prune_sel_bags : int, default=1
         Bag count of the multiclass (K>=3) selection fits; see :class:`TBoostClassifier`. Any
         value other than ``1`` raises here.
@@ -7305,39 +6217,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Consulted only when one of them is armed, so its value cannot perturb a default fit.
         ``3`` is the product bar: mains and pairs are what a filing reads, three-way tables are
         what inflates it. Must be in ``1..8``.
-    prune_guard : bool, default=True
-        Fold vote only: check the selected set of tables as a whole. The vote judges tables one
-        at a time, so it can drop a group of correlated tables that only matter together; the
-        guard compares the selected set with the full set on honest rows (the out-of-bag rows,
-        or a shared holdout for grouped data) and re-admits dropped tables, best evidence
-        first, while the relative deviance gap exceeds ``prune_guard_tol``. The multiclass
-        (K>=3) fold vote uses ``multiclass_prune_guard`` instead.
-    prune_guard_tol : float, default=0.05
-        Fold vote only: the no-harm guard's tolerance, the largest acceptable relative increase
-        of the selected set's deviance over the full set's. ``prune_guard_z``,
-        ``prune_guard_z_dn`` and ``prune_guard_tol_floor`` turn it into an SE-aware bar.
-    prune_guard_z : float, default=0.0
-        Fold vote only (see ``prune_selector``). SE multiplier for the set-level no-harm guard's
-        breach test: it breaches, and the re-admission ladder stops, on ``gap >
-        max(prune_guard_tol, prune_guard_z * SE)`` where ``SE`` is the standard error of the
-        relative deviance gap on the guard's own evidence rows (reported as ``gap_se``, with the
-        resulting bar as ``tol_effective``). The shipped ``0.0`` is the fixed-relative-tolerance
-        test. Measured and deliberately off: on a zero-inflated compound target the row-level SE
-        is dominated by a few large claims and cannot resolve even a real set-level gap — see
-        the ``_PRUNE_GUARD_Z_DEFAULT`` note.
-    prune_guard_z_dn : float, default=2.0
-        Fold vote only (see ``prune_selector``). SE multiplier for the DOWNWARD recalibration of
-        the same bar (av39). The effective tolerance becomes ``min(tol_up,
-        max(prune_guard_tol_floor, prune_guard_z_dn * SE))``, where ``tol_up`` is the
-        ``prune_guard_z`` result above — so where the guard's jury is sharp the bar tightens to
-        a few SE instead of a fixed 5%, and where it is blunt the ``min`` pins the bar back at
-        ``prune_guard_tol`` and the fit is bit-identical. This knob can therefore only ever make
-        the guard fire MORE, never less. It governs BOTH the breach trigger and the ladder's
-        stopping rule. ``0.0`` restores the pre-av39 guard exactly.
-    prune_guard_tol_floor : float, default=0.005
-        Fold vote only (see ``prune_selector``). Lower clamp on the downward recalibration, so
-        an arbitrarily sharp jury cannot drive the bar to zero and re-admit the whole bank on
-        immeasurable noise. Ignored when ``prune_guard_z_dn = 0``.
     prune_min_stability : float, default=0.5
         Fold vote only (see ``prune_selector``). Fold-stability bar for keeping a table: the
         aggregator keeps one when ``mean_gain > prune_min_mean_gain`` **and** (it survived at
@@ -7402,24 +6281,9 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         a ridge fit on its training rows, so every candidate gets a held-out gain. Regression
         and binary classification only: ``True`` raises on a multiclass (K>=3) fit.
     prune_guard_min_rows : int, default=500
-        Minimum honest evidence rows before the tables are judged on them. The ranked path
-        needs this many out-of-bag rows, or the fit falls back as ``prune_selector`` describes.
-        The fold vote's set-level no-harm guard needs this many before it judges at all —
-        below this the pruned-vs-full deviance ratio is noise and the guard reports itself
-        skipped rather than acting on it; it counts out-of-bag-covered rows on the OOB path and
-        shared-holdout rows on the grouped carve path. Only has an effect together with
+        Minimum out-of-bag rows the ranked path needs to score its prefixes; with fewer, the
+        fit falls back as ``prune_selector`` describes. Only has an effect together with
         ``prune=True``.
-    prune_slope_eps : float, default=0.01
-        Fold vote only (see ``prune_selector``). Dead band on the post-prune slope re-anchor:
-        the correction is not applied unless the out-of-bag scale ``b`` differs from 1 by more
-        than this, so a bank that was not materially compressed keeps a byte-identical artifact.
-        See ``pruning_report_["slope"]``.
-    prune_slope_min_z : float, default=3.0
-        Fold vote only (see ``prune_selector``). Significance bar for that same correction:
-        ``b`` must also be off by at least this many standard errors (``z_b``) before it is
-        applied. Together with ``prune_slope_eps`` this is the "materially AND significantly
-        off" test — lowering either makes the re-anchor fire more readily. See
-        ``pruning_report_["slope"]``.
     prune_refit_full : bool, default=False
         Deprecated and without effect on any path: contribution-stability pruning always
         fits the deployed model on all rows and applies the keep-set to that same fit, so
@@ -7431,21 +6295,30 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
-        to deploy the drop-only pruned model. Only has an effect together with ``prune=True``.
+        Held-out no-harm guarded: adopted only if it does not raise the held-out deviance.
+        Tables on a categorical encoded by several channels (``cat_channels``) are left as
+        fitted; the outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only
+        pruned model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
-        Banding: after pruning, each deployed interaction table is condensed into a small
-        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        Banding: each deployed interaction table is condensed into a small product grid of
+        bands. Adjacent cells are merged where the model barely distinguishes
         them, every table containing a feature cuts it at the same nested places, and missing
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
-        outcome is in ``pruning_report_["banding"]``.
+        off. Banding runs on every fit, pruned or not; with one bag (``n_bags=1``) there is
+        no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
+        ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
-        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
-        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
-        that can cost.
+        How far banding may move the predictions, as a fraction of the model's training
+        deviance (``0.001`` = 0.1%): a budget on banding's cross-fitted estimate of the move's
+        expected cost, the deviance it would add if the unbanded tables were exactly right. New
+        data can exceed the estimate at tight caps. The noise tolerance alone could let a very
+        noisy model move far; this caps the move, and is the only bound with one bag
+        (``n_bags=1``). The training deviance rises by more, because the cap
+        leaves out the first-order term (the banded tables move away from the training rows' own
+        optimum); on new data that term can go either way. Must be finite and greater than 0;
+        ``band_tolerance=None`` turns banding off.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -7479,21 +6352,12 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
-        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        kept, and deployed, and the evidence they were judged on; saved with the model.
+        ``["selector"]`` names the selector that ran: ``"none"`` on an unpruned fit
+        (``prune=False``), which keeps every table, ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
         (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
         admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
-        which the guard, slope and evidence fields below describe.
-
-        ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
-        slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
-        bank's (``b_keep``/``b_full``), its standard error ``se_b`` and z-statistic ``z_b``,
-        the ``sd_ratio`` measuring how much link-scale spread the prune removed, and
-        ``applied`` — with ``skipped`` naming the gate when it did not fire. Present only on
-        a log-link fit whose guard ran on out-of-bag evidence; the correction is applied only
-        when the scale is both materially and *significantly* off, so a fit that does not
-        need it keeps a byte-identical artifact.
+        which the evidence fields below describe.
 
         The av37 evidence gate adds ``["drop_z"]`` / ``["keep_budget"]`` (the knobs in force),
         ``["legacy_selected"]`` (what the pre-av37 rule would have kept), ``["evidence_budget"]``
@@ -7501,13 +6365,18 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         wanted that the old rule refused), ``["evidence_admitted"]`` (those it could afford, in
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
-        means the gate was off and every other field is inert. ``["guard"]`` likewise gains
-        ``guard_z``, ``gap_se`` (the SE of the relative deviance gap on the evidence rows) and
-        ``tol_effective`` — the bar actually used for BOTH the breach trigger and the
-        ladder's stopping rule — plus the av39 ``guard_z_dn`` / ``tol_floor`` knobs and
-        ``n_chunks`` (rungs the ladder had available against ``steps``, the rungs climbed).
-        ``tol_effective`` = ``min(max(prune_guard_tol, guard_z*gap_se),
-        max(tol_floor, guard_z_dn*gap_se))``, each term skipped when its z is 0.
+        means the gate was off and every other field is inert.
+
+        ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
+        were adopted, how many kept tables they span, the tables left as fitted
+        (``excluded``) and the held-out deviance before and after.
+
+        ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
+        its tables, the certificate (``"exact"`` when every combination of the other features
+        was checked, ``"bound"`` when a sound bound was used), the worst step before and after
+        (link scale, ``>= 0`` is monotone), the largest change to its main effect, and the
+        interaction tables clipped. ``certified`` is true when the tables were already monotone
+        and were left untouched.
 
         ``["box_budget"]`` appears only when ``prune_box_budget > 0``: ``max_boxes`` (the
         budget), ``boxes_before``/``boxes_after`` and ``effects_before``/``effects_after`` (the
@@ -7630,10 +6499,6 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
         *,
         offset: Any | None = None,
-        eval_set: tuple[Any, Any] | None = None,
-        eval_sample_weight: Any | None = None,
-        eval_exposure: Any | None = None,
-        eval_offset: Any | None = None,
         callbacks: Any | None = None,
     ) -> "TBoostRegressor":
         """Fit the boosted ensemble.
@@ -7672,7 +6537,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             Per-row entity ids for panel/grouped data; a ``str`` names a column of the polars
             ``X``. See the class-level note above. Besides the group-honest internal carves,
             the outer bags are drawn at GROUP granularity (since 2026-09-07), so the
-            out-of-bag rows the cell refit and the prune guard read never contain a row
+            out-of-bag rows the cell refit and the ranked path read never contain a row
             whose group-mates were in bag. ``None`` (the default) keeps the ordinary
             row-level internal carves — as does an ALL-SINGLETON grouping, which is normalized
             to ``None`` at ingest because at group size 1 it means the same thing (a ``str``
@@ -7685,39 +6550,34 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             and like exposure there it also scales the row's mass in the tables' reference
             measure and ``support``. Scoring adds it only when passed again (``offset=`` on
             the ``predict*`` methods); omitted, a row scores on a zero offset.
-        eval_set : (X_val, y_val), optional
-            Rows that only score early stopping: every bag stops at its own best round on
-            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
-            they never reach training, the intercept, the cell refit, the tables or pruning.
-            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
-            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
-        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
-            The evaluation rows' weight, exposure and offset (``str`` names a column of
-            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
-            ``eval_offset`` when ``offset`` is.
         callbacks : callable or list of callables, optional
             Each called after every boosting round of the deployed fit with a dict:
             ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
             ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
             rows and its early-stopping rows; ``None`` without the latter). Bags run in
             parallel, so calls for different bags interleave; each bag's rounds arrive in
-            order, all on the calling thread. A truthy return stops every bag after its
-            current round (``stopping_reason_ == "callback"``); an exception stops the fit
-            and propagates. The per-round history is kept in ``evals_result_``.
+            order, all on the calling thread. A truthy return stops that bag (``info["bag"]``)
+            after the round, as early stopping stops each bag at its own round
+            (``stopping_reason_per_bag_`` is then ``"callback"``); to stop the whole fit,
+            return truthy for every bag. A callback that decides from its dict alone stops the
+            same bags at the same rounds on every run. An exception stops the fit and
+            propagates. The per-round history is kept in ``evals_result_``.
 
         Notes
         -----
-        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        After a fit, ``n_trees_per_bag_`` holds the trees each bag kept,
         ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
         ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
         ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
         boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
-        ``evals_result_`` holds each bag's per-round mean deviances:
-        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
-        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
-        is an extra pass per round, so it is computed only when ``callbacks`` are given.
+        model saved before 0.7.0. ``evals_result_`` holds each bag's per-round mean deviance on
+        the rows it set aside for early stopping (``validation_fraction``), ``{"eval":
+        {"deviance": [[...], ...]}}``, which the stopping rule computes anyway; with
+        ``callbacks`` it also holds ``"train"``, the deviance on the bag's training rows (an
+        extra pass per round, +5-11% fit time). It is kept on the live fit only, not saved with
+        the model, and is absent when there is neither (``validation_fraction=None`` without
+        ``callbacks``).
 
         Returns
         -------
@@ -7741,11 +6601,7 @@ class TBoostRegressor(RegressorMixin, _BaseTBoost):  # type: ignore[misc]
             },
         )
         self._record_column_specs(y, sample_weight, exposure, groups)
-        self._stage_fit_extras(
-            eval_set, eval_sample_weight, eval_exposure, callbacks,
-            has_exposure=resolved["exposure"] is not None,
-            eval_offset=eval_offset, has_offset=resolved["offset"] is not None,
-        )
+        self._stage_fit_extras(callbacks)
         try:
             self._fit_model(
                 X,
@@ -8020,9 +6876,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     (``n_bags=8``), per-tree column sampling is on (``colsample_bytree=0.8``), and post-fit
     table pruning is on (``prune=True``): the bags' out-of-bag rows choose the tables to keep
     (``prune_selector``), the kept interaction tables are banded (``band_tolerance``) and the
-    tables are graduated (``graduate``; not for multiclass). The fitted artifact is that tables-only model.
-    Pass ``n_bags=1, validation_fraction=None, prune=False`` for the cheapest single-fit
-    baseline.
+    tables are graduated (``graduate``). The fitted artifact is that tables-only model.
+    Pass ``n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+    graduate=False`` for the cheapest single-fit baseline: one fit's full table bank, as the
+    trees fitted it.
 
     polars DataFrames/LazyFrames are first-class ``X`` input (their extracted numeric block
     is already F-contiguous float32, the cheapest ingest layout; String/Categorical/Enum
@@ -8033,11 +6890,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
 
     **Honesty notes.** With ``groups=`` on :meth:`fit`, the outer bags are drawn at GROUP
     granularity (since 2026-09-07): no group straddles a bag's in-bag/out-of-bag boundary, so
-    the out-of-bag rows the cell refit and the prune guard read are honest on panel data.
+    the out-of-bag rows the cell refit and the ranked path read are honest on panel data.
     The internal early-stopping holdout carve is stratified by class in
     the native core for every ``n_bags`` configuration — for binary (K=2) AND multiclass
-    (K>=3) fits alike (the per-class labels are the strata). Multiclass fits also have no ``graduate``/Whittaker-Henderson graduation path at
-    all (an explicit ``graduate=True`` raises rather than silently no-opping), and no
+    (K>=3) fits alike (the per-class labels are the strata). Multiclass fits have no
     ``exposure`` support (:meth:`fit` raises if both are given for K>=3).
 
     The multiclass (K>=3) native-softmax path HONORS: ``n_bags``/``bag_subsample`` (outer bags
@@ -8045,10 +6901,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     since 2026-08-23 — one row draw per round shared by the K class trees, weighted by the joint
     gradient/hessian norm across classes), the post-prune per-class intercept re-anchor (an
     intercept-only multinomial IPF, applied unconditionally inside the prune — it is NOT the
-    ``reanchor`` knob), ``multiclass_prune_guard`` (the K>=3 set-level prune no-harm guard,
-    ON by default since 2026-09-07 with an SE-aware bar; see ``multiclass_prune_cv``), and ``cell_refit_base``/``cell_refit_gamma`` (the §G1 out-of-bag fANOVA
+    ``reanchor`` knob), and ``cell_refit_base``/``cell_refit_gamma`` (the §G1 out-of-bag fANOVA
     cell refit, since 2026-08-25 — K decoupled diagonal-Hessian cell solves on the softmax
-    working residual, accepted or shrunk by ONE joint backtrack on the true multinomial loss).
+    working residual, accepted or shrunk by ONE joint backtrack on the true multinomial loss),
+    and every post-fit stage: the rebalance (``prune_rebalance``, re-solved the same way),
+    banding and graduation of every class's tables.
     ``leaf_refine_steps``/``leaf_refine_backtracks`` have no effect for K>=3 (a Jacobi
     refinement measured harmful as a drop-in), so a default fit is byte-identical to
     ``leaf_refine_steps=0``.
@@ -8190,15 +7047,16 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         fade, and additionally requires 3-way admissions to clear a stricter multiplier than
         2-way admissions.
     graduate : bool or None, default=None
-        Binary (K=2) fits use the regressor's graduation policy -- smoothing on the
-        full fit, no holdout, no accuracy gate (see :class:`TBoostRegressor`).
-        Multiclass (K>=3) graduation is unavailable; explicit ``True`` raises.
+        The regressor's graduation policy -- smoothing on the full fit, no holdout, kept
+        only if the training deviance rises by at most 1% (see :class:`TBoostRegressor`). A
+        multiclass (K>=3) fit graduates every class's tables, re-anchors the class
+        intercepts, and checks the multinomial deviance.
     graduation_alpha : float or None, default=None
-        Fixed smoothing strength on binary fits; unused for multiclass.
+        Fixed smoothing strength (see :class:`TBoostRegressor`).
     graduation_high_order_alpha : float, default=0.0
         Opt-in strength in ``[0, 1]`` for one reference-weighted neighbour diffusion
-        step on factored interactions of orders 3 through 8. Requires ``prune=True``
-        and graduation enabled; unsupported for monotone or multiclass fits. Numeric
+        step on factored interactions of orders 3 through 8. Requires graduation
+        enabled. Numeric
         axes use finite cell order; categorical axes and missing-to-finite edges are
         excluded. A missing slice may still change along other numeric axes.
         Preserves product-reference zero marginal means and recomputes variances.
@@ -8240,9 +7098,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         two levers that most move stacking accuracy, at a cost of roughly ``n_bags`` times
         the train/predict time of a single fit — accuracy is the priority of the shipped
         default. ``n_bags=1`` disables bagging; without it there are no out-of-bag rows, so
-        banding is skipped and pruning falls back to the fold vote (a multiclass fit keeps
-        its full bank instead). The multiclass (K>=3) path bags too, souping the bags per
-        class.
+        pruning falls back to the fold vote, and no spread between bags, so
+        ``band_deviance_cap`` alone bounds the banding. The multiclass (K>=3) path bags too,
+        souping the bags per class.
     bag_subsample : float, default=0.8
         Per-bag row-sampling fraction for outer bagging. ``0.8`` (the default) is subagging
         — sampling without replacement — rather than a ``1.0`` bootstrap: a bootstrap bag
@@ -8300,12 +7158,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
     reanchor : bool or None, default=None
         Whether to re-solve the model's global intercept exactly against the training data
         after fitting, removing post-shrinkage aggregate bias. ``None`` uses a link-aware
-        default which resolves to off for the logistic objective (the link-aware "on" case
-        only applies to the log-link regression objectives). An explicit ``True``/``False``
-        always overrides the default on the binary (K=2) path; the multiclass (K>=3) path
-        does not apply intercept re-anchoring at all regardless of this setting — an
-        explicit ``True``/``False`` there raises ``ValueError`` rather than silently
-        no-opping (see the class-level honesty note).
+        default, which resolves to on for the logistic objective. An explicit
+        ``True``/``False`` always overrides the default on the binary (K=2) path; the
+        multiclass (K>=3) path does not apply intercept re-anchoring at all regardless of
+        this setting — an explicit ``True``/``False`` there raises ``ValueError`` rather than
+        silently no-opping (see the class-level honesty note).
     reanchor_slope : bool or None, default=None
         Whether to fit an honest affine link-scale recalibration (``F' = b + a * F``) on the
         fit's own internal validation holdout after early stopping, correcting the uniform
@@ -8314,8 +7171,8 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         fit is ridge-shrunk toward the identity and only applied when its holdout deviance
         gain clears the prior penalty, so thin or uninformative holdouts stay at
         (near-)identity — this can only help or be neutral, never hurt. Inert without a
-        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` follows
-        the same link-aware default as ``reanchor`` (off for the logistic objective); an
+        validation holdout (i.e. when ``validation_fraction`` is ``None``). ``None`` resolves
+        to off for the logistic objective (validated on the log-link objectives only); an
         explicit ``True``/``False`` always wins on the binary (K=2) path. Like ``reanchor``,
         the multiclass (K>=3) path does not apply this recalibration regardless of the
         setting — an explicit ``True``/``False`` there raises ``ValueError`` rather than
@@ -8396,7 +7253,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         ``"default_cell"`` always scores it in the axis's ``default_cell`` (the encoder's base
         level). ``"error"`` makes every scoring call (``predict*``, ``predict_contributions``,
         ``tables``, ``cell_indices``, ``actual_vs_expected``) raise ``ValueError`` naming the
-        feature and up to five unseen values. ``eval_set`` rows follow the same policy. A null
+        feature and up to five unseen values. A null
         is never unknown: it scores in the missing level. ``tables()`` marks the cell an unseen
         value lands in (``unseen_cell``), ``categories_`` lists the fitted levels and
         :meth:`unseen_values` counts the unseen ones.
@@ -8405,7 +7262,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         applies no constraints. Accepts either a length-``n_features`` positional sequence of
         ``{-1, 0, 1}`` (``1`` = increasing, ``-1`` = decreasing, ``0`` = unconstrained), or a
         dict keyed by feature name (matched against DataFrame column names, or the canonical
-        ``f{i}``) or integer index, valued the same way.
+        ``f{i}``) or integer index, valued the same way. Numeric features only: a sign on a
+        categorical feature raises. The trees enforce the signs; every post-fit stage then
+        runs as usual and the deployed tables are projected back onto the signs last,
+        changing as little as they can (``pruning_report_["monotone"]``).
     categorical_features : sequence, str, int, or None, default=None
         Which features to treat as categorical (target-statistic encoded, see the ``cat_*``
         parameters) rather than numeric. Accepts a single name/index, a sequence of
@@ -8501,9 +7361,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         place on held-out rows, and deploy the smaller, more explainable tables-only model
         (see ``pruning_report_``). ON by default — every insur-arena benchmark cell deployed
         the pruned artifact. ``prune_selector`` decides how the tables are judged (see
-        :class:`TBoostRegressor`). ``False`` deploys the full, unpruned table bank instead
-        (fitted faster, but a much larger artifact). Either way the model is stored as rating
-        tables. Available on both the binary and multiclass (K>=3) paths.
+        :class:`TBoostRegressor`). ``False`` keeps the full table bank instead (fitted faster,
+        but more tables); only the selection is skipped, and the model is always stored as
+        rating tables. Available on both the binary and multiclass (K>=3) paths.
     prune_main_effects : bool, default=False
         Whether pruning may drop main effects too; see :class:`TBoostRegressor`. Honored by
         every selector on the binary and multiclass (K>=3) paths.
@@ -8513,10 +7373,10 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         all its (k-1)-way subsets), scores the prefixes on the bags' out-of-bag rows and
         deploys the smallest one that is good enough (``prune_path_fraction``,
         ``prune_path_tolerance``). It needs out-of-bag rows: without at least
-        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) a regression or binary fit
-        falls back to the fold vote, and a multiclass (K>=3) fit keeps its full bank.
+        ``prune_guard_min_rows`` of them (``n_bags=1``, for one) the fit falls back to the
+        fold vote.
         ``"fold_vote"`` judges every table by refits on cross-validation folds, with its own
-        vote, evidence gate and no-harm guard: the parameters documented as fold vote only.
+        vote and evidence gate: the parameters documented as fold vote only.
         ``pruning_report_["selector"]`` records which selector ran, and ``binding_report_``
         lists the parameters you set that it did not read.
     prune_path_fraction : float, default=0.995
@@ -8549,20 +7409,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Multiclass (K>=3) prune selection regime. ``True`` (the default since 2026-09-07) is
         the single-output prune's design: ``prune_n_folds`` fold refits scored on their
         held-out fold, voted with ``prune_min_stability``, gated by ``prune_drop_z`` and
-        ``prune_keep_budget``, then measured by ``multiclass_prune_guard`` with an SE-aware bar.
-        ``False`` is the historical single train/select split walk, which was measured to drop
-        tables on selection noise and to lose 0.003-0.006 skill on the InsurArena multiclass
-        panels.
-    multiclass_prune_guard_floor : float, default=0.002
-        Floor of the multiclass (K>=3) prune guard's bar, as a fraction of the deploy model's
-        honest deviance improvement over the class prior. The guard re-admits tables until the
-        pruned model is within ``max(prune_guard_z_dn * SE, floor * (dev_null - dev_full))`` of
-        the full bank on honest rows; the floor is the price a simpler model is allowed to pay.
-        ``0.0`` keeps the SE term only.
-    multiclass_prune_guard : bool, default=True
-        The multiclass (K>=3) fold vote's set-level no-harm guard: check the selected tables as
-        a whole against the full bank on honest rows, and re-admit dropped tables while the gap
-        exceeds the bar (see ``multiclass_prune_guard_floor``). The ranked path has no guard.
+        ``prune_keep_budget``. ``False`` is the historical single train/select split walk,
+        which was measured to drop tables on selection noise and to lose 0.003-0.006 skill on
+        the InsurArena multiclass panels.
     multiclass_prune_sel_bags : int, default=1
         Bag count of the multiclass (K>=3) fold vote's selection fits (the fold models, or the
         selection model of the legacy single split). Must be ``>= 1``; any value other than
@@ -8694,39 +7543,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Consulted only when one of them is armed, so its value cannot perturb a default fit.
         ``3`` is the product bar: mains and pairs are what a filing reads, three-way tables are
         what inflates it. Must be in ``1..8``.
-    prune_guard : bool, default=True
-        Fold vote only: check the selected set of tables as a whole. The vote judges tables one
-        at a time, so it can drop a group of correlated tables that only matter together; the
-        guard compares the selected set with the full set on honest rows (the out-of-bag rows,
-        or a shared holdout for grouped data) and re-admits dropped tables, best evidence
-        first, while the relative deviance gap exceeds ``prune_guard_tol``. The multiclass
-        (K>=3) fold vote uses ``multiclass_prune_guard`` instead.
-    prune_guard_tol : float, default=0.05
-        Fold vote only: the no-harm guard's tolerance, the largest acceptable relative increase
-        of the selected set's deviance over the full set's. ``prune_guard_z``,
-        ``prune_guard_z_dn`` and ``prune_guard_tol_floor`` turn it into an SE-aware bar.
-    prune_guard_z : float, default=0.0
-        Fold vote only (see ``prune_selector``). SE multiplier for the set-level no-harm guard's
-        breach test: it breaches, and the re-admission ladder stops, on ``gap >
-        max(prune_guard_tol, prune_guard_z * SE)`` where ``SE`` is the standard error of the
-        relative deviance gap on the guard's own evidence rows (reported as ``gap_se``, with the
-        resulting bar as ``tol_effective``). The shipped ``0.0`` is the fixed-relative-tolerance
-        test. Measured and deliberately off: on a zero-inflated compound target the row-level SE
-        is dominated by a few large claims and cannot resolve even a real set-level gap — see
-        the ``_PRUNE_GUARD_Z_DEFAULT`` note.
-    prune_guard_z_dn : float, default=2.0
-        Fold vote only (see ``prune_selector``). SE multiplier for the DOWNWARD recalibration of
-        the same bar (av39). The effective tolerance becomes ``min(tol_up,
-        max(prune_guard_tol_floor, prune_guard_z_dn * SE))``, where ``tol_up`` is the
-        ``prune_guard_z`` result above — so where the guard's jury is sharp the bar tightens to
-        a few SE instead of a fixed 5%, and where it is blunt the ``min`` pins the bar back at
-        ``prune_guard_tol`` and the fit is bit-identical. This knob can therefore only ever make
-        the guard fire MORE, never less. It governs BOTH the breach trigger and the ladder's
-        stopping rule. ``0.0`` restores the pre-av39 guard exactly.
-    prune_guard_tol_floor : float, default=0.005
-        Fold vote only (see ``prune_selector``). Lower clamp on the downward recalibration, so
-        an arbitrarily sharp jury cannot drive the bar to zero and re-admit the whole bank on
-        immeasurable noise. Ignored when ``prune_guard_z_dn = 0``.
     prune_min_stability : float, default=0.5
         Fold vote only (see ``prune_selector``). Fold-stability bar for keeping a table: the
         aggregator keeps one when ``mean_gain > prune_min_mean_gain`` **and** (it survived at
@@ -8791,24 +7607,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         a ridge fit on its training rows, so every candidate gets a held-out gain. Regression
         and binary classification only: ``True`` raises on a multiclass (K>=3) fit.
     prune_guard_min_rows : int, default=500
-        Minimum honest evidence rows before the tables are judged on them. The ranked path
-        needs this many out-of-bag rows, or the fit falls back as ``prune_selector`` describes.
-        The fold vote's set-level no-harm guard needs this many before it judges at all —
-        below this the pruned-vs-full deviance ratio is noise and the guard reports itself
-        skipped rather than acting on it; it counts out-of-bag-covered rows on the OOB path and
-        shared-holdout rows on the grouped carve path. Only has an effect together with
+        Minimum out-of-bag rows the ranked path needs to score its prefixes; with fewer, the
+        fit falls back as ``prune_selector`` describes. Only has an effect together with
         ``prune=True``.
-    prune_slope_eps : float, default=0.01
-        Fold vote only (see ``prune_selector``). Dead band on the post-prune slope re-anchor:
-        the correction is not applied unless the out-of-bag scale ``b`` differs from 1 by more
-        than this, so a bank that was not materially compressed keeps a byte-identical artifact.
-        See ``pruning_report_["slope"]``.
-    prune_slope_min_z : float, default=3.0
-        Fold vote only (see ``prune_selector``). Significance bar for that same correction:
-        ``b`` must also be off by at least this many standard errors (``z_b``) before it is
-        applied. Together with ``prune_slope_eps`` this is the "materially AND significantly
-        off" test — lowering either makes the re-anchor fire more readily. See
-        ``pruning_report_["slope"]``.
     prune_refit_full : bool, default=False
         Deprecated and without effect on any path: contribution-stability pruning always
         fits the deployed model on all rows and applies the keep-set to that same fit, so
@@ -8820,22 +7621,32 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Whether to re-solve the surviving tables' cell values to the deviance-optimum of the
         reduced structure after pruning drops tables ("rebalance on means": a single IRLS
         ridge cell-refit step, re-purified to preserve the 1-/2-/3-way order separation).
-        Held-out no-harm guarded: adopted only if it lowers held-out deviance. Set ``False``
-        to deploy the drop-only pruned model. Binary (K=2) path only. Only has an effect
-        together with ``prune=True``.
+        Held-out no-harm guarded: adopted only if it does not raise the held-out deviance. On a
+        multiclass (K>=3) fit each class's tables are re-solved from the softmax residual, and
+        one joint step, chosen on the held-out multinomial deviance, decides how much of it is
+        kept. Tables on a categorical encoded by several channels are left as fitted; the
+        outcome is in ``pruning_report_["rebalance"]``. Set ``False`` to deploy the drop-only pruned
+        model. Only has an effect together with ``prune=True``.
     band_tolerance : float or None, default=0.75
-        Banding: after pruning, each deployed interaction table is condensed into a small
-        product grid of bands. Adjacent cells are merged where the model barely distinguishes
+        Banding: each deployed interaction table is condensed into a small product grid of
+        bands. Adjacent cells are merged where the model barely distinguishes
         them, every table containing a feature cuts it at the same nested places, and missing
         values keep their own band. The mean squared change of the predictions is held within
         ``(band_tolerance * sigma) ** 2``, where ``sigma`` is the spread between the bags, and
         within ``band_deviance_cap``; larger values give coarser bands. ``None`` turns banding
-        off. Banding runs only on a pruned, bagged fit (``prune=True``, ``n_bags >= 2``); the
-        outcome is in ``pruning_report_["banding"]``.
+        off. Banding runs on every fit, pruned or not; with one bag (``n_bags=1``) there is
+        no spread to measure, so ``band_deviance_cap`` alone bounds it. The outcome is in
+        ``pruning_report_["banding"]``.
     band_deviance_cap : float, default=0.001
-        The most banding may cost, as a fraction of the model's training deviance (``0.001`` =
-        0.1%). The noise tolerance alone could let a very noisy model move far; this caps what
-        that can cost.
+        How far banding may move the predictions, as a fraction of the model's training
+        deviance (``0.001`` = 0.1%): a budget on banding's cross-fitted estimate of the move's
+        expected cost, the deviance it would add if the unbanded tables were exactly right. New
+        data can exceed the estimate at tight caps. The noise tolerance alone could let a very
+        noisy model move far; this caps the move, and is the only bound with one bag
+        (``n_bags=1``). A model with three or more classes shares it between the classes. The training deviance rises by more, because the cap
+        leaves out the first-order term (the banded tables move away from the training rows' own
+        optimum); on new data that term can go either way. Must be finite and greater than 0;
+        ``band_tolerance=None`` turns banding off.
     ref_measure : {"exposure", "product_marginals", "uniform"} or None, default=None
         The reference measure the fitted tables are purified against, i.e. the weighting
         that decides which table owns the part of the score that could sit in more than one
@@ -8872,21 +7683,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         Wall-clock seconds the fit took. Saved with the model.
     pruning_report_ : dict
         Diagnostic report from post-fit table pruning: which fANOVA effects were scanned,
-        kept, and deployed, and the evidence they were judged on. Only set when
-        ``prune=True``; saved with the model. ``["selector"]`` names the selector that ran:
-        ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
+        kept, and deployed, and the evidence they were judged on; saved with the model.
+        ``["selector"]`` names the selector that ran: ``"none"`` on an unpruned fit
+        (``prune=False``), which keeps every table, ``"ranked_path"``, whose prefixes and their out-of-bag deviances are under ``["path"]``
         (``["selection"]`` on a multiclass fit) with the total gain, the cutoff steps, the
         admission ``sequence`` and the tables the variance-share floor dropped, or a fold vote,
-        which the guard, slope and evidence fields below describe.
-
-        ``["guard"]`` records the set-level no-harm guard, and ``["slope"]`` the post-prune
-        slope re-anchor: the deployed bank's out-of-bag scale ``b`` relative to the full
-        bank's (``b_keep``/``b_full``), its standard error ``se_b`` and z-statistic ``z_b``,
-        the ``sd_ratio`` measuring how much link-scale spread the prune removed, and
-        ``applied`` — with ``skipped`` naming the gate when it did not fire. Present only on
-        a log-link fit whose guard ran on out-of-bag evidence; the correction is applied only
-        when the scale is both materially and *significantly* off, so a fit that does not
-        need it keeps a byte-identical artifact.
+        which the evidence fields below describe.
 
         The av37 evidence gate adds ``["drop_z"]`` / ``["keep_budget"]`` (the knobs in force),
         ``["legacy_selected"]`` (what the pre-av37 rule would have kept), ``["evidence_budget"]``
@@ -8894,13 +7696,18 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         wanted that the old rule refused), ``["evidence_admitted"]`` (those it could afford, in
         rank order), ``["evidence_budget_bound"]`` (whether the budget truncated them) and
         ``["evidence_scores"]`` (per table: fold count, mean gain, SE and t). ``drop_z: null``
-        means the gate was off and every other field is inert. ``["guard"]`` likewise gains
-        ``guard_z``, ``gap_se`` (the SE of the relative deviance gap on the evidence rows) and
-        ``tol_effective`` — the bar actually used for BOTH the breach trigger and the
-        ladder's stopping rule — plus the av39 ``guard_z_dn`` / ``tol_floor`` knobs and
-        ``n_chunks`` (rungs the ladder had available against ``steps``, the rungs climbed).
-        ``tol_effective`` = ``min(max(prune_guard_tol, guard_z*gap_se),
-        max(tol_floor, guard_z_dn*gap_se))``, each term skipped when its z is 0.
+        means the gate was off and every other field is inert.
+
+        ``["rebalance"]`` (with ``prune_rebalance``) records whether the re-solved cell values
+        were adopted, how many kept tables they span, the tables left as fitted
+        (``excluded``) and the held-out deviance before and after.
+
+        ``["monotone"]`` appears on a fit with ``monotone_constraints``: per constrained feature,
+        its tables, the certificate (``"exact"`` when every combination of the other features
+        was checked, ``"bound"`` when a sound bound was used), the worst step before and after
+        (link scale, ``>= 0`` is monotone), the largest change to its main effect, and the
+        interaction tables clipped. ``certified`` is true when the tables were already monotone
+        and were left untouched.
 
         ``["box_budget"]`` appears only when ``prune_box_budget > 0``: ``max_boxes`` (the
         budget), ``boxes_before``/``boxes_after`` and ``effects_before``/``effects_after`` (the
@@ -8910,10 +7717,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         first, so the tail is the weakest) and ``cascade_dropped`` (those removed after, each
         properly containing a dropped support).
     graduation_report_ : list of dict
-        One entry per eligible table on a BINARY (K=2) fit -- the binary bank graduates
-        through the same path as the regressor's (see ``graduate``). Not set for
-        multiclass (K>=3): there is no Whittaker-Henderson path for the per-class banks,
-        and an explicit ``graduate=True`` raises there rather than no-opping.
+        One entry per eligible table, as on the regressor (see ``graduate``). On a
+        multiclass (K>=3) fit each entry also names its class bank (``class``, the index into
+        ``classes_``).
 
     Examples
     --------
@@ -9100,18 +7906,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_rebalance: bool = True,
         ref_measure: str | None = None,
         measure_floor: float = _MEASURE_FLOOR_DEFAULT,
-        prune_guard: bool = True,
-        prune_guard_tol: float = 0.05,
         prune_drop_z: float | None = _PRUNE_DROP_Z_DEFAULT,
         prune_keep_budget: int = _PRUNE_KEEP_BUDGET_DEFAULT,
         prune_fold_fidelity: bool = _PRUNE_FOLD_FIDELITY_DEFAULT,
-        prune_guard_z: float = _PRUNE_GUARD_Z_DEFAULT,
-        prune_guard_z_dn: float = _PRUNE_GUARD_Z_DN_DEFAULT,
-        prune_guard_tol_floor: float = _PRUNE_GUARD_TOL_FLOOR_DEFAULT,
-        multiclass_prune_guard: bool = True,
         multiclass_prune_sel_bags: int = 1,
         multiclass_prune_cv: bool = True,
-        multiclass_prune_guard_floor: float = _MULTICLASS_GUARD_FLOOR_DEFAULT,
         prune_box_budget: int = _PRUNE_BOX_BUDGET_DEFAULT,
         prune_lambda_boxes: float = _PRUNE_LAMBDA_BOXES_DEFAULT,
         prune_table_budget: int = _PRUNE_TABLE_BUDGET_DEFAULT,
@@ -9130,8 +7929,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         prune_fold_min_rows: int = _MIN_PRUNE_FOLD_ROWS,
         prune_fold_es_patience: int | None = None,
         prune_guard_min_rows: int = _PRUNE_GUARD_MIN_ROWS,
-        prune_slope_eps: float = _SLOPE_EPS,
-        prune_slope_min_z: float = _SLOPE_MIN_Z,
         prune_size_penalty: float | None = None,
         early_stopping: int | float | None = None,
         unknown_category: str = "rare",
@@ -9210,18 +8007,11 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             prune_rebalance=prune_rebalance,
             ref_measure=ref_measure,
             measure_floor=measure_floor,
-            prune_guard=prune_guard,
-            prune_guard_tol=prune_guard_tol,
             prune_drop_z=prune_drop_z,
             prune_keep_budget=prune_keep_budget,
             prune_fold_fidelity=prune_fold_fidelity,
-            prune_guard_z=prune_guard_z,
-            prune_guard_z_dn=prune_guard_z_dn,
-            prune_guard_tol_floor=prune_guard_tol_floor,
-            multiclass_prune_guard=multiclass_prune_guard,
             multiclass_prune_sel_bags=multiclass_prune_sel_bags,
             multiclass_prune_cv=multiclass_prune_cv,
-            multiclass_prune_guard_floor=multiclass_prune_guard_floor,
             prune_box_budget=prune_box_budget,
             prune_lambda_boxes=prune_lambda_boxes,
             prune_table_budget=prune_table_budget,
@@ -9240,8 +8030,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             prune_fold_min_rows=prune_fold_min_rows,
             prune_fold_es_patience=prune_fold_es_patience,
             prune_guard_min_rows=prune_guard_min_rows,
-            prune_slope_eps=prune_slope_eps,
-            prune_slope_min_z=prune_slope_min_z,
         )
 
     def _expected_response(
@@ -9272,10 +8060,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
         *,
         offset: Any | None = None,
-        eval_set: tuple[Any, Any] | None = None,
-        eval_sample_weight: Any | None = None,
-        eval_exposure: Any | None = None,
-        eval_offset: Any | None = None,
         callbacks: Any | None = None,
     ) -> "TBoostClassifier":
         """Fit the boosted ensemble.
@@ -9328,39 +8112,36 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             and like exposure there it also scales the row's mass in the tables' reference
             measure and ``support``. Scoring adds it only when passed again (``offset=`` on
             the ``predict*`` methods); omitted, a row scores on a zero offset.
-        eval_set : (X_val, y_val), optional
-            Rows that only score early stopping: every bag stops at its own best round on
-            them, no holdout is carved from ``X`` (``validation_fraction`` is ignored), and
-            they never reach training, the intercept, the cell refit, the tables or pruning.
-            ``X_val`` is matched to the fit features as ``predict`` matches; ``y_val`` may name
-            a column of a polars ``X_val``. ``reanchor_slope=True`` is refused with it.
-        eval_sample_weight, eval_exposure, eval_offset : array-like or str, optional
-            The evaluation rows' weight, exposure and offset (``str`` names a column of
-            ``X_val``). ``eval_exposure`` is required when ``exposure`` is given, and
-            ``eval_offset`` when ``offset`` is.
         callbacks : callable or list of callables, optional
             Each called after every boosting round of the deployed fit with a dict:
             ``phase`` (``"fit"``), ``bag``, ``n_bags``, ``round`` (1-based), ``n_trees``,
             ``train_deviance`` and ``eval_deviance`` (mean deviances on the bag's training
             rows and its early-stopping rows; ``None`` without the latter). Bags run in
             parallel, so calls for different bags interleave; each bag's rounds arrive in
-            order, all on the calling thread. A truthy return stops every bag after its
-            current round (``stopping_reason_ == "callback"``); an exception stops the fit
-            and propagates. The per-round history is kept in ``evals_result_``.
+            order, all on the calling thread. A truthy return stops that bag (``info["bag"]``)
+            after the round, as early stopping stops each bag at its own round
+            (``stopping_reason_per_bag_`` is then ``"callback"``); to stop the whole fit,
+            return truthy for every bag. A callback that decides from its dict alone stops the
+            same bags at the same rounds on every run. An exception stops the fit and
+            propagates. The per-round history is kept in ``evals_result_``.
 
         Notes
         -----
-        After a regression or binary fit, ``n_trees_per_bag_`` holds the trees each bag kept,
+        After a fit, ``n_trees_per_bag_`` holds the trees each bag kept,
         ``stopping_reason_per_bag_`` why each bag stopped (``"early_stopping"``,
         ``"max_trees"``, ``"no_split"`` or ``"callback"``), ``n_trees_`` the largest count and
         ``stopping_reason_`` one summary (``"callback"``, else ``"early_stopping"``, else
-        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). They describe the
-        boosting, before pruning, and survive ``to_bytes``/``to_json``; they are ``None`` for a
-        multiclass fit or a model saved before 0.7.0. With ``eval_set`` or ``callbacks``,
-        ``evals_result_`` holds each bag's per-round mean deviances:
-        ``{"train": {"deviance": [[...], ...]}, "eval": {"deviance": [[...], ...]}}``. The
-        ``"eval"`` curve (the early-stopping rows) costs nothing extra; the ``"train"`` curve
-        is an extra pass per round, so it is computed only when ``callbacks`` are given.
+        ``"no_split"`` if any bag ended that way, else ``"max_trees"``). On a multiclass
+        (K>=3) fit a boosting round grows one tree per class, so the counts are rounds, which
+        ``n_trees`` caps. They describe the boosting, before pruning, and survive
+        ``to_bytes``/``to_json``; they are ``None`` for a model saved before 0.7.0 (a multiclass
+        one before 0.9.1). ``evals_result_`` holds each bag's per-round mean deviance on the rows
+        it set aside for early stopping (``validation_fraction``), ``{"eval": {"deviance":
+        [[...], ...]}}``, which the stopping rule computes anyway (the multinomial deviance on a
+        multiclass fit, one value per round); on a binary fit with ``callbacks`` it also holds
+        ``"train"``, the deviance on the bag's training rows (an extra pass per round, +5-11%
+        fit time). It is kept on the live fit only, not saved with the model, and is absent
+        when there is neither (``validation_fraction=None`` without ``callbacks``).
 
         Returns
         -------
@@ -9412,11 +8193,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             # Binary stays on the exact logistic single-model path (unchanged wire format/behavior).
             self._multi_model = None
             y01 = (y_arr == classes[1]).astype(np.float32, copy=False)
-            self._stage_fit_extras(
-                eval_set, eval_sample_weight, eval_exposure, callbacks,
-                has_exposure=exposure is not None,
-                eval_offset=eval_offset, has_offset=offset is not None,
-            )
+            self._stage_fit_extras(callbacks)
             try:
                 self._fit_model(
                     X,
@@ -9429,11 +8206,12 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 )
             finally:
                 self.__dict__.pop("_fit_extras_", None)
+            self._warn_voided_params()
             return self
         # K >= 3: native-softmax (multinomial) multiclass path.
-        if eval_set is not None or callbacks is not None or offset is not None:
+        if callbacks is not None or offset is not None:
             raise ValueError(
-                "eval_set, callbacks and offset support regression and binary classification only"
+                "callbacks and offset support regression and binary classification only"
             )
         if exposure is not None:
             raise ValueError("exposure is not supported for multiclass (K >= 3) classification")
@@ -9443,14 +8221,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         # the prune report and the deployed artifact. OVERRIDDEN only — see the method.
         self._warn_voided_params()
         return self
-
-    def _eval_target(self, y: Any) -> np.ndarray:
-        labels = np.asarray(y)
-        if labels.ndim == 2 and labels.shape[1] == 1:
-            labels = labels[:, 0]
-        if labels.ndim != 1 or not np.all(np.isin(labels, self.classes_)):
-            raise ValueError("eval_set y must hold only the class labels seen in y")
-        return cast(np.ndarray, (labels == self.classes_[1]).astype(np.float32))
 
     def _fit_multiclass(
         self,
@@ -9462,15 +8232,9 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         groups: Any | None = None,
     ) -> _MultiClassModel | _MultiClassTableModel:
         self._clear_stale_fit_state()
-        self._clear_fit_counts()  # the boosting report covers regression and binary fits
-        # No silent no-op: there is no graduation path for multiclass (K>=3) at all, prune or
-        # not, so an explicit graduate=True can never be honored here.
-        if self.graduate:
-            raise ValueError(
-                "graduate=True has no effect for multiclass (K>=3) fits: there is no "
-                "Whittaker-Henderson graduation path for the multiclass per-class banks. "
-                "Leave graduate at its default (None)."
-            )
+        self._clear_fit_counts()  # set again from the deployed fit's report below
+        self._validate_high_order_alpha()
+        self._validate_band_deviance_cap()
         self._validate_multiclass_inert_params()
         self._validate_cat_channels(multiclass=True)
         _reject_sparse(X)
@@ -9508,7 +8272,7 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
             if _is_degenerate_grouping(groups_arr):
                 groups_arr = None
         # GROUP-AWARE outer bags (2026-09-07): dense group codes make every bag a subsample of
-        # whole groups, so the out-of-bag rows the cell refit and the prune guard read are honest
+        # whole groups, so the out-of-bag rows the cell refit and the ranked path read are honest
         # on panel data (a policy's other years never trained the jury that scores it).
         bag_codes = (
             np.ascontiguousarray(np.unique(groups_arr, return_inverse=True)[1], dtype=np.uint32)
@@ -9531,8 +8295,6 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
         self._ae_requires_weight_ = weight32 is not None
         self._ae_requires_exposure_ = self._ae_requires_offset_ = False
         monotone = self._resolve_monotone(n_features, feature_names)
-        if self.graduation_high_order_alpha > 0 and monotone and any(monotone):
-            raise ValueError("higher-order smoothing does not support monotone constraints")
         if monotone is not None and cat_idx:
             cat_set = set(cat_idx)
             numeric_idx = [i for i in range(n_features) if i not in cat_set]
@@ -9560,29 +8322,22 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 se_rule=float(self.prune_se_rule),
                 lambda_boxes=float(getattr(self, "prune_lambda_boxes", 0.0) or 0.0),
                 sel_bags=int(self.multiclass_prune_sel_bags),
-                prune_guard=bool(self.multiclass_prune_guard),
-                prune_guard_tol=float(self.prune_guard_tol),
                 prune_guard_min_rows=int(self.prune_guard_min_rows),
-                # Group-aware bags make a grouped fit's out-of-bag rows honest (see `_fit_model`).
-                guard_oob_honest=True,
                 bag_groups=bag_codes,
-                # The SE-aware bar (2026-09-07): the raw relative tolerance alone never fires on
-                # a multiclass log-loss (irreducible class entropy dwarfs any prune harm), so the
-                # single-output guard's downward tightening `prune_guard_z_dn` is the live bar.
-                guard_z=float(self.prune_guard_z_dn),
-                guard_floor=float(self.multiclass_prune_guard_floor),
                 box_budget=max(0, int(getattr(self, "prune_box_budget", 0) or 0)),
                 lambda_tables=float(getattr(self, "prune_lambda_tables", 0.0) or 0.0),
                 table_budget=max(0, int(getattr(self, "prune_table_budget", 0) or 0)),
                 table_min_arity=int(
                     getattr(self, "prune_table_min_arity", _PRUNE_TABLE_MIN_ARITY_DEFAULT)
                 ),
-                # See `_PRUNE_SELECTOR_DEFAULT`: the ranked path replaces the fold CV and the guard.
+                # See `_PRUNE_SELECTOR_DEFAULT`: the ranked path replaces the fold CV.
                 ranked_path=str(getattr(self, "prune_selector", _PRUNE_SELECTOR_DEFAULT)) == "ranked_path",
                 path_steps=int(getattr(self, "prune_path_steps", _PRUNE_PATH_STEPS_DEFAULT)),
                 path_fraction=float(getattr(self, "prune_path_fraction", _PRUNE_PATH_FRACTION_DEFAULT)),
                 path_tolerance=float(getattr(self, "prune_path_tolerance", _PRUNE_PATH_TOLERANCE_DEFAULT)),
                 path_min_share=self._checked_min_variance_share(),
+                # See `prune_rebalance`: the kept tables are re-solved per class.
+                rebalance=bool(self.prune_rebalance),
                 # See `_PRUNE_MAIN_EFFECTS_DEFAULT`: every multiclass selector honors it.
                 prune_main_effects=bool(
                     getattr(self, "prune_main_effects", _PRUNE_MAIN_EFFECTS_DEFAULT)
@@ -9686,6 +8441,13 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                     **common,
                 )
             self.pruning_report_ = json.loads(report_json)
+            # The deployed fit's per-bag boosting report rides in the prune report (the native
+            # side keeps the ensemble), as the cell-refit diagnostics below do.
+            fit_report = self.pruning_report_.pop("fit_report", None)
+            if fit_report:
+                self._set_fit_counts([int(r["trees_kept"]) for r in fit_report],
+                                     [str(r["reason"]) for r in fit_report])
+                self._set_history([], [list(r.get("eval_deviance") or []) for r in fit_report])
             # §G1 K>=3 OOB cell-refit diagnostics for the DEPLOYED fit — the multiclass analogue
             # of `delta_step_gate_`. Pruning replaces the `_MultiClassModel` with a
             # `_MultiClassTableModel`, which carries no fit-time diagnostics, so the native side
@@ -9714,11 +8476,32 @@ class TBoostClassifier(ClassifierMixin, _BaseTBoost):  # type: ignore[misc]
                 bag_groups=bag_codes,
             )
             self.cell_refit_report_ = model.cell_refit_report
-            # Every fit deploys rating tables: an unpruned fit keeps all of them, losslessly.
-            w_full = weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
-            model = model.to_tables(
-                x32, np.ascontiguousarray(w_full), cat_x=cat_x, **self._measure_kwargs()
+            fit_report = model.fit_report()
+            if fit_report:
+                self._set_fit_counts([int(r[0]) for r in fit_report], [str(r[2]) for r in fit_report])
+                self._set_history([list(r[3]) for r in fit_report], [list(r[4]) for r in fit_report])
+            # Every fit deploys rating tables: an unpruned fit keeps all of them and bands them
+            # as a pruned fit does; only the selection is skipped.
+            w_full = np.ascontiguousarray(
+                weight32 if weight32 is not None else np.ones(x32.shape[0], dtype=np.float32)
             )
+            full_model = model
+            model = model.to_tables(x32, w_full, cat_x=cat_x, **self._measure_kwargs())
+            supports = sorted({tuple(int(i) for i in u)
+                               for bank in model.sobol() for u, _ in bank if u})
+            report: dict[str, Any] = {"selector": "none", "kept": [list(u) for u in supports],
+                                      "n_candidates": len(supports)}
+            self.pruning_report_ = report
+            band_tol = getattr(self, "band_tolerance", _BAND_TOLERANCE_DEFAULT)
+            if band_tol is not None:
+                model, band_json = full_model.band_tables(
+                    model, x32, np.ascontiguousarray(y_labels), w_full, float(band_tol),
+                    float(getattr(self, "band_deviance_cap", _BAND_DEVIANCE_CAP_DEFAULT)),
+                    cat_x=cat_x, **self._measure_kwargs(),
+                )
+                self.pruning_report_["banding"] = json.loads(band_json)
+        # Every class bank is graduated, pruned or not, as a single-output fit's bank is.
+        model = self._graduate(model, x32, y_labels, weight32, None, cat_x)
         self._multi_model = model
         self._cat_indices_ = cat_idx
         self.n_features_in_ = n_features

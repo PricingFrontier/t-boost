@@ -15,7 +15,7 @@ from t_boost import TBoostClassifier, TBoostRegressor, report_html
 from t_boost import metrics
 from t_boost import _report
 from t_boost._html_report import (_W_FACTOR, _W_FULL, _W_HALF, _Log, _table_cells, cell_labels,
-                                   run_label, span_label)
+                                   run_label, span_label, training_chart)
 from t_boost._t_boost import _report_cell_quantiles, _report_cell_sums, _report_ranking
 
 FAST = dict(n_trees=60, n_bags=3, n_jobs=1, seed=0)
@@ -42,7 +42,7 @@ def poisson():
         tr.select("age", "veh", "dens"), tr["y"], exposure=tr["exp"])
     report = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"),
                               eval_exposure="exp", name="Freq <v1>")
-    assert [d["label"] for d in report["datasets"]] == ["train", "validation"]
+    assert [d["label"] for d in report["datasets"]] == ["train", "test"]
     return m, tr, ev, report
 
 
@@ -63,8 +63,7 @@ def test_report_is_strict_json_and_renders_from_json(poisson):
 def test_summary_metrics_are_mlflow_ready(poisson):
     _, _, _, report = poisson
     sm = report["summary_metrics"]
-    assert {"train_deviance", "validation_deviance_explained", "validation_gini",
-            "validation_ae"} <= set(sm)
+    assert {"train_deviance", "test_deviance_explained", "test_gini", "test_ae"} <= set(sm)
     for key, value in sm.items():
         assert _MLFLOW_KEY.match(key) and isinstance(value, float) and np.isfinite(value)
 
@@ -229,9 +228,13 @@ def test_multiclass_report():
     for row in ae:
         k = list(m.classes_).index(row["class"])
         assert sum(row["expected"]) == pytest.approx(float(np.sum(w[:1600] * proba[:, k])))
-    assert {"train_ae_0", "train_gini_2", "validation_accuracy"} <= set(report["summary_metrics"])
+    assert {"train_ae_0", "train_gini_2", "test_accuracy"} <= set(report["summary_metrics"])
     html = report_html(report)
     assert 'name="cl"' in html and "logit contribution" in html
+    # A multiclass fit records each bag's early-stopping curve too, so the Training card draws it.
+    curves = report["fit"]["evals_result"]["value"]["eval"]["deviance"]
+    assert len(curves) == FAST["n_bags"]
+    assert training_chart(report, 558, 240).count('class="dfaded"') == FAST["n_bags"]
     mm = m._multi_model
     x32, kw = m._serve_kwargs(X, mm)
     per_class = mm.feature_contributions(x32, **kw)
@@ -437,7 +440,7 @@ def test_factor_check_reads_equal_mass_bands_shared_by_every_dataset(poisson):
     passing = [f for f in report["review"] if f["check"] == "factor_ae" and f["status"] == "pass"]
     assert passing and all("of the mass" in f["message"] for f in passing)
     html = report_html(report)
-    assert "A/E by band (the review check)" in html and "furthest from balance" in html
+    assert "A/E by band (the review check)" in html and "width by exposure; flagged outside" in html
 
 
 def test_page_is_css_only_tabs_with_one_dataset_switch(poisson):
@@ -691,3 +694,147 @@ def test_multinomial_deviance_needs_probability_rows():
     proba = np.array([[0.2, 0.8], [0.6, 0.4]], dtype=np.float32).astype(np.float64)
     assert metrics.mean_multinomial_deviance(np.array([1, 0]), proba) == pytest.approx(
         -math.log(0.8) - math.log(0.6), rel=1e-6)
+
+
+def test_two_datasets_are_train_and_test(poisson):
+    # The bags early-stop and prune on rows they hold back, so one eval pair is the test data:
+    # named so, held to `ae_test`, and with no note about missing test data.
+    m, tr, ev, report = poisson
+    assert [d["label"] for d in report["datasets"]] == ["train", "test"]
+    assert not any(f["check"] == "holdout_data" for f in report["review"])
+    strict = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp",
+                              thresholds={"ae_validation": None, "ae_test": 1e-6})
+    flag = next(f for f in strict["review"]
+                if f["check"] == "overall_ae" and f["dataset"] == "test")
+    assert flag["status"] == "warning" and flag["threshold"] == 1e-6
+    alone = m.pricing_report(tr, "y", exposure="exp")
+    assert any(f["check"] == "holdout_data" and "Pass test data" in f["message"]
+               for f in alone["review"])
+
+
+def test_a_live_fit_draws_its_training_curve(poisson):
+    # Every live fit keeps each bag's deviance on its early-stopping rows (free: the stopping
+    # rule computes it), so the Training card has a curve without an eval_set at fit.
+    m, _, _, report = poisson
+    curves = report["fit"]["evals_result"]["value"]["eval"]["deviance"]
+    assert len(curves) == len(m.n_trees_per_bag_)
+    svg = training_chart(report, 558, 240)
+    assert "early-stopping rows" in svg and "training rows" not in svg
+    assert svg.count('class="dfaded"') == len(curves) and 'class="faded"' not in svg
+    assert svg.count('class="ddot"') == len(curves)
+    # The starting loss is at the top and the lowest loss at mid-height (the drop is mirrored
+    # below it), so the curves fill the top half of the plot (y from 24 to 218 px).
+    paths = re.findall(r'<path class="dfaded" d="([^"]+)"', svg)
+    assert len(paths) == len(curves)
+    ys = [float(y) for d in paths for y in re.findall(r"[ML][\d.]+,([\d.]+)", d)]
+    assert min(ys) >= 24.0 - 1e-9, "no curve starts above the plot"
+    assert max(ys) == pytest.approx((24.0 + 218.0) / 2, abs=1.0)
+
+
+def test_callbacks_add_each_bags_training_curve():
+    # With callbacks the fit also records each bag's training-rows deviance (an extra pass per
+    # round); the chart draws both sets of curves, with a legend.
+    df = frame(n=1500)
+    X = df.select("age", "veh", "dens")
+    m = TBoostRegressor(objective="poisson", **FAST).fit(
+        X, df["y"], exposure=df["exp"], callbacks=lambda info: None)
+    assert set(m.evals_result_) == {"train", "eval"}
+    report = m.pricing_report(df, "y", exposure="exp")
+    svg = training_chart(report, 558, 240)
+    assert svg.count('class="faded"') == svg.count('class="dfaded"') == FAST["n_bags"]
+    assert "training rows" in svg and "round kept" in svg
+
+
+def alternating(n=4000, seed=11):
+    """An effect that alternates level by level: smoothing it costs far more than 1% of the
+    training deviance, so graduation is declined."""
+    rng = np.random.default_rng(seed)
+    x = rng.integers(0, 40, n).astype(float)[:, None]
+    return x, rng.poisson(np.exp(-0.2 + 0.9 * (x[:, 0] % 2)))
+
+
+def test_a_declined_graduation_is_reported():
+    x, y = alternating()
+    m = TBoostRegressor(objective="poisson", **FAST).fit(x, y)  # strengths chosen by GCV
+    assert m.graduation_validation_["adopted"] is False
+    assert "training deviance" in m.graduation_validation_["rejected"]
+    assert not any(r["param"] == "graduation_alpha" for r in m.binding_report_)
+    flags = m.pricing_report(x, y)["review"]
+    assert any(f["check"] == "graduation" and f["status"] == "info"
+               and f["message"].startswith("graduation was not applied") for f in flags)
+
+
+def test_balance_chart_marks_the_bands_the_review_flags(poisson):
+    # The review records its verdict on each band; the Performance chart draws one small A/E
+    # chart per feature and marks those bands, so the chart and the flags always agree.
+    m, tr, ev, _ = poisson
+    strict = m.pricing_report(tr, "y", exposure="exp", eval_set=(ev, "y"), eval_exposure="exp",
+                              thresholds={"factor_ae": 1e-6, "factor_z": None})
+    test = strict["datasets"][1]
+    flagged = [b for e in test["actual_vs_expected"] for b in e["bands"]
+               if b.get("flag") == "warning"]
+    warned = {f["feature"] for f in strict["review"]
+              if f["check"] == "factor_ae" and f["status"] == "warning" and f["dataset"] == "test"}
+    assert flagged and warned == {e["feature"] for e in test["actual_vs_expected"]
+                                  if any(b.get("flag") == "warning" for b in e["bands"])}
+    html = report_html(strict)
+    assert html.count('class="flagdot"') >= len(flagged)
+    assert "flagged outside ±0%" in html and f"{len(warned)} factors out of balance on test" in html
+    # A fresh review drops the verdicts of the last one.
+    relaxed = _report.review(m, strict, _report.resolve_thresholds({"factor_ae": None}))
+    assert not any(b.get("flag") for d in strict["datasets"]
+                   for e in d["actual_vs_expected"] for b in e["bands"])
+    assert not any(f["check"] == "factor_ae" and f["status"] == "warning" for f in relaxed)
+
+
+def test_prediction_histogram_bins_every_dataset_alike(poisson):
+    # The spread of the predictions is a histogram on bins every dataset shares, holding all of
+    # each dataset's exposure (rates beyond the bins fall in the end bins).
+    _, _, _, report = poisson
+    hists = [d["metrics"]["predicted_rate_histogram"] for d in report["datasets"]]
+    assert all(h["edges"] == hists[0]["edges"] for h in hists)
+    assert len(hists[0]["edges"]) == len(hists[0]["mass"]) + 1 == 41
+    edges = hists[0]["edges"]
+    assert all(np.diff(edges) > 0)
+    assert hists[0]["log"] is (edges[0] > 0 and edges[-1] / edges[0] > 3)  # log for a wide spread
+    for d, h in zip(report["datasets"], hists):
+        assert sum(h["mass"]) == pytest.approx(d["metrics"]["mass"])
+    html = report_html(report)
+    assert html.count('class="hbar"') >= 40 and "share of exposure per bin" in html
+
+
+def test_legends_and_titles_name_the_datasets(poisson):
+    # The page has no script: what names "the selected dataset" is drawn once per dataset and
+    # shown with it by the dataset switch.
+    _, _, _, report = poisson
+    html = report_html(report)
+    for shown, other in (("train", "test"), ("test", "train")):
+        assert f"actual ({shown})" in html and f"A/E ({other})" in html
+        assert f"{shown} in colour, {other} in grey" in html
+        assert f"out of balance on {shown}" in html
+        assert f"({shown})</span>" in html
+    assert "selected dataset" not in html and "other datasets" not in html
+
+
+def test_interaction_ae_by_band_pair(poisson):
+    # Each drawn interaction carries the A/E of its first feature's bands within each band of its
+    # partner, per dataset, and the page draws one strip per partner band.
+    _, _, _, report = poisson
+    inter = report["interactions"][0]
+    ae = inter["ae"]
+    assert {ae["x"], ae["by"]} <= set(inter["features"]) and ae["x"] != ae["by"]
+    nx, nb = len(ae["x_labels"]), len(ae["by_labels"])
+    assert nx == len(ae["x_bands"]) and nb == len(ae["by_bands"]) and 1 <= nb <= 4
+    for d, ds in zip(ae["datasets"], report["datasets"]):
+        assert d["label"] == ds["label"]
+        assert [len(row) for row in d["ae"]] == [nb] * nx == [len(row) for row in d["sd"]]
+        # with nothing missing, every row lands in exactly one band pair
+        assert sum(map(sum, d["mass"])) == pytest.approx(ds["metrics"]["mass"])
+    html = report_html(report)
+    assert f"by {ae['x']}, a line per {ae['by']} band" in html  # actual and expected rates
+    lv = ae["datasets"][0]["levels"]
+    assert len(lv["actual"]) == len(lv["expected"]) == len(lv["mass"])
+    assert sum(map(sum, lv["mass"])) == pytest.approx(sum(map(sum, ae["datasets"][0]["mass"])))
+    assert f"each {ae['by']} band on its own" in html
+    assert html.count('class="ibw0"') >= len(ae["datasets"])
+

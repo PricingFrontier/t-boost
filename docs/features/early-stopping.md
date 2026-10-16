@@ -13,8 +13,8 @@ The following parameters can be set in the constructor of the
 model is trained:
 
 `validation_fraction`
-:   The fraction of the training objects set aside as the validation dataset (0.1). `None` turns
-    early stopping off.
+:   The fraction of the training objects each bag sets aside as its validation dataset (0.1).
+    `None` turns early stopping off.
 
 `early_stopping_rounds`
 :   The number of iterations to continue the training after the iteration with the optimal
@@ -29,14 +29,10 @@ model is trained:
 
 See [Early stopping settings](../training-parameters/early-stopping.md) for details.
 
-The following parameters can be set for the `fit` method:
-
-`eval_set`, `eval_sample_weight`, `eval_exposure`, `eval_offset`
-:   A separate validation dataset, used instead of the objects set aside from the training
-    dataset.
+The following parameter can be set for the `fit` method:
 
 `callbacks`
-:   Functions called after every iteration, which can stop the training.
+:   Functions called after every iteration of every bag, which can stop that bag.
 
 ## Usage examples {#usage-examples}
 
@@ -44,8 +40,7 @@ The following parameters can be set for the `fit` method:
 from t_boost import TBoostRegressor
 
 model = TBoostRegressor(objective="poisson")
-model.fit(train_data, "ClaimCount", exposure="Exposure",
-          eval_set=(valid_data, "ClaimCount"), eval_exposure="Exposure")
+model.fit(train_data, "ClaimCount", exposure="Exposure")
 
 print(model.n_trees_per_bag_)          # the trees each bag kept
 print(model.stopping_reason_per_bag_)  # why each bag stopped

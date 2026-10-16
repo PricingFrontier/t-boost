@@ -40,3 +40,6 @@ examples/frequency_model.bin
 
 # MkDocs build output (docs site)
 /site
+
+# post-fit-stages measurement caches (specs/roadmap/repro/post-fit-stages/results/pf06_07/INDEX.txt)
+/specs/roadmap/repro/post-fit-stages/results/pf06_07/dumps/

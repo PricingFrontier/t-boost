@@ -1,0 +1,6 @@
+fr_instal s0 b8      shipped    shipped: d_test +0.609% train x1.0149 smoothed 177 [46, 49, 38, 44] ceiling 22 per-class [0.127, 0.169, 0.208, 0.066]
+fr_instal s0 b8      shipped   shared_h: d_test +0.487% train x1.0143 smoothed 188 [48, 46, 48, 46] ceiling 9 per-class []
+fr_instal s0 b8      shipped  shared_eq: d_test +0.464% train x1.0120 smoothed 200 [51, 49, 51, 49] ceiling 12 per-class []
+fr_instal s0 b8     unbanded    shipped: d_test +0.251% train x1.0043 smoothed 60 [19, 19, 10, 12] ceiling 6 per-class [0.044, 0.086, 0.108, 0.001]
+fr_instal s0 b8     unbanded   shared_h: d_test +0.142% train x1.0033 smoothed 76 [19, 19, 19, 19] ceiling 4 per-class []
+fr_instal s0 b8     unbanded  shared_eq: d_test +0.108% train x1.0023 smoothed 64 [16, 16, 16, 16] ceiling 0 per-class []

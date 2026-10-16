@@ -478,3 +478,22 @@ incumbent model (rustystats' `base_predictions`), split/date provenance — see 
   - **Tables tints**: five-step light green (above no effect) / yellow (below) per cell on the
     square root of |log effect| / the table's largest; grey for no exposure.
   - Slides tab, slide images and the takeaway variants for them removed.
+- Train and test by default (user, 2026-10-14: "should we just have train and test?"). t-boost's
+  bags early-stop on rows each holds back (`validation_fraction`) and prune on their out-of-bag
+  rows, so validation data is opt-in: early-stopping on chosen data (the latest period, say) or
+  comparing settings. On freMTPL2, fitting on 80% with the bags' own early stopping beat 60% plus
+  a 20% `eval_set` by 0.12% of test deviance (8.30% vs 8.19% deviance explained; two seeds). So
+  one eval pair is `test` (labels default by count: train/test, or train/validation/test), the
+  second of two datasets is held to `ae_test`, the "no test data" note is gone, and a fit that
+  early-stopped on an `eval_set` gets an info note naming the dataset that may be that data
+  (info, not warning: stopping on a later period and reporting a separate test set is sound).
+- Declined graduation is no longer silent (same day). The native check keeps smoothed tables
+  only if the training deviance rises by at most 1%; the docs had said there was no accuracy
+  gate. A fixed `graduation_alpha` it declines now warns at fit, is INERT in `binding_report_`
+  (so `check_bindings()` raises and the report shows a warning), `graduation_validation_` keeps
+  the reason under `rejected`, and the report notes a declined GCV graduation.
+- Fit-time `eval_set` removed (2026-10-15, `post-fit-stages.md` PF-18): the report's `eval_set`
+  stays (it is how test data arrives), the "early-stopped on an eval_set" note and
+  `fit.early_stopping.eval_set` are gone, every live single-output fit has a training curve, and
+  the Training chart draws one line per bag with the round it kept (per-bag holdouts sit at
+  different levels, so a mean over the running bags jumped as they finished).

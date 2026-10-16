@@ -26,8 +26,7 @@ One entry per checked parameter set away from its default, with `param`, `value`
 
 The report covers parameters whose effect depends on other settings: the pruning gates and
 limits (for example, every pruning parameter when `prune=False`, and the parameters of the
-pruning selector that did not run), `validation_fraction` with an `eval_set`,
-`monotone_constraints` and deprecated spellings. It is not an audit of every parameter.
+pruning selector that did not run), `monotone_constraints` and deprecated spellings. It is not an audit of every parameter.
 
 ## Usage examples {#usage-examples}
 

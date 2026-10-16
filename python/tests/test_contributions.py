@@ -205,9 +205,11 @@ def test_unpruned_fits_deploy_the_full_table_bank() -> None:
 
 
 def test_unpruned_tables_match_the_ensemble() -> None:
-    """The unpruned deploy is a re-representation of the ensemble, not a refit."""
+    """The unpruned deploy, unbanded and ungraduated, is a re-representation of the ensemble,
+    not a refit."""
     df = _frame(n=2000, seed=5)
-    model = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0)
+    model = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0,
+                            band_tolerance=None, graduate=False)
     model.fit(df, "ClaimCount", exposure="Exposure")
     # The ensemble is not kept, so refit the same seed and skip the conversion to compare.
     ensemble = TBoostRegressor(objective="poisson", n_trees=200, n_bags=1, prune=False, seed=0)

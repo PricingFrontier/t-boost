@@ -44,8 +44,8 @@ longer affects predictions.
 
 A fit without out-of-bag objects (for example `n_bags=1`) falls back to a K-fold
 cross-validated vote, which judges main effects the same way when `prune_main_effects=True`. The
-selection is recorded in `pruning_report_`. `prune=False` deploys the full, unpruned set of
-tables instead. See [Pruning settings](../training-parameters/pruning.md).
+selection is recorded in `pruning_report_`. `prune=False` keeps every table instead, and the
+stages below still run. See [Pruning settings](../training-parameters/pruning.md).
 
 ## Banding {#banding}
 
@@ -55,19 +55,23 @@ contains a feature cuts it at the same nested places, so bands line up across ta
 values always keep their own band.
 
 How coarse the bands get is set by the model's own noise. The prediction change from banding is
-held within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between bags. It is
-also capped at `band_deviance_cap` (0.1%) of the training deviance. Banding needs bagging to
-measure $\sigma$. Its report is in `pruning_report_["banding"]`, and `band_tolerance=None` turns
-it off. See [Banding settings](../training-parameters/banding.md).
+held within $(band\_tolerance \cdot \sigma)^2$, where $\sigma$ is the spread between bags. Its
+expected cost, the deviance it would add if the unbanded tables were exactly right (estimated
+on rows the bands were not fitted to), is also capped at `band_deviance_cap` (0.1%) of the training deviance. With one bag (`n_bags=1`) there is
+no $\sigma$ to measure, and the cap alone bounds banding. Its report is in
+`pruning_report_["banding"]`, and `band_tolerance=None` turns it off. See
+[Banding settings](../training-parameters/banding.md).
 
 ## Graduation {#graduation}
 
 Finally, the tables are smoothed with Whittaker-Henderson graduation, the actuarial smoother for
 rating factors. Each table picks its own strength by generalized cross-validation, so a table
-whose roughness is real shape is left untouched. No objects are held out for it.
+whose roughness is real shape is left untouched. No objects are held out for it: the smoothing is
+kept only if it raises the training deviance by at most 1%, a brake on heavy smoothing rather than
+a test of accuracy.
 
 `graduation_alpha` fixes one strength for every table. `graduation_high_order_alpha` (off by
 default) adds a light neighbour smoothing for factored 3-way and higher interactions. Details are
-in `graduation_report_`. `graduate=False` ships the unsmoothed tables. Graduation is skipped for
-monotone-constrained fits and is not supported for models with three or more classes. See
+in `graduation_report_`. `graduate=False` ships the unsmoothed tables. With three or more classes,
+every class's tables are graduated. See
 [Graduation settings](../training-parameters/graduation.md).

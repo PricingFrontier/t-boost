@@ -122,7 +122,7 @@ fn a_generous_budget_deploys_the_same_bytes_as_no_budget() {
     );
 
     for max_boxes in [0_usize, boxes, boxes + 1, usize::MAX] {
-        let (budgeted, report, _) = prune_model_to_keepset_budgeted(
+        let (budgeted, report, _, _) = prune_model_to_keepset_budgeted(
             &model,
             &serve,
             &y,
@@ -173,7 +173,7 @@ fn a_tight_budget_lands_under_it_and_spares_the_dense_tables() {
 
     for divisor in [2_usize, 4, 16] {
         let budget = boxes / divisor;
-        let (budgeted, report, _) = prune_model_to_keepset_budgeted(
+        let (budgeted, report, _, _) = prune_model_to_keepset_budgeted(
             &model,
             &serve,
             &y,

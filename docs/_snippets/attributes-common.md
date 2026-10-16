@@ -84,9 +84,10 @@ the `n_trees` training parameter in the following cases:
 
 - The training is stopped by [early stopping](../../algorithm/early-stopping.md).
 - No split clears `min_split_gain`.
-- A callback stops the training.
+- A callback stops the bag.
 
-`None` for a multiclassification model.
+For multiclassification, a boosting round grows one tree per class, and the counts are rounds,
+which `n_trees` caps.
 
 #### Type
 
@@ -96,7 +97,7 @@ int
 
 #### Purpose
 
-The number of trees each bag kept. `None` for a multiclassification model.
+The number of trees each bag kept (boosting rounds, for multiclassification).
 
 #### Type
 
@@ -106,9 +107,9 @@ list of ints
 
 #### Purpose
 
-Why the training stopped, summarized over the bags: `"callback"` if a callback stopped it, else
+Why the training stopped, summarized over the bags: `"callback"` if a callback stopped a bag, else
 `"early_stopping"` if a bag was stopped by early stopping, else `"no_split"` if a bag
-ran out of splits, else `"max_trees"`. `None` for a multiclassification model.
+ran out of splits, else `"max_trees"`.
 
 #### Type
 
@@ -118,8 +119,7 @@ string
 
 #### Purpose
 
-Why each bag stopped: `"early_stopping"`, `"max_trees"`, `"no_split"` or `"callback"`. `None` for
-a multiclassification model.
+Why each bag stopped: `"early_stopping"`, `"max_trees"`, `"no_split"` or `"callback"`.
 
 #### Type
 
@@ -130,17 +130,22 @@ list of strings
 #### Purpose
 
 Return the values of metrics calculated during the training: the mean deviance of every
-iteration of every bag, when an `eval_set` or `callbacks` were passed to `fit`.
+iteration of every bag on the validation objects of
+[early stopping](../../algorithm/early-stopping.md), and, when `callbacks` were passed to `fit`,
+on the bag's training objects too.
 
 Output format:
 
 ```
-{"train": {"deviance": [[value_1, value_2, ...], ...]}, "eval": {"deviance": [[value_1, value_2, ...], ...]}}
+{"eval": {"deviance": [[value_1, value_2, ...], ...]}, "train": {"deviance": [[value_1, value_2, ...], ...]}}
 ```
 
-with one list per bag. The `"eval"` curve (the validation objects) costs nothing extra. The
-`"train"` curve takes an extra pass per iteration, so it is calculated only when `callbacks` are
-given. Without either, the dictionary is empty. It is not saved with the model.
+with one list per bag. The `"eval"` curve is recorded on every training (early stopping
+calculates it anyway); for multiclassification it is the multinomial deviance, one value per
+iteration. The `"train"` curve takes an extra pass per iteration (5–11% of the training time),
+so it is calculated only when `callbacks` are given. The attribute is absent when there is
+neither (`validation_fraction=None` without `callbacks`) and on a loaded model: it is not saved
+with the model.
 
 #### Type
 
@@ -175,8 +180,9 @@ float
 
 The record of the table selection: the selector used (`selector`), the candidate tables and
 their scores (`table_scores`), the kept tables (`kept`), the scored path (`path`) and, when they
-ran, the reports of banding (`banding`) and of the budgets (`table_budget`, `box_budget`). Only
-set when `prune=True`. Saved with the model.
+ran, the reports of the rebalance (`rebalance`), of banding (`banding`) and of the budgets
+(`table_budget`, `box_budget`). On an unpruned model (`prune=False`) the selector is `"none"`
+and every table is kept. Saved with the model.
 
 For the ranked-path selector, `path` holds the bank sizes (`sizes`) and their out-of-bag
 deviance (`oob_deviance`), the total gain over the main-effects bank (`total_gain`), the step of
@@ -195,8 +201,9 @@ dict
 #### Purpose
 
 The graduation diagnostics, one entry per table: the features, the smoothing strength (`alpha`)
-and whether the smoothing was rejected. Only set when graduation is turned on. Saved with the
-model.
+and whether the smoothing was rejected. For multiclassification, each entry also names its
+class (`class`, the index into `classes_`). Only set when graduation is turned on. Saved with
+the model.
 
 #### Type
 

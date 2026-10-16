@@ -311,9 +311,9 @@ def _row(m, param):
 
 
 def test_fold_vote_knobs_are_INERT_when_the_ranked_path_selects():
-    m, warns = _fit(prune_selector="ranked_path", prune_min_stability=1.0, prune_guard_tol=0.1)
+    m, warns = _fit(prune_selector="ranked_path", prune_min_stability=1.0, prune_n_folds=3)
     assert m.pruning_report_["selector"] == "ranked_path"
-    for param in ("prune_min_stability", "prune_guard_tol"):
+    for param in ("prune_min_stability", "prune_n_folds"):
         row = _row(m, param)
         assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
     assert warns == []                              # INERT stays silent at fit
@@ -338,13 +338,15 @@ def test_the_fold_vote_fallback_is_reported_on_the_ranked_path_knobs():
     assert _row(m, "prune_min_stability")["status"] != "INERT"   # the fold vote did run
 
 
-def test_a_monotone_fit_reports_its_selection_knobs_INERT():
-    # A monotone fit keeps the full table bank: no selector runs at all.
+def test_a_monotone_fit_runs_its_selector():
+    # A monotone fit used to keep the full table bank with no selector; now the selector runs
+    # and the deployed tables are projected back onto the signs afterwards.
     X, y = _fixture()
     m = TBoostRegressor(objective="poisson", n_trees=60, seed=0, n_jobs=2, prune=True,
                         monotone_constraints={"a": 1}, prune_min_stability=1.0).fit(X[["a", "b"]], y)
-    row = _row(m, "prune_min_stability")
-    assert (row["status"], row["overridden_by"]) == ("INERT", "monotone_constraints")
+    assert _row(m, "prune_min_stability")["overridden_by"] != "monotone_constraints"
+    assert _row(m, "monotone_constraints")["status"] == "HONOURED"
+    assert "monotone" in m.pruning_report_
 
 
 def test_multiclass_selection_knobs_follow_the_task():
@@ -352,24 +354,20 @@ def test_multiclass_selection_knobs_follow_the_task():
     rng = np.random.default_rng(1)
     noisy = X.a + rng.normal(size=len(X))
     kw = dict(n_trees=60, seed=0, n_jobs=2, prune_selector="ranked_path")
-    multi = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
+    multi = TBoostClassifier(**kw, multiclass_prune_sel_bags=2).fit(
         X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
-    row = _row(multi, "multiclass_prune_guard_floor")
+    row = _row(multi, "multiclass_prune_sel_bags")
     assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
     # The legacy single split's fraction only carves the selection rows the path never reads.
     legacy = TBoostClassifier(**kw, multiclass_prune_cv=False, prune_validation_fraction=0.2).fit(
         X[["a", "b"]], np.digitize(noisy, [-0.5, 0.5]))
     row = _row(legacy, "prune_validation_fraction")
     assert (row["status"], row["overridden_by"]) == ("INERT", "prune_selector")
-    # A binary fit never reads a multiclass knob, so the ranked path is not its reason.
-    binary = TBoostClassifier(**kw, multiclass_prune_guard_floor=0.01).fit(
-        X[["a", "b"]], (noisy > 0).astype(int))
-    assert not [r for r in binary.binding_report_ if r["param"] == "multiclass_prune_guard_floor"]
 
 
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
+    """This module pins the fold-vote selector (its evidence gate and vote machinery) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R
@@ -378,16 +376,3 @@ def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
         defaults = cls.__init__.__kwdefaults__
         monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
         monkeypatch.setitem(defaults, "band_tolerance", None)
-
-
-def test_validation_fraction_is_reported_only_when_set_with_an_eval_set(data):
-    # The default validation_fraction is unused when eval_set supplies the early-stopping rows;
-    # only a value the caller set is INERT. A default eval_set fit passes check_bindings.
-    X, y = data
-    Xe, ye = X.iloc[:200], y[:200]
-    m = _mk(n_trees=40).fit(X, y, eval_set=(Xe, ye))
-    assert not [r for r in m.binding_report_ if r["param"] == "validation_fraction"]
-    m.check_bindings()
-    m = _mk(n_trees=40, validation_fraction=0.2).fit(X, y, eval_set=(Xe, ye))
-    row = next(r for r in m.binding_report_ if r["param"] == "validation_fraction")
-    assert (row["status"], row["overridden_by"]) == ("INERT", "eval_set")

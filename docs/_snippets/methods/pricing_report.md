@@ -19,7 +19,7 @@ pricing_report(X, y, *,
                sample_weight=None, exposure=None, offset=None,
                ref_measure=None,
                eval_set=None, eval_sample_weight=None, eval_exposure=None, eval_offset=None,
-               labels=("train", "validation", "test"),
+               labels=None,
                name=None,
                thresholds=None)
 ```
@@ -83,21 +83,20 @@ None
 
 #### Description
 
-The validation data, or the validation and the test data, described beside the train data
-(`X`, `y`):
+The test data, or the validation and the test data, described beside the train data (`X`, `y`):
 
-- one pair `(X_validation, y_validation)`, the convention of `fit`;
+- one pair `(X_test, y_test)`;
 - a list of two pairs `[(X_validation, y_validation), (X_test, y_test)]`.
+
+Train and test are the usual pair: the bags early-stop and prune on objects they hold back, so
+a model needs no separate validation data. Keep some only to compare settings.
 
 Each dataset gets its own metrics, A/E, unseen values and review checks, and the drift from the
 train data to it (PSI) is measured. A `y` may name a column of its polars `X`.
 
-If the model was early-stopped on an `eval_set` passed to `fit`, that data is not fully
-out-of-sample: pass it as the validation data and keep a test set for the independent estimate.
-
 **Possible types**
 
-- tuple `(X_validation, y_validation)`
+- tuple `(X_test, y_test)`
 - list of two tuples `[(X_validation, y_validation), (X_test, y_test)]`
 
 **Default value**
@@ -127,18 +126,19 @@ None
 
 #### Description
 
-The names of the datasets, in the order train, validation, test (only as many are used as there
-are datasets). They label the page and prefix the `summary_metrics` keys. The review thresholds
-follow the role, not the name: `ae_validation` applies to the second dataset whatever it is
-called.
+The names of the datasets, in order. They label the page and prefix the `summary_metrics` keys.
+`None` names them by their role: `("train", "test")` for two datasets, `("train", "validation",
+"test")` for three. The review thresholds follow the role, not the name: `ae_test` applies to
+the second of two datasets and `ae_validation` to the second of three, whatever they are called.
 
 **Possible types**
 
-tuple of distinct strings
+- tuple of distinct strings
+- None
 
 **Default value**
 
-`("train", "validation", "test")`
+None
 
 ### name
 
@@ -176,7 +176,7 @@ The values in force are written to the report and printed next to every flag.
 | `thin_cell_mass` | 0.001 | one-way cells holding less than this share of the table's exposure count as thin |
 | `psi_warn` | 0.10 | PSI per feature above value: warning |
 | `psi_critical` | 0.25 | PSI per feature above value: critical |
-| `train_gap` | 0.05 | drop in deviance explained from train to validation, and to test |
+| `train_gap` | 0.05 | drop in deviance explained from train to each later dataset |
 | `unseen_mass` | 0.01 | mass share of unseen categorical values in a dataset |
 
 The factor check reads up to ten bands per feature (the missing values, then runs of equal train
@@ -206,11 +206,14 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
   `binding_report_`, each with whether it is available on this model.
 - `datasets` — Per dataset: its label, rows, `metrics` (deviance, null deviance, deviance
   explained, Gini, A/E, lift bands with their A/E, standard error `sd` and `z`, Lorenz curve,
+  percentiles of the predicted rate and its histogram (`predicted_rate_histogram`: bin `edges`
+  shared by every dataset, the `mass` in each and whether the bins are `log`-spaced),
   and for a multiclassification model accuracy, a class matrix and per-class values),
   `actual_vs_expected` (each cell with a `z` score; on the first dataset, `shap`: each cell's
   exposure-weighted mean and 10th and 90th percentile of the feature's exact Shapley value, on
   the link scale, read from the report's `tables`), `bands` (the factor check's bands per
-  feature), missing values and unseen values. Each cell's `axis` is its feature's merged grid; a
+  feature; a band the review flags carries `"flag": "warning"`, a near miss
+  `"flag": "near_miss"`), missing values and unseen values. Each cell's `axis` is its feature's merged grid; a
   numeric axis carries `integer`, true when the feature took only whole values in the first
   dataset, and its cells are then labelled as integers (`51`, `22–25`). The numeric axes of
   `tables` carry the same flag.
@@ -219,7 +222,11 @@ A dictionary of plain JSON values (`json.dumps(report, allow_nan=False)` succeed
 - `structure` — The deployed effects of each table bank with their variance shares.
 - `interactions` — Per interaction table, by share of model variance: its features, share,
   cells, the range of its effect over the cells with exposure and the range holding 90% of the
-  exposure (`spread`), and its smoothing strength.
+  exposure (`spread`), and its smoothing strength. The 40 largest also carry `ae`: the A/E by
+  band of the first feature (`x`, the factor check's bands) within each band of its partner
+  (`by`, up to four bands of equal exposure), per dataset, with each pair's `mass`, `z` and
+  standard deviation `sd`, and the actual, expected and mass by level of the first feature within
+  each partner band (`levels`).
 - `features` — Per raw feature, by importance: its importance split into its own one-way table
   and its share through interactions, the interactions it is in, and its one-way table's effect
   range, thin cells, missing-value level and smoothing strength.
@@ -242,9 +249,7 @@ import t_boost
 
 # model: a TBoostRegressor(objective="poisson") trained with exposure="Exposure"
 report = model.pricing_report(train_data, "ClaimCount", exposure="Exposure",
-                              eval_set=[(validation_data, "ClaimCount"),
-                                        (test_data, "ClaimCount")],
-                              eval_exposure=["Exposure", "Exposure"],
+                              eval_set=(test_data, "ClaimCount"), eval_exposure="Exposure",
                               name="Motor frequency v3")
 with open("freq_report.json", "w") as f:
     json.dump(report, f)

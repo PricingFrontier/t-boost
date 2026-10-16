@@ -1,7 +1,7 @@
 # Model report
 
-The model report gathers, for one model and its train, validation and test data, what a reviewer needs to decide
-whether the model is ready for production: how well it fits in and out of sample, how it is
+The model report gathers, for one model and its train and test data, what a reviewer needs to
+decide whether the model is ready for production: how well it fits in and out of sample, how it is
 built, how the pruning chose its tables, every rating factor, the drift between the datasets
 and a list of review flags.
 
@@ -16,9 +16,7 @@ import json
 import t_boost
 
 report = model.pricing_report(train_data, "ClaimCount", exposure="Exposure",
-                              eval_set=[(validation_data, "ClaimCount"),
-                                        (test_data, "ClaimCount")],
-                              eval_exposure=["Exposure", "Exposure"],
+                              eval_set=(test_data, "ClaimCount"), eval_exposure="Exposure",
                               name="Motor frequency v3")
 with open("freq_report.json", "w") as f:
     json.dump(report, f)
@@ -26,12 +24,14 @@ with open("freq_report.html", "w") as f:
     f.write(t_boost.report_html(report))
 ```
 
-The train data is `X`, `y`; `eval_set` adds the validation data, or the validation and the test
-data (a list of two pairs), named `train`, `validation` and `test` unless `labels` says
-otherwise. The report describes the data passed to it; it cannot verify which rows were used to
-fit the model and which were held out. If the model was early-stopped on an `eval_set` passed to
-`fit`, that data is not fully out-of-sample, and the report says so: the test data are then the
-independent estimate.
+The train data is `X`, `y`; `eval_set` adds the test data, or the validation and the test data
+(a list of two pairs), named `train` and `test`, or `train`, `validation` and `test`, unless
+`labels` says otherwise. Train and test are the usual pair: t-boost's bags early-stop and prune
+on objects they hold back, so a model needs no separate validation data. Keep some only to
+compare settings.
+
+The report describes the data passed to it; it cannot verify which rows were used to fit the
+model and which were held out.
 
 All three kinds of model are supported: regression, binary classification and
 multiclassification (one-vs-rest per class, with a class selector on the page). The per-row work
@@ -56,9 +56,10 @@ viewer.
 
 ## The page {#sections}
 
-The page has seven tabs and one dataset switch (train, validation, test; it opens on the last
-dataset given, the most independent one). The selected dataset is drawn in colour in every chart
-and the others in grey, so train, validation and test compare without scrolling. Blue is
+The page has seven tabs and one dataset switch (train and test, or train, validation and test;
+it opens on the last dataset given, the most independent one). The selected dataset is drawn in
+colour in every chart and the others in grey, so the datasets compare without scrolling; the
+legends and the titles name the dataset each line or figure belongs to. Blue is
 observed data and orange is the model throughout. Each chart has a one-line caption and its
 numbers collapsed beneath it; hovering a point shows its values. The tabs, the switches and the
 collapsed sections are plain HTML and CSS, so they work where scripts are blocked.
@@ -92,8 +93,14 @@ Then calibration by decile: ten bands of equal exposure by ascending predicted r
 tied predictions stays in one band), the actual and predicted rate of the selected dataset above
 and the A/E of every dataset below, with ±2 standard deviations shaded for the selected one. A
 standard deviation is the objective's variance function times the Pearson dispersion, summed over
-the band's rows. Beside the Lorenz curves, every feature's A/E by band on one chart against the
-`factor_ae` tolerance, and below, the spread of the predictions. A multiclassification model has
+the band's rows. Beside the Lorenz curves, every feature's A/E by band as a small chart on one
+shared scale, each band as wide as its share of exposure: the selected dataset in colour with ±2
+standard deviations shaded, the `factor_ae` tolerance dashed, the bands the review flags in red
+and its near misses in amber, and each feature's band furthest from balance named above its
+chart. The scale is set by the bands the review checks (`factor_min_mass`); thinner ones are
+clipped at its edge. Below, the spread of the predictions as a histogram: the share of exposure
+by predicted rate, on bins every dataset shares (log-spaced when the rates span more than a
+factor of 3), the selected dataset as bars and the others outlined. A multiclassification model has
 a class switch, one-vs-rest views per class and the class matrices.
 
 ### Factors {#factors}
@@ -103,10 +110,11 @@ table, then its share of the interactions it is in, split evenly over their feat
 with its band furthest from balance on the selected dataset. Selecting a feature shows, on one
 x-axis of its levels: the deployed one-way table (relativities on a log scale for a log link,
 odds multipliers for a logit link; cells holding under `thin_cell_mass` of the table's exposure
-faded), the A/E of the factor check's bands for every dataset, with the `factor_ae` tolerance
-dashed and ±2 standard deviations shaded, and the train exposure. Categorical levels are ordered
-by their effect. The findings about the feature are listed above the chart; the actual and
-expected rate by level and the numbers by band and by level are collapsed below it.
+faded); the actual and expected rate by level on the selected dataset (levels under
+`thin_cell_mass` of its exposure faded); the A/E of the factor check's bands for every dataset,
+with the `factor_ae` tolerance dashed and ±2 standard deviations shaded; and the train exposure.
+Categorical levels are ordered by their effect. The findings about the feature are listed above
+the chart; the numbers by band and by level are collapsed below it.
 
 Over the one-way table, the chart draws the feature's SHAP value per level on the train data: its
 mean (dashed) and the band holding 80% of the policies at that level (10th to 90th percentile,
@@ -126,8 +134,14 @@ The interaction tables by share of model variance, each with the range of its ef
 exposure (the support-weighted 5th to 95th percentile of its cells). Selecting one draws, on the
 levels of its feature with the most levels, that feature's one-way table (dashed) and, for up to
 four bands of equal exposure of the partner, the effect with this table added: where the lines
-part, the interaction matters. A three-way table is averaged over its third feature. The 40
-largest are drawn; every table's numbers are under Tables.
+part, the interaction matters. Under it, the selected dataset's actual (dashed) and expected
+(solid) rate by level of the first feature within each partner band (pairs under
+`thin_cell_mass` of the exposure have their actual faded); then one strip per partner band with
+the A/E by band of the first feature, ±2 standard deviations shaded and the `factor_ae`
+tolerance dashed (band pairs under `factor_min_mass` faded). Lines that stay near 1 in every
+strip mean the model captures the interaction. A three-way table
+is averaged over its third feature. The 40 largest are drawn; every table's numbers are under
+Tables.
 
 ### Tables {#tables}
 
@@ -150,9 +164,11 @@ groups (main effects, kept, below the floor, past the cutoff). The cutoff is the
 first bank reaching `prune_path_fraction` of the total gain and the first within
 `prune_path_tolerance` of the minimum; the floor (`prune_min_variance_share`) then removes the
 tables below it that no kept table is built on. The pruning report is saved with the model. Then
-the smoothing strength of each table, and the deviance by boosting round with the rounds where
-the bags stopped (the curve is recorded only on a live fit with `eval_set` or callbacks, and is
-not saved with the model).
+the smoothing strength of each table, and the deviance on each bag's early-stopping objects by
+boosting round, with the round each bag kept, and on each bag's training objects too when
+`callbacks` were passed to `fit`. The curves fill the top half of the chart: the scale runs from
+the starting deviance down to as far again below the lowest one. The curves are kept on the
+trained model only: they are not saved with the model.
 
 ### Checks {#checks}
 
@@ -164,10 +180,11 @@ verdict. The thresholds are set with the `thresholds` parameter of `pricing_repo
 team can apply its own:
 
 - the overall A/E of each dataset (`ae_train`, `ae_validation`, `ae_test`);
-- whether the validation and test deviance explained is positive (the model beats a constant);
-- the drop in deviance explained from train to validation and to test (`train_gap`);
-- which out-of-sample data the report has (no validation, no test, or validation data that
-  drove early stopping);
+- whether the deviance explained on each later dataset is positive (the model beats a constant);
+- the drop in deviance explained from train to each later dataset (`train_gap`);
+- whether the report has out-of-sample data at all;
+- whether graduation, the smoothing of the tables, was declined (see
+  [Graduation settings](../training-parameters/graduation.md));
 - whether any bag reached `n_trees` without [early stopping](../algorithm/early-stopping.md);
 - deciles of predicted rate whose A/E is off by more than `decile_ae` and at least `factor_z`
   standard deviations (with `factor_z` set to `None`, the tolerance alone);

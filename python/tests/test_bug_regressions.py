@@ -26,7 +26,6 @@ from t_boost.metrics import (
     mean_tweedie_deviance,
     ordered_gini,
 )
-from t_boost.sklearn import _guard_mu, _guard_reanchor
 
 
 OPTIONS = dict(
@@ -92,18 +91,6 @@ def test_bug003_multiclass_encoder_excludes_holdout_labels(channels, bags):
                                       es_holdout=holdout)
         encoders.append(json.loads(model.to_json())["model"]["classes"][0]["schema"]["cat_encoders"])
     assert encoders[0] == encoders[1]
-
-
-@pytest.mark.parametrize("objective", ["logistic", "poisson"])
-@pytest.mark.parametrize("varying", [False, True])
-def test_bug008_guard_intercept_balances_weighted_response(objective, varying):
-    rng = np.random.default_rng(0)
-    raw = rng.normal(size=100) if varying else np.zeros(100)
-    w = rng.uniform(0.5, 2, 100)
-    y = np.r_[np.ones(10), np.zeros(90)]
-    shifted = _guard_reanchor(objective, raw, y, w, True)
-    assert np.dot(w, _guard_mu(objective, shifted)) == pytest.approx(np.dot(w, y), rel=1e-9)
-    np.testing.assert_array_equal(_guard_reanchor(objective, raw, y, w, False), raw)
 
 
 @pytest.mark.parametrize("marker", ["t-boost-multiclass", "t-boost-multiclass-tables", "t-boost-tables"])
@@ -700,3 +687,42 @@ def test_bug064_joint_exports_preserve_fit_mass_and_require_it_after_loading(cla
         with pytest.raises(ValueError, match=key):
             loaded.tables(x, ref_measure="joint")
         assert json.loads(loaded.tables(x, ref_measure="joint", **{key: mass})) == expected
+
+
+# Audit of 2026-10-14 (specs/roadmap/monotone-pruning.md, "Also on this branch").
+
+
+def test_audit_binary_classifier_warns_when_a_parameter_has_no_effect():
+    # The K=2 branch of `TBoostClassifier.fit` returned before `_warn_voided_params`, so a binary
+    # fit never warned, while the regressor and K>=3 did. A fixed graduation strength this large
+    # is declined by the training-deviance check, which warns on every task.
+    import warnings
+
+    rng = np.random.default_rng(0)
+    n = 2000
+    x = pd.DataFrame({"a": rng.normal(size=n), "b": rng.normal(size=n)})
+    y = (rng.uniform(size=n) < 1 / (1 + np.exp(-(x.a - 0.5 * x.b)))).astype(int)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        TBoostClassifier(n_trees=40, seed=0, n_jobs=2, graduation_alpha=1e9).fit(x, y)
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert any("graduation_alpha" in m and "NO EFFECT" in m for m in messages)
+
+
+def test_audit_a_callback_keeps_the_group_holdout_of_an_unpruned_fit():
+    # With `prune=False` and groups, a callback made the deploy extras non-empty, which skipped the
+    # group-aware early-stopping carve and fell back to a row-level carve that leaks a group's rows
+    # into validation. An observer that never stops the fit must leave the model byte-identical.
+    from _artifact import model_bytes
+
+    rng = np.random.default_rng(0)
+    n_groups, per_group = 200, 5
+    groups = np.repeat(np.arange(n_groups), per_group)
+    effect = rng.normal(scale=0.5, size=n_groups)
+    x = pd.DataFrame({"a": rng.normal(size=n_groups * per_group),
+                      "b": rng.normal(size=n_groups * per_group)})
+    y = rng.poisson(np.exp(0.3 * x.a + effect[groups])).astype(float)
+    options = dict(objective="poisson", n_trees=60, seed=0, n_jobs=2, prune=False)
+    plain = TBoostRegressor(**options).fit(x, y, groups=groups)
+    observed = TBoostRegressor(**options).fit(x, y, groups=groups, callbacks=lambda info: None)
+    assert model_bytes(observed) == model_bytes(plain)

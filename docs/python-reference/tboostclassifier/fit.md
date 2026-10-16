@@ -15,10 +15,6 @@ fit(X,
     groups=None,
     *,
     offset=None,
-    eval_set=None,
-    eval_sample_weight=None,
-    eval_exposure=None,
-    eval_offset=None,
     callbacks=None)
 ```
 
@@ -73,8 +69,6 @@ None
 --8<-- "_snippets/params/groups-fit.md"
 
 --8<-- "_snippets/params/offset-fit.md"
-
---8<-- "_snippets/params/eval-fit.md"
 
 --8<-- "_snippets/params/callbacks-fit.md"
 

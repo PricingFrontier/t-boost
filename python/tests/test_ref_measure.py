@@ -157,7 +157,7 @@ def test_training_row_subset_is_rejected_as_graduation_evidence():
 
 @pytest.fixture(autouse=True)
 def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard, evidence gate and slope machinery) on
+    """This module pins the fold-vote selector (its evidence gate and vote machinery) on
     unbanded tables: the ranked path and banding became the defaults on 2026-09-26."""
     from t_boost import TBoostClassifier as _C
     from t_boost import TBoostRegressor as _R

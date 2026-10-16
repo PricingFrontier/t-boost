@@ -118,14 +118,7 @@ class _Booster:
         cat_x: Sequence[Sequence[str]] | None = None,
         es_holdout: Sequence[bool] | None = None,
         bag_groups: np.ndarray | None = None,
-        eval_x: np.ndarray | None = None,
-        eval_y: np.ndarray | None = None,
-        eval_cat_x: Sequence[Sequence[str]] | None = None,
-        eval_weight: np.ndarray | None = None,
-        eval_exposure: np.ndarray | None = None,
         observer: Callable[[int, int, int, float, float | None], Any] | None = None,
-        record_history: bool = False,
-        eval_unseen_rare: bool = False,
     ) -> _Model: ...
 
     def fit_multiclass(
@@ -161,10 +154,7 @@ class _Booster:
         n_folds: int = 5,
         es_holdout: Sequence[bool] | None = None,
         deploy_es_holdout: Sequence[bool] | None = None,
-        prune_guard: bool = False,
-        prune_guard_tol: float = 0.05,
         prune_guard_min_rows: int = 500,
-        guard_oob_honest: bool = True,
         sel_bags: int = 1,
         box_budget: int = 0,
         lambda_tables: float = 0.0,
@@ -178,8 +168,6 @@ class _Booster:
         min_mean_gain: float = 0.0,
         drop_z: float | None = None,
         keep_budget: int = 0,
-        guard_z: float = 0.0,
-        guard_floor: float = 0.0,
         bag_groups: np.ndarray | None = None,
         ranked_path: bool = False,
         path_steps: int = 32,
@@ -189,6 +177,7 @@ class _Booster:
         path_tolerance: float = 0.0,
         prune_main_effects: bool = False,
         path_min_share: float = 0.0,
+        rebalance: bool = False,
     ) -> tuple[_MultiClassTableModel, str]: ...
 
     def fit_prune_folds(
@@ -442,7 +431,7 @@ class _Model:
         cat_x: Sequence[Sequence[str]] | None = None,
         table_budget: int = 0,
         table_min_arity: int = 3,
-    ) -> tuple[_TableModel, str, str]: ...
+    ) -> tuple[_TableModel, str, str, str | None]: ...
 
     def bag_bank_jsons(
         self,
@@ -513,6 +502,18 @@ class _TableModel:
         n_jobs: int | None = None,
         mse_cap: float = ...,
     ) -> tuple[_TableModel, str]: ...
+    def enforce_monotone(
+        self,
+        x: np.ndarray,
+        h: np.ndarray,
+        monotone: Sequence[int],
+        y: np.ndarray,
+        weight: np.ndarray,
+        exposure: np.ndarray | None = None,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        reanchor: bool = True,
+        n_jobs: int | None = None,
+    ) -> tuple[_TableModel, str]: ...
     def graduation_tables(
         self, max_cells: int = 2500
     ) -> list[tuple[int, list[int], list[int], list[float], list[float], list[bool]]]: ...
@@ -528,6 +529,7 @@ class _TableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         n_jobs: int | None = None,
         box_budget: int = 0,
+        reanchor: bool = True,
     ) -> tuple[_TableModel, bool, str]: ...
 
     def apply_graduation(
@@ -540,6 +542,7 @@ class _TableModel:
         cat_x: Sequence[Sequence[str]] | None = None,
         n_jobs: int | None = None,
         eval_rows: Sequence[int] | None = None,
+        reanchor: bool = True,
     ) -> tuple[_TableModel, bool]: ...
 
     @staticmethod
@@ -606,6 +609,7 @@ class _TableModel:
 
 @final
 class _MultiClassModel:
+    def fit_report(self) -> list[tuple[int, int, str, list[float], list[float]]] | None: ...
     @staticmethod
     def from_json(s: str) -> _MultiClassModel: ...
 
@@ -660,6 +664,19 @@ class _MultiClassModel:
         laplace: float = 1.0,
         measure_floor: float = 0.001,
     ) -> _MultiClassTableModel: ...
+    def band_tables(
+        self,
+        tables: _MultiClassTableModel,
+        x: np.ndarray,
+        y: np.ndarray,
+        weight: np.ndarray,
+        tolerance: float,
+        deviance_cap: float,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        ref_measure: str | None = None,
+        laplace: float = 1.0,
+        measure_floor: float = 0.001,
+    ) -> tuple[_MultiClassTableModel, str]: ...
     def mc_apply_keepset(
         self,
         x: np.ndarray,
@@ -671,29 +688,6 @@ class _MultiClassModel:
         laplace: float = 1.0,
         measure_floor: float = 0.001,
     ) -> _MultiClassTableModel: ...
-
-    def mc_carve_arms(
-        self,
-        x: np.ndarray,
-        weight: np.ndarray,
-        groups: Sequence[Sequence[Sequence[int]]],
-        mask: Sequence[bool],
-        cat_x: Sequence[Sequence[str]] | None = None,
-        ref_measure: str | None = None,
-        laplace: float = 1.0,
-        measure_floor: float = 0.001,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]: ...
-
-    def mc_oob_arms(
-        self,
-        x: np.ndarray,
-        weight: np.ndarray,
-        groups: Sequence[Sequence[Sequence[int]]],
-        cat_x: Sequence[Sequence[str]] | None = None,
-        ref_measure: str | None = None,
-        laplace: float = 1.0,
-        measure_floor: float = 0.001,
-    ) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]: ...
 
     def tables(
         self,
@@ -747,6 +741,20 @@ class _MultiClassTableModel:
 
     def deployed_table_count(self) -> int: ...
     def deployed_census(self) -> dict[str, Any]: ...
+    def graduation_tables(
+        self, max_cells: int = 2500
+    ) -> list[list[tuple[int, list[int], list[int], list[float], list[float], list[bool]]]]: ...
+    def apply_graduation(
+        self,
+        x: np.ndarray,
+        y: np.ndarray,
+        weight: np.ndarray,
+        updates: Sequence[tuple[int, int, Sequence[float]]],
+        alpha: float = 0.0,
+        cat_x: Sequence[Sequence[str]] | None = None,
+        n_jobs: int | None = None,
+        box_budget: int = 0,
+    ) -> tuple[_MultiClassTableModel, bool, str]: ...
 
     @property
     def class_labels(self) -> list[str]: ...

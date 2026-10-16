@@ -16,8 +16,9 @@ validation dataset and the number of trees each bag kept.
 By default the number of trees ([`n_trees`](training-parameters/common.md#n_trees)) is a large
 cap and [early stopping](algorithm/early-stopping.md) decides when to stop. After the fit,
 check `stopping_reason_per_bag_`: bags that stopped with `"max_trees"` reached the cap before
-early stopping triggered, so raise `n_trees` or `learning_rate`. Pass an `eval_set` to
-`fit` to monitor the deviance of every iteration in `evals_result_`.
+early stopping triggered, so raise `n_trees` or `learning_rate`. The deviance of every
+iteration on the validation objects is in `evals_result_`, and the
+[model report](model-analysis/model-report.md) draws it.
 
 ## Learning rate {#learning-rate}
 
@@ -52,7 +53,8 @@ the value keeps an effect.
 
 [`n_bags`](training-parameters/bagging.md#n_bags) (8 by default) trades training time for
 accuracy: the training costs about `n_bags` times a single model. For the cheapest single-model
-baseline, pass `n_bags=1, validation_fraction=None, prune=False`.
+baseline, pass `n_bags=1, validation_fraction=None, prune=False, band_tolerance=None,
+graduate=False`.
 
 ## Smaller rating structures {#smaller-models}
 

@@ -2,14 +2,13 @@
 
 `crates/t-boost-core/tests/order_lift.rs` pins exactness and growth. The bar that
 matters commercially — *a 4-way table appears only where there is genuine signal* — is
-enforced one layer up, by the av37 evidence-gated prune plus its SE-aware no-harm guard,
-both of which live in the PyO3/sklearn layer. So it is tested here.
+enforced one layer up, by the ranked-path prune in the PyO3/sklearn layer. So it is tested
+here, at the shipped defaults.
 
-The mechanism, measured: the evidence gate itself selects order <= 3 (it ranks candidates
-by held-out per-fold contribution and spends a flat keep budget), and a 4-way survives only
-when the guard finds that the selected bank is materially worse on held-out deviance than
-the full one and re-admits by mean gain. In other words a 4-way table has to be worth a
-measurable out-of-sample deviance gap before anything keeps it.
+The mechanism: the ranked path admits tables in order of purified variance under heredity (a
+4-way only after all its 3-way subsets) and deploys the smallest prefix that captures the
+out-of-bag improvement (`prune_path_fraction`, `prune_path_tolerance`). A 4-way table has to
+carry enough out-of-sample deviance improvement to fall inside that cutoff before it is kept.
 """
 
 from __future__ import annotations
@@ -89,11 +88,10 @@ def test_a_genuine_four_way_target_admits_four_way_tables_and_fits_better():
 
     assert kept4.get(4, 0) > 0, "a genuine 4-way target kept no 4-way table"
     assert mse4 < mse3, f"order 4 must beat order 3 on 4-way data ({mse4} vs {mse3})"
-    # The 4-ways got in through the no-harm guard, not through the evidence gate's own
-    # budget: the gate selects order <= 3, then the guard measures that the selected bank
-    # is materially worse than the full one and re-admits. That is the mechanism the
-    # "genuine signal" claim rests on, so pin it rather than just the outcome.
-    assert report4["guard"]["fired"] is True
+    # The 4-way got in through the ranked path's own out-of-bag cutoff, which is the mechanism
+    # the "genuine signal" claim rests on, so pin it rather than just the outcome.
+    assert report4["selector"] == "ranked_path"
+    assert report4["effective_order"] == 4
 
 
 def test_the_four_way_tables_kept_are_a_small_minority():
@@ -134,15 +132,3 @@ def test_an_order_exceeding_the_depth_is_refused_in_python():
     with pytest.raises(ValueError, match="max_depth"):
         TBoostRegressor(max_interaction_order=4, max_depth=3, n_trees=5).fit(frame, y)
 
-
-@pytest.fixture(autouse=True)
-def _legacy_fold_vote_unbanded(monkeypatch: pytest.MonkeyPatch) -> None:
-    """This module pins the fold-vote selector (its guard and evidence mechanics) on unbanded
-    tables: the ranked path and banding became the defaults on 2026-09-26."""
-    from t_boost import TBoostClassifier as _C
-    from t_boost import TBoostRegressor as _R
-
-    for cls in (_R, _C):
-        defaults = cls.__init__.__kwdefaults__
-        monkeypatch.setitem(defaults, "prune_selector", "fold_vote")
-        monkeypatch.setitem(defaults, "band_tolerance", None)

@@ -17,19 +17,19 @@ def test_invalid_strength_fails_before_fit(alpha):
             np.zeros((20, 3), dtype=np.float32), np.zeros(20, dtype=np.float32))
 
 
-@pytest.mark.parametrize('kwargs', [dict(prune=False), dict(graduate=False),
-                                   dict(monotone_constraints=[1, 0, 0])])
-def test_unsupported_configuration_is_not_silently_ignored(kwargs):
-    with pytest.raises(ValueError, match='smoothing|graduation_high_order_alpha'):
-        TBoostRegressor(graduation_high_order_alpha=0.5, **kwargs).fit(
+def test_unsupported_configuration_is_not_silently_ignored():
+    with pytest.raises(ValueError, match='graduation_high_order_alpha'):
+        TBoostRegressor(graduation_high_order_alpha=0.5, graduate=False).fit(
             np.zeros((20, 3), dtype=np.float32), np.zeros(20, dtype=np.float32))
 
 
-def test_classifier_parameter_clone_and_multiclass_rejection():
+def test_classifier_parameter_clone_and_validation():
     estimator = TBoostClassifier(graduation_high_order_alpha=0.4)
     assert clone(estimator).graduation_high_order_alpha == 0.4
-    with pytest.raises(ValueError, match='higher-order smoothing.*multiclass'):
-        estimator.fit(np.zeros((30, 3), dtype=np.float32), np.arange(30) % 3)
+    # The multiclass path validates the strength as the single-output one does.
+    with pytest.raises(ValueError, match='graduation_high_order_alpha'):
+        TBoostClassifier(graduation_high_order_alpha=1.5).fit(
+            np.zeros((30, 3), dtype=np.float32), np.arange(30) % 3)
 
 
 @pytest.mark.parametrize('candidate_score,train_adopted,expected', [
@@ -126,9 +126,10 @@ def test_estimator_fit_default_noop_and_enabled_reporting():
     rng = np.random.default_rng(24)
     x = rng.normal(size=(2000, 3)).astype(np.float32)
     y = (3 * np.all(x > 0, axis=1) + rng.normal(size=len(x))).astype(np.float32)
+    # Unbanded, so the three-way effects stay factored for the diffusion to smooth.
     params = dict(n_trees=6, n_bags=1, n_jobs=1, validation_fraction=None,
                   prune_n_folds=2, graduation_alpha=0, interaction_gain_hurdle=0,
-                  leaf_refine_steps=0, colsample_bytree=1)
+                  leaf_refine_steps=0, colsample_bytree=1, band_tolerance=None)
     default = TBoostRegressor(**params).fit(x, y)
     zero = TBoostRegressor(**params, graduation_high_order_alpha=0).fit(x, y)
     assert model_bytes(default) == model_bytes(zero)
@@ -139,3 +140,22 @@ def test_estimator_fit_default_noop_and_enabled_reporting():
     assert enabled.graduation_validation_['candidate_count'] == 1
     for restored in [TBoostRegressor.from_json(enabled.to_json()), TBoostRegressor.from_bytes(enabled.to_bytes())]:
         np.testing.assert_array_equal(restored.predict(x), enabled.predict(x))
+    # An unpruned fit smooths its factored effects too: only the selection is skipped.
+    unpruned = TBoostRegressor(**params, prune=False, graduation_high_order_alpha=0.2).fit(x, y)
+    high = [r for r in unpruned.graduation_report_ if r.get('method') == 'reference_diffusion']
+    assert high and any(r['applied'] for r in high)
+
+
+def test_a_multiclass_fit_smooths_every_class_banks_factored_effects():
+    rng = np.random.default_rng(24)
+    x = rng.normal(size=(3000, 3)).astype(np.float32)
+    y = np.where(np.all(x > 0, axis=1), 2, (x[:, 0] + rng.normal(size=len(x)) > 0).astype(int))
+    params = dict(n_trees=6, n_bags=1, n_jobs=1, validation_fraction=None, prune=False,
+                  graduation_alpha=0, interaction_gain_hurdle=0, leaf_refine_steps=0,
+                  colsample_bytree=1, band_tolerance=None)
+    enabled = TBoostClassifier(**params, graduation_high_order_alpha=0.2).fit(x, y)
+    high = [r for r in enabled.graduation_report_ if r.get('method') == 'reference_diffusion']
+    assert high and any(r['applied'] for r in high)
+    assert {r['class'] for r in high} == {0, 1, 2}
+    restored = TBoostClassifier.from_bytes(enabled.to_bytes())
+    np.testing.assert_array_equal(restored.predict_proba(x), enabled.predict_proba(x))

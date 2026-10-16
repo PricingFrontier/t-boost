@@ -1,0 +1,476 @@
+diff --git a/crates/t-boost-core/src/prune.rs b/crates/t-boost-core/src/prune.rs
+index be90048..263de6f 100644
+--- a/crates/t-boost-core/src/prune.rs
++++ b/crates/t-boost-core/src/prune.rs
+@@ -2169,6 +2169,73 @@ pub fn bag_score_variance_for_rows(
+         .collect())
+ }
+ 
++/// EXPERIMENT (PF-06/07, not for landing): every bag's kept-bank raw score on `rows`,
++/// `[bag][row]`, so the between-bag spread can be split into its softmax-common part.
++///
++/// # Errors
++/// As [`bag_score_variance_for_rows`].
++pub fn exp_bag_scores_for_rows(
++    model: &Model,
++    serve: &ServeBinnedMatrix,
++    w_measure: RefMeasure,
++    mass: Option<&[f32]>,
++    keep: Option<&[FeatureSet]>,
++    rows: &[u32],
++) -> Result<Vec<Vec<f64>>, PbError> {
++    let Some(spans) = model.bag_spans.as_ref() else {
++        return Err(PbError::InvalidInput {
++            what: "bag scores need the outer-bag soup's runtime bag partition".into(),
++        });
++    };
++    let soup_grids = crate::explain::MergedGrids::from_model(model)?;
++    let mut out = Vec::with_capacity(spans.len());
++    for bag in 0..spans.len() {
++        let full = bag_bank(model, serve, &w_measure, mass, &soup_grids, bag, false)?;
++        let bank = match keep {
++            Some(k) => retain_tables(&full, k),
++            None => full,
++        };
++        let mut flat = vec![0.0_f64; rows.len()];
++        crate::scoring::score_banks_rows(
++            &[&bank],
++            &model.schema.cat_encoders,
++            &serve.0,
++            rows,
++            &mut flat,
++        )?;
++        out.push(flat);
++    }
++    Ok(out)
++}
++
++/// EXPERIMENT (PF-07, not for landing): every bag's kept bank (on the soup's merged grids).
++///
++/// # Errors
++/// As [`bag_score_variance_for_rows`].
++pub fn exp_bag_banks(
++    model: &Model,
++    serve: &ServeBinnedMatrix,
++    w_measure: RefMeasure,
++    mass: Option<&[f32]>,
++    keep: Option<&[FeatureSet]>,
++) -> Result<Vec<TableBank>, PbError> {
++    let Some(spans) = model.bag_spans.as_ref() else {
++        return Err(PbError::InvalidInput {
++            what: "bag banks need the outer-bag soup's runtime bag partition".into(),
++        });
++    };
++    let soup_grids = crate::explain::MergedGrids::from_model(model)?;
++    let mut out = Vec::with_capacity(spans.len());
++    for bag in 0..spans.len() {
++        let full = bag_bank(model, serve, &w_measure, mass, &soup_grids, bag, false)?;
++        out.push(match keep {
++            Some(k) => retain_tables(&full, k),
++            None => full,
++        });
++    }
++    Ok(out)
++}
++
+ /// The ranked path's out-of-bag evidence, accumulated in ONE pass over the per-bag banks.
+ ///
+ /// For every fit row `r`, the bags that never trained on `r` (`!Model::bag_in_bag[b][r]`) are
+diff --git a/crates/t-boost-py/src/lib.rs b/crates/t-boost-py/src/lib.rs
+index 0968282..612da99 100644
+--- a/crates/t-boost-py/src/lib.rs
++++ b/crates/t-boost-py/src/lib.rs
+@@ -7473,6 +7473,56 @@ impl PyMultiClassTableModel {
+         let bytes = self.model.to_bincode().map_err(py_err)?;
+         Ok(PyBytes::new(py, &bytes))
+     }
++
++    /// EXPERIMENT (PF-06/07, not for landing): band every class bank with the given per-class
++    /// noise (`None` = one bag) and budget mode (see `mc_band_apply`).
++    #[pyo3(signature = (x, y, weight, sigmas, tolerance, deviance_cap, mode, cat_x=None, n_jobs=None))]
++    #[allow(clippy::too_many_arguments)]
++    fn exp_band(
++        &self,
++        py: Python<'_>,
++        x: PyReadonlyArray2<'_, f32>,
++        y: PyReadonlyArray1<'_, f32>,
++        weight: PyReadonlyArray1<'_, f32>,
++        sigmas: Vec<Option<f64>>,
++        tolerance: f64,
++        deviance_cap: f64,
++        mode: String,
++        cat_x: Option<Vec<Vec<String>>>,
++        n_jobs: Option<usize>,
++    ) -> PyResult<(PyMultiClassTableModel, String)> {
++        let columns = raw_columns_from_array(x)?;
++        let labels = class_labels_from_array(&y, self.model.n_classes())?;
++        let w_vec = weight
++            .as_slice()
++            .map_err(|e| PyValueError::new_err(format!("weight must be contiguous: {e}")))?
++            .to_vec();
++        let sig: Vec<f64> = sigmas
++            .iter()
++            .map(|s| s.unwrap_or(f64::INFINITY))
++            .collect();
++        let tm = Arc::clone(&self.model);
++        let (banded, reports) = py
++            .detach(move || {
++                run_on_pool(n_jobs, || {
++                    let prep = mc_band_prep(&tm, &columns, cat_x.as_deref(), &w_vec, &labels)?;
++                    mc_band_apply(&tm, &prep, tolerance, deviance_cap, &sig, &mode)
++                })
++            })
++            .map_err(py_err)?;
++        let json = serde_json::to_string(&reports).map_err(|err| {
++            py_err(PbError::Serialization(format!(
++                "could not serialize banding report: {err}"
++            )))
++        })?;
++        Ok((
++            PyMultiClassTableModel {
++                model: Arc::new(banded),
++                serve: Default::default(),
++            },
++            json,
++        ))
++    }
+ }
+ 
+ /// Low-level Python table-bank wrapper.
+@@ -9815,6 +9865,33 @@ fn band_multiclass_table_model(
+     ),
+     PbError,
+ > {
++    let prep = mc_band_prep(tm, columns, cat_x, w, labels)?;
++    let dump = std::env::var_os("TBOOST_EXP_MCBAND_DUMP");
++    let sigmas = mc_band_sigmas(&prep, mc, serve, w, w_measure, keep, dump.as_deref())?;
++    if let Some(dir) = dump.as_deref() {
++        exp_mcband_dump(std::path::Path::new(dir), tm, &prep, &sigmas)?;
++    }
++    let mode = std::env::var("TBOOST_EXP_MCBAND_MODE").unwrap_or_default();
++    mc_band_apply(tm, &prep, tolerance, deviance_cap, &sigmas, &mode)
++}
++
++/// EXPERIMENT (PF-06/07): multiclass banding's shared row inputs.
++struct McBandPrep {
++    binned: BinnedMatrix,
++    logits: Vec<Vec<f64>>,
++    prob: Vec<Vec<f64>>,
++    mass: Vec<f64>,
++    ws: f64,
++    dev_mean: f64,
++}
++
++fn mc_band_prep(
++    tm: &MultiClassTableModel,
++    columns: &[Vec<f32>],
++    cat_x: Option<&[Vec<String>]>,
++    w: &[f32],
++    labels: &[u32],
++) -> Result<McBandPrep, PbError> {
+     let first = tm.classes.first().ok_or_else(|| PbError::Internal {
+         what: "multiclass tables model has no classes".into(),
+     })?;
+@@ -9825,10 +9902,6 @@ fn band_multiclass_table_model(
+         None,
+     )?;
+     let n = w.len();
+-    // Each class bank has its OWN merged grid (the classes share raw grids, not merged ones), so
+-    // the rows' merged cells are taken per class.
+-    let class_cells =
+-        |c: &TableModel| -> Result<Vec<Vec<u32>>, PbError> { c.column_cells(&binned) };
+     let logits: Vec<Vec<f64>> = mc_stage("banding.logits", || {
+         tm.classes
+             .iter()
+@@ -9838,7 +9911,6 @@ fn band_multiclass_table_model(
+             })
+             .collect::<Result<_, _>>()
+     })?;
+-    let k_classes = logits.len();
+     // softmax per row, accumulated class by class in the same order as a per-row loop
+     let mut mx = vec![f64::NEG_INFINITY; n];
+     for lk in &logits {
+@@ -9876,29 +9948,45 @@ fn band_multiclass_table_model(
+         dev -= 2.0 * mi * p.ln();
+     }
+     let dev_mean = (dev / ws.max(f64::MIN_POSITIVE)).max(0.0); // rounding never makes it negative
++    Ok(McBandPrep {
++        binned,
++        logits,
++        prob,
++        mass,
++        ws,
++        dev_mean,
++    })
++}
++
++/// Each class's bag noise σ_k (curvature-weighted RMS of its per-row bag standard error), or
++/// infinity with one bag. EXPERIMENT: with `dump`, every bag's class-k scores are written too.
++fn mc_band_sigmas(
++    prep: &McBandPrep,
++    mc: &MultiClassModel,
++    serve: &ServeBinnedMatrix,
++    w: &[f32],
++    w_measure: RefMeasure,
++    keep: Option<&[FeatureSet]>,
++    dump: Option<&std::ffi::OsStr>,
++) -> Result<Vec<f64>, PbError> {
++    let n = prep.mass.len();
+     let all_rows: Vec<u32> = (0..u32::try_from(n).unwrap_or(u32::MAX)).collect();
+     // The bag banks behind the noise estimate are purified under the same row mass as the
+     // multiclass prune's and keep-set's banks (`measure_mass`: the weights, under a measure that
+     // reads row mass).
+     let bag_mass = t_boost_core::prune::measure_mass(&w_measure, w, None);
+-    let cfg = t_boost_core::banding::BandingConfig {
+-        tolerance,
+-        ..Default::default()
+-    };
+-    let no_class = |k: usize| PbError::Internal {
+-        what: format!("multiclass banding: no class {k}"),
+-    };
+-    let mut out = tm.clone();
+-    let mut reports = Vec::with_capacity(k_classes);
+-    for (k, (pk, lk)) in prob.iter().zip(&logits).enumerate() {
+-        let h: Vec<f64> = mass
++    let mut out = Vec::with_capacity(prep.prob.len());
++    for (k, pk) in prep.prob.iter().enumerate() {
++        let h: Vec<f64> = prep
++            .mass
+             .iter()
+             .zip(pk)
+             .map(|(&mi, &p)| mi * p * (1.0 - p))
+             .collect();
+-        let mck = mc.classes.get(k).ok_or_else(|| no_class(k))?;
+-        let tmk = tm.classes.get(k).ok_or_else(|| no_class(k))?;
+         let hs: f64 = h.iter().sum();
++        let mck = mc.classes.get(k).ok_or_else(|| PbError::Internal {
++            what: format!("multiclass banding: no class {k}"),
++        })?;
+         // One bag has no spread to measure its noise by: the deviance cap alone bounds the
+         // banding.
+         let sigma = match mck.bag_spans.as_ref().map(Vec::len) {
+@@ -9913,21 +10001,207 @@ fn band_multiclass_table_model(
+                         &all_rows,
+                     )
+                 })?;
++                if let Some(dir) = dump {
++                    let scores = t_boost_core::prune::exp_bag_scores_for_rows(
++                        mck,
++                        serve,
++                        w_measure.clone(),
++                        bag_mass.as_deref(),
++                        keep,
++                        &all_rows,
++                    )?;
++                    let mut bytes = Vec::with_capacity(scores.len() * n * 8);
++                    for bag in &scores {
++                        for v in bag {
++                            bytes.extend_from_slice(&v.to_le_bytes());
++                        }
++                    }
++                    let path = std::path::Path::new(dir).join(format!("bagscores_{k}.f64"));
++                    std::fs::write(&path, bytes).map_err(|e| PbError::Internal {
++                        what: format!("exp dump: {e}"),
++                    })?;
++                    if std::env::var_os("TBOOST_EXP_BAGTABLES").is_some() {
++                        // every bag's dense order-1/2 kept tables, for the graduation noise study
++                        let banks = t_boost_core::prune::exp_bag_banks(
++                            mck,
++                            serve,
++                            w_measure.clone(),
++                            bag_mass.as_deref(),
++                            keep,
++                        )?;
++                        let js: Vec<Vec<serde_json::Value>> = banks
++                            .iter()
++                            .map(|b| {
++                                b.tables
++                                    .iter()
++                                    .filter(|t| t.u.order() <= 2)
++                                    .map(|t| {
++                                        serde_json::json!({
++                                            "u": t.u.0.iter().map(|f| f.0).collect::<Vec<_>>(),
++                                            "shape": t.values.shape_u32(),
++                                            "values": t.values.values().to_vec(),
++                                        })
++                                    })
++                                    .collect()
++                            })
++                            .collect();
++                        std::fs::write(
++                            std::path::Path::new(dir).join(format!("bagtables_{k}.json")),
++                            serde_json::Value::from(js).to_string(),
++                        )
++                        .map_err(|e| PbError::Internal {
++                            what: format!("exp dump: {e}"),
++                        })?;
++                    }
++                    if k == 0 {
++                        if let Some(inb) = mck.bag_in_bag.as_ref() {
++                            let mut m = Vec::with_capacity(inb.len() * n);
++                            for bag in inb {
++                                m.extend(bag.iter().map(|&b| u8::from(b)));
++                            }
++                            std::fs::write(std::path::Path::new(dir).join("inbag.u8"), m)
++                                .map_err(|e| PbError::Internal {
++                                    what: format!("exp dump: {e}"),
++                                })?;
++                        }
++                    }
++                }
+                 let b = n_bags as f64;
+                 let num: f64 = h.iter().zip(&var).map(|(&hi, &vi)| hi * vi / b).sum();
+                 (num / hs.max(f64::MIN_POSITIVE)).sqrt()
+             }
+             _ => f64::INFINITY,
+         };
+-        let cells = mc_stage("banding.class_cells", || class_cells(tmk))?;
++        out.push(sigma);
++    }
++    Ok(out)
++}
++
++/// EXPERIMENT (PF-06/07): write the pre-banding model and the per-class banding inputs.
++fn exp_mcband_dump(
++    dir: &std::path::Path,
++    tm: &MultiClassTableModel,
++    prep: &McBandPrep,
++    sigmas: &[f64],
++) -> Result<(), PbError> {
++    let io = |e: std::io::Error| PbError::Internal {
++        what: format!("exp dump: {e}"),
++    };
++    std::fs::create_dir_all(dir).map_err(io)?;
++    std::fs::write(dir.join("preband.bin"), tm.to_bincode()?).map_err(io)?;
++    let hs: Vec<f64> = prep
++        .prob
++        .iter()
++        .map(|pk| {
++            prep.mass
++                .iter()
++                .zip(pk)
++                .map(|(&mi, &p)| mi * p * (1.0 - p))
++                .sum()
++        })
++        .collect();
++    let meta = serde_json::json!({
++        "sigmas": sigmas.iter().map(|s| if s.is_finite() { serde_json::json!(s) } else { serde_json::json!(null) }).collect::<Vec<_>>(),
++        "dev_mean": prep.dev_mean,
++        "ws": prep.ws,
++        "hs": hs,
++        "n": prep.mass.len(),
++    });
++    std::fs::write(dir.join("meta.json"), meta.to_string()).map_err(io)?;
++    Ok(())
++}
++
++/// Band every class bank from the shared inputs. `mode` (EXPERIMENT, empty = shipped) is a
++/// `+`-joined list of: `mass` (class k's share of the cap is its curvature mass Σh_k / Σ_j Σh_j,
++/// not 1/K), `capx<f>` (cap × f), `sigx<f>` (σ × f), `nosig` (σ = ∞).
++fn mc_band_apply(
++    tm: &MultiClassTableModel,
++    prep: &McBandPrep,
++    tolerance: f64,
++    deviance_cap: f64,
++    sigmas: &[f64],
++    mode: &str,
++) -> Result<
++    (
++        MultiClassTableModel,
++        Vec<t_boost_core::banding::BandingReport>,
++    ),
++    PbError,
++> {
++    let mut mass_share = false;
++    let mut cap_mult = 1.0_f64;
++    let mut sig_mult = 1.0_f64;
++    let mut no_sig = false;
++    for tok in mode.split('+').filter(|t| !t.is_empty()) {
++        if tok == "mass" {
++            mass_share = true;
++        } else if tok == "nosig" {
++            no_sig = true;
++        } else if let Some(f) = tok.strip_prefix("capx") {
++            cap_mult = f.parse().map_err(|_| PbError::InvalidInput {
++                what: format!("exp mode {tok}"),
++            })?;
++        } else if let Some(f) = tok.strip_prefix("sigx") {
++            sig_mult = f.parse().map_err(|_| PbError::InvalidInput {
++                what: format!("exp mode {tok}"),
++            })?;
++        } else {
++            return Err(PbError::InvalidInput {
++                what: format!("unknown exp mode {tok}"),
++            });
++        }
++    }
++    let k_classes = prep.logits.len();
++    let cfg = t_boost_core::banding::BandingConfig {
++        tolerance,
++        ..Default::default()
++    };
++    let no_class = |k: usize| PbError::Internal {
++        what: format!("multiclass banding: no class {k}"),
++    };
++    let hs_all: Vec<f64> = prep
++        .prob
++        .iter()
++        .map(|pk| {
++            prep.mass
++                .iter()
++                .zip(pk)
++                .map(|(&mi, &p)| mi * p * (1.0 - p))
++                .sum()
++        })
++        .collect();
++    let hs_total: f64 = hs_all.iter().sum();
++    let mut out = tm.clone();
++    let mut reports = Vec::with_capacity(k_classes);
++    for (k, (pk, lk)) in prep.prob.iter().zip(&prep.logits).enumerate() {
++        let h: Vec<f64> = prep
++            .mass
++            .iter()
++            .zip(pk)
++            .map(|(&mi, &p)| mi * p * (1.0 - p))
++            .collect();
++        let tmk = tm.classes.get(k).ok_or_else(|| no_class(k))?;
++        let hs: f64 = h.iter().sum();
++        let sigma = if no_sig {
++            f64::INFINITY
++        } else {
++            sigmas.get(k).copied().ok_or_else(|| no_class(k))? * sig_mult
++        };
++        let share = if mass_share {
++            hs / hs_total.max(f64::MIN_POSITIVE)
++        } else {
++            1.0 / k_classes as f64
++        };
++        let cells = mc_stage("banding.class_cells", || tmk.column_cells(&prep.binned))?;
+         let rows = t_boost_core::banding::BandingRows {
+             cells: &cells,
+             h: &h,
+-            mass: &mass,
++            mass: &prep.mass,
+             target: lk,
+             sigma,
+             // the class's share of the deviance cap (expected increase Σ h δ² / Σ w per class)
+-            mse_cap: deviance_cap * dev_mean * ws / (hs.max(f64::MIN_POSITIVE) * k_classes as f64),
++            mse_cap: cap_mult * deviance_cap * prep.dev_mean * prep.ws * share
++                / hs.max(f64::MIN_POSITIVE),
+         };
+         let (bank, rep) = t_boost_core::banding::band_bank(&tmk.bank, &rows, &cfg)?;
+         out.classes.get_mut(k).ok_or_else(|| no_class(k))?.bank = bank;
+@@ -10605,7 +10879,12 @@ fn apply_multiclass_graduation(
+     }
+     let raw_deviance = multinomial_deviance(&logits(model)?, &labels, &weight)?;
+     let graduated_deviance = multinomial_deviance(&after, &labels, &weight)?;
+-    if !graduated_deviance.is_finite() || graduated_deviance > raw_deviance * 1.01 {
++    // EXPERIMENT (PF-07, not for landing): TBOOST_EXP_GRAD_SLACK overrides the 1% brake.
++    let slack = std::env::var("TBOOST_EXP_GRAD_SLACK")
++        .ok()
++        .and_then(|s| s.parse::<f64>().ok())
++        .unwrap_or(1.01);
++    if !graduated_deviance.is_finite() || graduated_deviance > raw_deviance * slack {
+         return Ok((model.clone(), false, reports));
+     }
+     graduated.validate()?;
